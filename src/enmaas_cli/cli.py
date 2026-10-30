@@ -1,0 +1,567 @@
+"""Argument parsing, command dispatch, exit codes."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import enum
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, NoReturn
+
+import httpx
+
+from .auth import AuthError, redact, resolve_key
+from .client import GatewayError, call
+from .config import Config, default_config_path, load_config
+from .dialect import (
+    ANTHROPIC_VERSION,
+    Dialect,
+    DialectError,
+    EmptyResponseError,
+    build_request,
+    default_max_tokens,
+    parse_response,
+    resolve_dialect,
+)
+from .receipts import ask_receipt, create_run_dir, prune_runs, state_root
+from .runner import run_map
+from .schema import ValidationError, load_schema, validate_against_schema
+from .usage import (
+    UsageEvent,
+    append_event,
+    format_summary,
+    format_summary_json,
+    load_events,
+    summarize_usage,
+)
+
+
+class ExitCode(enum.IntEnum):
+    OK = 0
+    ERROR = 1
+    PARTIAL = 2
+    ABORTED = 3
+
+
+class Parser(argparse.ArgumentParser):
+    """ArgumentParser that exits 1 on usage errors instead of 2."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(int(ExitCode.ERROR), f"{self.prog}: error: {message}\n")
+
+
+def positive_int(value: str) -> int:
+    """Validate a positive integer for argparse."""
+    ival = int(value)
+    if ival <= 0:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
+    return ival
+
+
+def positive_float(value: str) -> float:
+    """Validate a positive float for argparse."""
+    fval = float(value)
+    if fval <= 0:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive number")
+    return fval
+
+
+def resolve_thinking(flag: str | None, model: str) -> bool:
+    """Decide the `thinking` value to pass to build_request.
+
+    True means send no reasoning knob and let the provider decide.
+    False means send the explicit disable knob.
+
+    Hosted rits/* models reason without bound on large prompts: measured, a
+    45 KB prompt returned a 504 after 300 seconds on one and 32,768 tokens of
+    invisible thinking on the other. So they default to reasoning off.
+    Frontier models manage their own budgets and have not shown this, so they
+    are left untouched unless the user asks.
+    """
+    if flag is not None:
+        return flag == "on"
+    return not model.startswith("rits/")
+
+
+def assemble_prompt(*, prompt: str, files: list[Path]) -> str:
+    """Attach files as labelled blocks. Contents are data, never executed."""
+    parts = [prompt]
+    for path in files:
+        if not path.exists():
+            raise FileNotFoundError(f"attachment does not exist: {path}")
+        body = path.read_text(encoding="utf-8", errors="replace")
+        parts.append(f"\n--- file: {path} ---\n{body}\n--- end: {path} ---")
+    return "\n".join(parts)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = Parser(prog="enmaas")
+    parser.add_argument("--key-file", type=Path)
+    parser.add_argument("--config", type=Path)
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
+
+    models = sub.add_parser("models", help="list the gateway catalog")
+    models.add_argument("--dialect", choices=["anthropic", "openai", "both"], default="both")
+    models.add_argument("--json", action="store_true")
+    models.add_argument("--timeout", type=positive_float)
+
+    ask = sub.add_parser("ask", help="one-shot prompt, response written to a file")
+    ask.add_argument("-m", "--model")
+    ask.add_argument("-f", "--file", type=Path, action="append", default=[])
+    ask.add_argument("-p", "--prompt")
+    ask.add_argument("--prompt-file", type=Path)
+    ask.add_argument("--system")
+    ask.add_argument("-o", "--output", type=Path)
+    ask.add_argument("--stdout", action="store_true")
+    ask.add_argument("--json", action="store_true")
+    ask.add_argument("--thinking", choices=["on", "off"], default=None)
+    ask.add_argument("--save-thinking", action="store_true")
+    ask.add_argument("--max-tokens", type=positive_int)
+    ask.add_argument("--timeout", type=positive_float)
+    ask.add_argument("--retries", type=int, default=3)
+    ask.add_argument("--dialect", choices=["anthropic", "openai"])
+    ask.add_argument("--schema", type=Path)
+    ask.add_argument("--schema-name")
+
+    mp = sub.add_parser("map", help="fan out one call per JSONL item")
+    mp.add_argument("-m", "--model", required=True)
+    mp.add_argument("--items", type=Path, required=True)
+    mp.add_argument("--template", type=Path, required=True)
+    mp.add_argument("--outdir", type=Path, required=True)
+    mp.add_argument("--concurrency", type=positive_int)
+    mp.add_argument("--retries", type=int, default=3)
+    mp.add_argument("--timeout", type=positive_float)
+    mp.add_argument("--thinking", choices=["on", "off"], default=None)
+    mp.add_argument("--resume", action="store_true")
+    mp.add_argument("--json", action="store_true")
+    mp.add_argument("--dialect", choices=["anthropic", "openai"])
+    mp.add_argument("--max-tokens", type=positive_int)
+    mp.add_argument("--schema", type=Path)
+    mp.add_argument("--schema-name")
+
+    usage = sub.add_parser("usage", help="show usage statistics")
+    usage.add_argument("--json", action="store_true")
+    usage.add_argument("--since", type=positive_int, metavar="DAYS", help="limit to last N days")
+
+    return parser
+
+
+@dataclass(frozen=True)
+class AskResult:
+    receipt: str
+    path: Path
+    exit_code: int
+    model: str
+    dialect: str
+    completion: Any | None  # Completion object or None on error
+    elapsed: float
+    error: str | None
+
+
+async def run_ask(
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    key: str,
+    model: str,
+    prompt: str,
+    system: str | None,
+    dialect: Dialect | None,
+    thinking: bool,
+    max_tokens: int | None,
+    timeout: float,
+    retries: int,
+    output: Path | None,
+    run_root: Path,
+    save_thinking: bool,
+    schema_file: Path | None = None,
+    schema_name: str | None = None,
+) -> AskResult:
+    prune_runs(run_root)
+    run_dir = create_run_dir(run_root)
+    path = output if output is not None else run_dir / "response.md"
+
+    schema = load_schema(schema_file) if schema_file is not None else None
+
+    resolved = resolve_dialect(model, dialect)
+    request = build_request(
+        model=model,
+        prompt=prompt,
+        dialect=resolved,
+        max_tokens=max_tokens if max_tokens is not None else default_max_tokens(thinking=thinking),
+        thinking=thinking,
+        system=system,
+        key=key,
+        schema=schema,
+        schema_name=schema_name,
+    )
+
+    for warning in request.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+    started = time.monotonic()
+    try:
+        data = await call(client, base_url, request, timeout=timeout, retries=retries)
+        completion = parse_response(data, resolved)
+    except (GatewayError, EmptyResponseError) as exc:
+        elapsed = time.monotonic() - started
+        error_msg = redact(str(exc), key)
+        return AskResult(
+            receipt=(
+                f"enmaas ask FAILED\n"
+                f"  model     {model}  ({resolved} dialect)\n"
+                f"  error     {error_msg}"
+            ),
+            path=path,
+            exit_code=ExitCode.ERROR,
+            model=model,
+            dialect=resolved,
+            completion=None,
+            elapsed=elapsed,
+            error=error_msg,
+        )
+
+    if schema is not None:
+        try:
+            validate_against_schema(completion.text, schema)
+        except ValidationError as exc:
+            elapsed = time.monotonic() - started
+            error_msg = str(exc)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(completion.text, encoding="utf-8")
+            return AskResult(
+                receipt=(
+                    f"enmaas ask FAILED\n"
+                    f"  model     {model}  ({resolved} dialect)\n"
+                    f"  error     {error_msg}"
+                ),
+                path=path,
+                exit_code=ExitCode.ERROR,
+                model=model,
+                dialect=resolved,
+                completion=completion,
+                elapsed=elapsed,
+                error=error_msg,
+            )
+
+    elapsed = time.monotonic() - started
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(completion.text, encoding="utf-8")
+    if save_thinking and completion.reasoning:
+        (run_dir / "thinking.md").write_text(completion.reasoning, encoding="utf-8")
+
+    return AskResult(
+        receipt=ask_receipt(
+            model=model,
+            dialect=resolved,
+            completion=completion,
+            path=path,
+            elapsed=elapsed,
+        ),
+        path=path,
+        exit_code=ExitCode.OK,
+        model=model,
+        dialect=resolved,
+        completion=completion,
+        elapsed=elapsed,
+        error=None,
+    )
+
+
+async def run_models(
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    key: str,
+    dialect: str,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    """Query one or both catalogs. Neither is complete on its own."""
+    wanted: list[Dialect] = (
+        ["anthropic", "openai"] if dialect == "both" else [dialect]  # type: ignore[list-item]
+    )
+    found: dict[str, set[str]] = {}
+    for d in wanted:
+        headers = (
+            {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}
+            if d == "anthropic"
+            else {"Authorization": f"Bearer {key}"}
+        )
+        response = await client.get(f"{base_url}/v1/models", headers=headers, timeout=timeout)
+        response.raise_for_status()
+        for entry in response.json().get("data", []):
+            found.setdefault(str(entry.get("id")), set()).add(d)
+    return [
+        {"id": model_id, "dialects": sorted(dialects)}
+        for model_id, dialects in sorted(found.items())
+    ]
+
+
+def _read_prompt(args: argparse.Namespace) -> str:
+    if args.prompt is not None:
+        return str(args.prompt)
+    if args.prompt_file is not None:
+        return str(args.prompt_file.read_text(encoding="utf-8"))
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise ValueError("no prompt: pass -p, --prompt-file, or pipe text on stdin")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = load_config(args.config or default_config_path())
+    for warning in config.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+    try:
+        key = resolve_key(key_file=args.key_file, env=dict(os.environ), home=Path.home())
+    except AuthError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return int(ExitCode.ERROR)
+    if key.warning:
+        print(f"warning: {key.warning}", file=sys.stderr)
+
+    try:
+        return asyncio.run(_dispatch(args, config, key.value))
+    except (DialectError, ValidationError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return int(ExitCode.ERROR)
+
+
+async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
+    # Handle usage command first (no timeout argument)
+    if args.command == "usage":
+        ledger = state_root() / "usage.jsonl"
+        events = load_events(ledger)
+
+        if args.since is not None:
+            cutoff = datetime.now(UTC) - timedelta(days=args.since)
+            events = [e for e in events if e.timestamp >= cutoff]
+
+        summary = summarize_usage(events)
+
+        if args.json:
+            print(format_summary_json(summary))
+        else:
+            print(format_summary(summary, since_days=args.since))
+
+        return int(ExitCode.OK)
+
+    timeout = args.timeout if args.timeout is not None else config.timeout
+    async with httpx.AsyncClient() as client:
+        if args.command == "models":
+            try:
+                rows = await run_models(
+                    client=client,
+                    base_url=config.base_url,
+                    key=key,
+                    dialect=args.dialect or "both",
+                    timeout=timeout,
+                )
+            except httpx.HTTPError as exc:
+                print(f"error: {redact(str(exc), key)}", file=sys.stderr)
+                return int(ExitCode.ERROR)
+            if args.json:
+                print(json.dumps(rows, indent=2))
+            else:
+                for row in rows:
+                    print(f"{row['id']:<45} {','.join(row['dialects'])}")
+            return int(ExitCode.OK)
+
+        if args.command == "ask":
+            model = args.model if args.model is not None else config.default_model
+            dialect = args.dialect
+            if dialect is None and model in config.dialect_overrides:
+                override = config.dialect_overrides[model]
+                if override in ("anthropic", "openai"):
+                    dialect = override
+                else:
+                    print(
+                        f"warning: invalid dialect override '{override}' for {model}, ignoring",
+                        file=sys.stderr,
+                    )
+
+            prompt = assemble_prompt(prompt=_read_prompt(args), files=args.file)
+            result = await run_ask(
+                client=client,
+                base_url=config.base_url,
+                key=key,
+                model=model,
+                prompt=prompt,
+                system=args.system,
+                dialect=dialect,
+                thinking=resolve_thinking(args.thinking, model),
+                max_tokens=args.max_tokens,
+                timeout=timeout,
+                retries=args.retries,
+                output=args.output,
+                run_root=state_root(),
+                save_thinking=args.save_thinking,
+                schema_file=args.schema,
+                schema_name=args.schema_name,
+            )
+
+            # Log usage
+            usage_obj = result.completion.usage if result.completion else None
+            error_kind = None
+            if result.error:
+                # Extract error kind from error message
+                if "GatewayError" in result.error or "gateway" in result.error.lower():
+                    error_kind = "GatewayError"
+                elif "EmptyResponseError" in result.error or "exhausted max_tokens" in result.error:
+                    error_kind = "EmptyResponseError"
+                elif "ValidationError" in result.error or "validation" in result.error.lower():
+                    error_kind = "ValidationError"
+                else:
+                    error_kind = "Error"
+            append_event(
+                state_root() / "usage.jsonl",
+                UsageEvent(
+                    timestamp=datetime.now(UTC),
+                    command="ask",
+                    model=result.model,
+                    dialect=result.dialect,
+                    input_tokens=usage_obj.input_tokens if usage_obj else None,
+                    cached_tokens=usage_obj.cached_tokens if usage_obj else None,
+                    output_tokens=usage_obj.output_tokens if usage_obj else None,
+                    reasoning_tokens=usage_obj.reasoning_tokens if usage_obj else None,
+                    elapsed=result.elapsed,
+                    status="ok" if result.exit_code == ExitCode.OK else "error",
+                    schema_used=args.schema is not None,
+                    error_kind=error_kind,
+                    items_total=None,
+                    items_ok=None,
+                    items_failed=None,
+                ),
+            )
+
+            if args.json:
+                # Machine-readable output
+                usage = result.completion.usage if result.completion else None
+                ask_obj = {
+                    "status": "ok" if result.exit_code == ExitCode.OK else "error",
+                    "model": result.model,
+                    "dialect": result.dialect,
+                    "path": str(result.path) if result.error is None else None,
+                    "tokens": {
+                        "input": usage.input_tokens if usage else None,
+                        "cached": usage.cached_tokens if usage else None,
+                        "output": usage.output_tokens if usage else None,
+                        "reasoning": usage.reasoning_tokens if usage else None,
+                    },
+                    "elapsed": result.elapsed,
+                    "error": result.error,
+                }
+                print(json.dumps(ask_obj, indent=2))
+            elif args.stdout and result.exit_code == ExitCode.OK:
+                print(result.completion.text if result.completion else "")
+                print(result.receipt, file=sys.stderr)
+            else:
+                stream = sys.stdout if result.exit_code == ExitCode.OK else sys.stderr
+                print(result.receipt, file=stream)
+            return result.exit_code
+
+        dialect = args.dialect
+        if dialect is None and args.model in config.dialect_overrides:
+            override = config.dialect_overrides[args.model]
+            if override in ("anthropic", "openai"):
+                dialect = override
+            else:
+                print(
+                    f"warning: invalid dialect override '{override}' for {args.model}, ignoring",
+                    file=sys.stderr,
+                )
+
+        outcome = await run_map(
+            client=client,
+            base_url=config.base_url,
+            key=key,
+            model=args.model,
+            items_path=args.items,
+            template_path=args.template,
+            outdir=args.outdir,
+            concurrency=args.concurrency if args.concurrency is not None else config.concurrency,
+            retries=args.retries,
+            timeout=timeout,
+            thinking=resolve_thinking(args.thinking, args.model),
+            max_tokens=args.max_tokens,
+            dialect=dialect,
+            resume=args.resume,
+            schema_file=args.schema,
+            schema_name=args.schema_name,
+        )
+
+        # Log usage (resolve dialect for logging)
+        resolved_dialect = resolve_dialect(args.model, dialect)
+        error_kind = None
+        if outcome.aborted or outcome.failed > 0:
+            error_kind = "CircuitBreakerError" if outcome.aborted else "PartialFailure"
+        append_event(
+            state_root() / "usage.jsonl",
+            UsageEvent(
+                timestamp=datetime.now(UTC),
+                command="map",
+                model=args.model,
+                dialect=resolved_dialect,
+                input_tokens=outcome.input_tokens,
+                cached_tokens=None,
+                output_tokens=outcome.output_tokens,
+                reasoning_tokens=None,
+                elapsed=outcome.elapsed,
+                status="error" if outcome.aborted else "ok",
+                schema_used=args.schema is not None,
+                error_kind=error_kind,
+                items_total=outcome.total,
+                items_ok=outcome.ok,
+                items_failed=outcome.failed,
+            ),
+        )
+
+        if args.json:
+            status = "aborted" if outcome.aborted else ("partial" if outcome.failed > 0 else "ok")
+            obj: dict[str, Any] = {
+                "status": status,
+                "total": outcome.total,
+                "ok": outcome.ok,
+                "failed": outcome.failed,
+                "skipped": outcome.skipped,
+                "attempted": outcome.attempted,
+                "outdir": str(outcome.outdir),
+                "index": str(outcome.outdir / "results.jsonl"),
+                "tokens": {
+                    "input": outcome.input_tokens,
+                    "output": outcome.output_tokens,
+                },
+                "elapsed": outcome.elapsed,
+                "failures": [
+                    {"id": item_id, "error": message} for item_id, message in outcome.failures
+                ],
+            }
+            print(json.dumps(obj, indent=2))
+        else:
+            status = "ABORTED" if outcome.aborted else "ok"
+            not_attempted = outcome.total - outcome.attempted - outcome.skipped
+            print(f"enmaas map {status}")
+            print(f"  model     {args.model}")
+            print(
+                f"  items     {outcome.total} total: {outcome.attempted} attempted, "
+                f"{outcome.ok} ok, {outcome.failed} failed, {outcome.skipped} skipped"
+            )
+            if not_attempted > 0:
+                print(f"            {not_attempted} not attempted")
+            print(f"  outdir    {outcome.outdir}")
+            print(f"  index     {outcome.outdir / 'results.jsonl'}")
+            print(f"  tokens    in {outcome.input_tokens:,}   out {outcome.output_tokens:,}")
+            print(f"  elapsed   {outcome.elapsed:.1f}s")
+            for item_id, message in outcome.failures[:20]:
+                print(f"  failure   {item_id}  {message}")
+            if outcome.aborted:
+                print("  resume    re-run with --resume to continue")
+        return outcome.exit_code

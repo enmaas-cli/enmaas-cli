@@ -1,0 +1,28 @@
+# Secrets and credentials
+.env
+*.key
+*.pem
+
+# Agent and session state
+.remember/
+.claude/
+
+# Design specs stay local, not committed
+docs/design/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Superpowers plans stay local, not committed
+docs/superpowers/
