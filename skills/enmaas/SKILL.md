@@ -56,6 +56,40 @@ template is a `str.format` string using those fields. Validation runs against
 every item before any request, so a bad template fails once rather than 400
 times.
 
+### Batch the items
+
+One call per item re-sends the whole template every time. On a bulk job most
+of each prompt is the shared instructions, so `--batch N` sends them once per
+group instead:
+
+    enmaas map -m rits/zai-org/glm-5-3 \
+      --items findings.jsonl --template classify.txt \
+      --outdir /tmp/triage --batch 10 --concurrency 3
+
+Measured on a 50-item job: 18,712 input tokens and 50 calls unbatched,
+against 8,047 and 5 calls at `--batch 10`. 57% less input, 61% faster, same
+50 answers.
+
+The template must say where it splits. Put a line reading `===PER ITEM===`
+between the shared instructions and the per-item fields:
+
+    You classify findings. Answer A, B or C.
+    ===PER ITEM===
+    TEXT: {text}
+    WHERE: {where}
+
+Everything above the marker is sent once per batch; everything below is
+repeated per item. Without the marker, `--batch` above 1 fails before any
+request rather than silently re-sending everything.
+
+Answers come back matched by item id, never by position, so a reply that
+skips an item cannot shift the rest onto the wrong items. An item with no
+answer is reported failed and `--resume` will retry it.
+
+Pick N by how long one item is. Large items in large groups risk running
+into `max_tokens` for the whole reply; start at 10 and drop it if items get
+truncated.
+
 One-shot analysis, response to a file:
 
     enmaas ask -m gpt-6-sol -f path/to/file.py <<'PROMPT'
