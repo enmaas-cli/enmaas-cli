@@ -415,11 +415,13 @@ def test_filter_by_since(tmp_path: Path) -> None:
 
 def test_unwritable_directory_does_not_break_call(tmp_path: Path) -> None:
     """Append failure is silent, call continues."""
-    unwritable = tmp_path / "readonly"
-    unwritable.mkdir()
-    unwritable.chmod(0o444)
+    # A directory with its execute bit cleared behaves differently across
+    # filesystems and users, so this uses a parent that is a regular file.
+    # Opening a child of a file fails as NotADirectoryError everywhere.
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
 
-    ledger = unwritable / "usage.jsonl"
+    ledger = blocker / "usage.jsonl"
     event = UsageEvent(
         timestamp=datetime.now(UTC),
         command="ask",
@@ -441,11 +443,8 @@ def test_unwritable_directory_does_not_break_call(tmp_path: Path) -> None:
     # Should not raise
     append_event(ledger, event)
 
-    # File should not exist
-    assert not ledger.exists()
-
-    # Cleanup
-    unwritable.chmod(0o755)
+    # Nothing was written, and crucially the call did not raise.
+    assert blocker.read_text() == ""
 
 
 def test_env_var_disables_logging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

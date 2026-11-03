@@ -12,8 +12,11 @@ from enmaas_cli.cli import main
 
 def test_permission_error_exits_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """PermissionError should exit 1 with an error message, not a traceback."""
-    # Set up environment
-    monkeypatch.setenv("ENMAAS_API_KEY", "sk-test-key")
+    # The CLI reads ENMAAS_KEY. This previously set ENMAAS_API_KEY, which it
+    # ignores, so the test only passed on a machine that happened to have a key
+    # at the ~/.secrets/enmaas fallback. On a clean runner it failed with "no
+    # key found" long before reaching the permission error it meant to check.
+    monkeypatch.setenv("ENMAAS_KEY", "sk-test-key")
 
     # Create a config file
     config = tmp_path / "config.toml"
