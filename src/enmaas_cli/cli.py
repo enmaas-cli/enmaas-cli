@@ -139,6 +139,12 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--retries", type=int, default=3)
     mp.add_argument("--timeout", type=positive_float)
     mp.add_argument("--thinking", choices=["on", "off"], default=None)
+    mp.add_argument(
+        "--batch", type=positive_int, default=1, metavar="N",
+        help="items per request (default 1). N>1 needs the template to mark "
+             "its per-item part; see the skill. Cuts input sharply on bulk "
+             "jobs because the shared preamble is sent once per batch.",
+    )
     mp.add_argument("--resume", action="store_true")
     mp.add_argument("--json", action="store_true")
     mp.add_argument("--dialect", choices=["anthropic", "openai"])
@@ -502,6 +508,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             resume=args.resume,
             schema_file=args.schema,
             schema_name=args.schema_name,
+            batch=args.batch,
         )
 
         # Log usage (resolve dialect for logging)
@@ -517,9 +524,9 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                 model=args.model,
                 dialect=resolved_dialect,
                 input_tokens=outcome.input_tokens,
-                cached_tokens=None,
+                cached_tokens=outcome.cached_tokens,
                 output_tokens=outcome.output_tokens,
-                reasoning_tokens=None,
+                reasoning_tokens=outcome.reasoning_tokens,
                 elapsed=outcome.elapsed,
                 status="error" if outcome.aborted else "ok",
                 schema_used=args.schema is not None,

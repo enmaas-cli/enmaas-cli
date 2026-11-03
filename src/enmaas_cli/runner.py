@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from .auth import redact
+from .batching import build_batch_prompt, split_batch_response, split_template
 from .client import GatewayError, call
 from .dialect import (
     Dialect,
@@ -160,6 +161,11 @@ class MapOutcome:
     aborted: bool
     input_tokens: int
     output_tokens: int
+    # Carried because caching is the largest cost lever on bulk work, and it
+    # cannot be tuned while the command that does the bulk work throws the
+    # measurement away.
+    cached_tokens: int
+    reasoning_tokens: int
     elapsed: float
     outdir: Path
     failures: list[tuple[str, str]]
@@ -191,10 +197,14 @@ async def run_map(
     resume: bool,
     schema_file: Path | None = None,
     schema_name: str | None = None,
+    batch: int = 1,
 ) -> MapOutcome:
     items = load_items(items_path)
     template = template_path.read_text(encoding="utf-8")
     validate_all(template, items)
+    # Split once, up front. A template that cannot be batched should fail
+    # before any request, not after the first group has been paid for.
+    preamble, per_item = split_template(template) if batch > 1 else ("", "")
 
     schema = load_schema(schema_file) if schema_file is not None else None
 
@@ -210,7 +220,8 @@ async def run_map(
     lock = asyncio.Lock()
     aborted = False
     started = time.monotonic()
-    counts = {"ok": 0, "failed": 0, "attempted": 0, "in": 0, "out": 0}
+    counts = {"ok": 0, "failed": 0, "attempted": 0, "in": 0, "out": 0,
+              "cached": 0, "reasoning": 0}
     failures: list[tuple[str, str]] = []
 
     async def process(item: dict[str, Any]) -> None:
@@ -241,6 +252,8 @@ async def run_map(
                 path.write_text(completion.text, encoding="utf-8")
                 counts["in"] += completion.usage.input_tokens or 0
                 counts["out"] += completion.usage.output_tokens or 0
+                counts["cached"] += completion.usage.cached_tokens or 0
+                counts["reasoning"] += completion.usage.reasoning_tokens or 0
                 row = {
                     "id": item_id,
                     "status": "ok",
@@ -273,7 +286,91 @@ async def run_map(
                 if breaker.should_abort():
                     aborted = True
 
-    await asyncio.gather(*(process(item) for item in pending))
+    async def process_batch(group: list[dict[str, Any]]) -> None:
+        """One call covering several items, answers matched back by id."""
+        nonlocal aborted
+        ids = [str(i["id"]) for i in group]
+        async with semaphore:
+            if aborted:
+                return
+            counts["attempted"] += len(group)
+            request = build_request(
+                model=model,
+                prompt=build_batch_prompt(preamble, per_item, group),
+                dialect=resolved,
+                max_tokens=tokens * len(group),
+                thinking=thinking,
+                system=None,
+                key=key,
+                schema=None,
+                schema_name=None,
+            )
+            rows: list[dict[str, Any]] = []
+            try:
+                data = await call(
+                    client, base_url, request, timeout=timeout, retries=retries
+                )
+                completion = parse_response(data, resolved)
+                answers = split_batch_response(completion.text, ids)
+                counts["in"] += completion.usage.input_tokens or 0
+                counts["out"] += completion.usage.output_tokens or 0
+                counts["cached"] += completion.usage.cached_tokens or 0
+                counts["reasoning"] += completion.usage.reasoning_tokens or 0
+            except (GatewayError, EmptyResponseError, ValidationError, OSError) as exc:
+                # The call failed, so every item in it failed. Attributing
+                # the error to each one keeps the breaker counting items.
+                message = redact(str(exc), key)
+                answers = {}
+                for item_id in ids:
+                    rows.append({"id": item_id, "status": "error", "path": None,
+                                 "tokens": None, "error": message})
+                    failures.append((item_id, message))
+                    counts["failed"] += 1
+
+            for item_id in ids:
+                if any(r["id"] == item_id for r in rows):
+                    continue
+                text = answers.get(item_id)
+                if text is None:
+                    # Not ok. A missing output file that nothing flags would
+                    # be skipped forever by --resume.
+                    message = f"no answer for {item_id} in the batched reply"
+                    rows.append({"id": item_id, "status": "error", "path": None,
+                                 "tokens": None, "error": message})
+                    failures.append((item_id, message))
+                    counts["failed"] += 1
+                    continue
+                try:
+                    if schema is not None:
+                        validate_against_schema(text, schema)
+                    path = outdir / f"{item_id}.md"
+                    path.write_text(text, encoding="utf-8")
+                except (ValidationError, OSError) as exc:
+                    message = redact(str(exc), key)
+                    rows.append({"id": item_id, "status": "error", "path": None,
+                                 "tokens": None, "error": message})
+                    failures.append((item_id, message))
+                    counts["failed"] += 1
+                    continue
+                rows.append({"id": item_id, "status": "ok", "path": str(path),
+                             "tokens": None, "batch_size": len(group),
+                             "error": None})
+                counts["ok"] += 1
+
+            async with lock:
+                with index.open("a", encoding="utf-8") as handle:
+                    for row in rows:
+                        handle.write(json.dumps(row) + "\n")
+                for row in rows:
+                    breaker.record(ok=row["status"] == "ok")
+                if breaker.should_abort():
+                    aborted = True
+
+    if batch > 1:
+        groups = [pending[n:n + batch] for n in range(0, len(pending), batch)]
+        await asyncio.gather(*(process_batch(g) for g in groups))
+    else:
+        await asyncio.gather(*(process(item) for item in pending))
 
     return MapOutcome(
         ok=counts["ok"],
@@ -284,6 +381,8 @@ async def run_map(
         aborted=aborted,
         input_tokens=counts["in"],
         output_tokens=counts["out"],
+        cached_tokens=counts["cached"],
+        reasoning_tokens=counts["reasoning"],
         elapsed=time.monotonic() - started,
         outdir=outdir,
         failures=failures,

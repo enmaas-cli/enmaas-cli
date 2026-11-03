@@ -169,6 +169,7 @@ def format_summary(summary: UsageSummary, *, since_days: int | None = None) -> s
         lines.append(f"  (reasoning):    {summary.total_reasoning_tokens:,} tokens")
     lines.append(f"Total elapsed:    {summary.total_elapsed:.1f}s")
     lines.append("")
+    lines.extend(_cost_lines(summary))
 
     if summary.by_model:
         lines.append("By model:")
@@ -210,3 +211,44 @@ def format_summary_json(summary: UsageSummary) -> str:
         "by_command": summary.by_command,
     }
     return json.dumps(obj, indent=2)
+
+
+def _cost_lines(summary: UsageSummary) -> list[str]:
+    """Spend and the reference comparison, kept clearly apart.
+
+    Spend is what the gateway charged, and is known only for models with a
+    rate. The Opus-equivalent is what the same tokens would have cost had
+    this session generated them, which is the figure that makes delegating
+    worth measuring. Adding the two would be meaningless.
+    """
+    from enmaas_cli.pricing import OPUS_REFERENCE, cost_for, opus_equivalent
+
+    table: dict[str, object] = {}
+    spend = 0.0
+    unpriced: list[str] = []
+    total_in = 0
+    total_out = 0
+
+    for model, stats in sorted(summary.by_model.items()):
+        tin = int(stats["input_tokens"])
+        tout = int(stats["output_tokens"])
+        total_in += tin
+        total_out += tout
+        cost = cost_for(model, tin, tout, table)  # type: ignore[arg-type]
+        if cost is None:
+            unpriced.append(model)
+        else:
+            spend += cost
+
+    lines = [f"Spend:            ${spend:,.2f}"]
+    if unpriced:
+        lines.append(
+            f"  unpriced:       {', '.join(unpriced)} "
+            f"(no rate configured, so not counted above)"
+        )
+    lines.append(
+        f"Opus-equivalent:  ${opus_equivalent(total_in, total_out):,.2f}"
+    )
+    lines.append(f"  reference:      {OPUS_REFERENCE.label}")
+    lines.append("")
+    return lines
