@@ -111,6 +111,47 @@ The OpenAI dialect enforces the schema server-side. The Anthropic dialect uses
 a forced tool call, which is advisory, so validation runs locally on both. In
 `map`, schema failures count toward the circuit breaker.
 
+## Telling it what models cost
+
+The gateway publishes no prices, so `usage` reports a model as unpriced
+until you say otherwise. `rits/*` is the exception: those are free and the
+tool knows it.
+
+Put your account's rates, USD per million tokens, in the config:
+
+    [prices."gpt-6-sol"]
+    input = 1.25
+    output = 10.0
+
+    [prices."gemini-"]
+    input = 2.0
+    output = 8.0
+
+A key is either an exact model id or a prefix covering a family; an exact
+id wins. A malformed or negative rate is reported as a warning and skipped,
+never dropped in silence, because a price that vanishes makes a model look
+free.
+
+## Counting work this CLI did not do
+
+The ledger only sees calls made through this CLI. A tool that talks to the
+gateway itself is invisible, and that understates real usage badly: one
+bug-hunt run pushed 1,067,793 input tokens through the gateway and `usage`
+reported none of it.
+
+If you call the gateway directly, record the run when it finishes:
+
+    enmaas record --model rits/zai-org/glm-5-3 --command bug-hunt \
+      --input 1067793 --output 49242 --elapsed 612
+
+`--command` is whatever did the work, so the ledger can tell tools apart.
+Add `--cached` and `--reasoning` when you have them, and
+`--status error --error-kind GatewayError` for a run that failed. A ledger
+holding only successes overstates how well things went.
+
+It is a subcommand rather than a library call so a caller in any language
+can be counted without importing this package.
+
 ## Exit codes
 
 | Code | Meaning | What to do |

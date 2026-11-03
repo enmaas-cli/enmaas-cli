@@ -65,6 +65,27 @@ def positive_int(value: str) -> int:
     return ival
 
 
+def nonnegative_int(value: str) -> int:
+    """Token counts may legitimately be zero, but never negative."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} is not an integer") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"{value} is negative")
+    return number
+
+
+def nonnegative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} is not a number") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"{value} is negative")
+    return number
+
+
 def positive_float(value: str) -> float:
     """Validate a positive float for argparse."""
     fval = float(value)
@@ -151,6 +172,27 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--max-tokens", type=positive_int)
     mp.add_argument("--schema", type=Path)
     mp.add_argument("--schema-name")
+
+    rec = sub.add_parser(
+        "record",
+        help="record a run this CLI did not make, so it is counted too",
+    )
+    rec.add_argument("--model", required=True)
+    rec.add_argument(
+        # Explicit dest: argparse already uses "command" for the subcommand
+        # name, and colliding would overwrite it with this value.
+        "--command", required=True, dest="command_name",
+        help="what did the work, e.g. the calling tool's name",
+    )
+    rec.add_argument("--input", type=nonnegative_int, required=True)
+    rec.add_argument("--output", type=nonnegative_int, required=True)
+    rec.add_argument("--cached", type=nonnegative_int)
+    rec.add_argument("--reasoning", type=nonnegative_int)
+    rec.add_argument("--elapsed", type=nonnegative_float, default=0.0)
+    rec.add_argument("--status", choices=["ok", "error"], default="ok")
+    rec.add_argument("--error-kind", help="class name only, never a message")
+    rec.add_argument("--dialect", choices=["openai", "anthropic"],
+                     default="openai")
 
     usage = sub.add_parser("usage", help="show usage statistics")
     usage.add_argument("--json", action="store_true")
@@ -348,6 +390,34 @@ def main(argv: list[str] | None = None) -> int:
 
 
 async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
+    if args.command == "record":
+        # A ledger that only sees this CLI's own calls understates reality:
+        # a tool talking to the gateway directly is invisible by
+        # construction. Recording is a subcommand rather than a library
+        # function so a caller in any language can be counted without
+        # taking a dependency on this package.
+        append_event(
+            state_root() / "usage.jsonl",
+            UsageEvent(
+                timestamp=datetime.now(UTC),
+                command=args.command_name,
+                model=args.model,
+                dialect=args.dialect,
+                input_tokens=args.input,
+                cached_tokens=args.cached,
+                output_tokens=args.output,
+                reasoning_tokens=args.reasoning,
+                elapsed=args.elapsed,
+                status=args.status,
+                schema_used=False,
+                error_kind=args.error_kind,
+                items_total=None,
+                items_ok=None,
+                items_failed=None,
+            ),
+        )
+        return int(ExitCode.OK)
+
     # Handle usage command first (no timeout argument)
     if args.command == "usage":
         ledger = state_root() / "usage.jsonl"
@@ -360,9 +430,9 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
         summary = summarize_usage(events)
 
         if args.json:
-            print(format_summary_json(summary))
+            print(format_summary_json(summary, config.prices))
         else:
-            print(format_summary(summary, since_days=args.since))
+            print(format_summary(summary, since_days=args.since, prices=config.prices))
 
         return int(ExitCode.OK)
 
