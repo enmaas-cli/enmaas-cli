@@ -9,6 +9,13 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from enmaas_cli.pricing import (
+    OPUS_REFERENCE,
+    ModelPrice,
+    cost_for,
+    opus_equivalent,
+)
+
 
 @dataclass(frozen=True)
 class UsageEvent:
@@ -146,7 +153,12 @@ def summarize_usage(events: list[UsageEvent]) -> UsageSummary:
     )
 
 
-def format_summary(summary: UsageSummary, *, since_days: int | None = None) -> str:
+def format_summary(
+    summary: UsageSummary,
+    *,
+    since_days: int | None = None,
+    prices: dict[str, ModelPrice] | None = None,
+) -> str:
     """Format summary as human-readable text."""
     lines = []
 
@@ -169,7 +181,7 @@ def format_summary(summary: UsageSummary, *, since_days: int | None = None) -> s
         lines.append(f"  (reasoning):    {summary.total_reasoning_tokens:,} tokens")
     lines.append(f"Total elapsed:    {summary.total_elapsed:.1f}s")
     lines.append("")
-    lines.extend(_cost_lines(summary))
+    lines.extend(_cost_lines(summary, prices or {}))
 
     if summary.by_model:
         lines.append("By model:")
@@ -198,8 +210,11 @@ def format_summary(summary: UsageSummary, *, since_days: int | None = None) -> s
     return "\n".join(lines)
 
 
-def format_summary_json(summary: UsageSummary) -> str:
+def format_summary_json(
+    summary: UsageSummary, prices: dict[str, ModelPrice] | None = None
+) -> str:
     """Format summary as JSON for machine consumption."""
+    spend, unpriced, reference = compute_costs(summary, prices)
     obj = {
         "total_calls": summary.total_calls,
         "total_input_tokens": summary.total_input_tokens,
@@ -209,11 +224,44 @@ def format_summary_json(summary: UsageSummary) -> str:
         "total_elapsed": summary.total_elapsed,
         "by_model": summary.by_model,
         "by_command": summary.by_command,
+        "spend_usd": spend,
+        "unpriced_models": unpriced,
+        "opus_equivalent_usd": reference,
+        "opus_reference": OPUS_REFERENCE.label,
     }
     return json.dumps(obj, indent=2)
 
 
-def _cost_lines(summary: UsageSummary) -> list[str]:
+def compute_costs(
+    summary: UsageSummary, table: dict[str, ModelPrice] | None = None
+) -> tuple[float, list[str], float]:
+    """Return (spend, unpriced models, Opus-equivalent).
+
+    One computation behind both the text and the JSON renderings. Two
+    copies would drift, which is how a hand-maintained summary of this
+    very ledger went stale in the first place.
+    """
+    table = table or {}
+    spend = 0.0
+    unpriced: list[str] = []
+    total_in = 0
+    total_out = 0
+    for model, stats in sorted(summary.by_model.items()):
+        tin = int(stats["input_tokens"])
+        tout = int(stats["output_tokens"])
+        total_in += tin
+        total_out += tout
+        cost = cost_for(model, tin, tout, table)
+        if cost is None:
+            unpriced.append(model)
+        else:
+            spend += cost
+    return spend, unpriced, opus_equivalent(total_in, total_out)
+
+
+def _cost_lines(
+    summary: UsageSummary, table: dict[str, ModelPrice]
+) -> list[str]:
     """Spend and the reference comparison, kept clearly apart.
 
     Spend is what the gateway charged, and is known only for models with a
@@ -221,24 +269,7 @@ def _cost_lines(summary: UsageSummary) -> list[str]:
     this session generated them, which is the figure that makes delegating
     worth measuring. Adding the two would be meaningless.
     """
-    from enmaas_cli.pricing import OPUS_REFERENCE, cost_for, opus_equivalent
-
-    table: dict[str, object] = {}
-    spend = 0.0
-    unpriced: list[str] = []
-    total_in = 0
-    total_out = 0
-
-    for model, stats in sorted(summary.by_model.items()):
-        tin = int(stats["input_tokens"])
-        tout = int(stats["output_tokens"])
-        total_in += tin
-        total_out += tout
-        cost = cost_for(model, tin, tout, table)  # type: ignore[arg-type]
-        if cost is None:
-            unpriced.append(model)
-        else:
-            spend += cost
+    spend, unpriced, reference = compute_costs(summary, table)
 
     lines = [f"Spend:            ${spend:,.2f}"]
     if unpriced:
@@ -246,9 +277,7 @@ def _cost_lines(summary: UsageSummary) -> list[str]:
             f"  unpriced:       {', '.join(unpriced)} "
             f"(no rate configured, so not counted above)"
         )
-    lines.append(
-        f"Opus-equivalent:  ${opus_equivalent(total_in, total_out):,.2f}"
-    )
+    lines.append(f"Opus-equivalent:  ${reference:,.2f}")
     lines.append(f"  reference:      {OPUS_REFERENCE.label}")
     lines.append("")
     return lines

@@ -10,6 +10,8 @@ measuring at all.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from enmaas_cli.pricing import (
     OPUS_REFERENCE,
     ModelPrice,
@@ -148,3 +150,131 @@ def test_the_summary_names_models_it_cannot_price() -> None:
 
     assert "unpriced" in text.lower()
     assert "gpt-6-sol" in text
+
+
+def test_prices_can_be_configured(tmp_path: Path) -> None:
+    """The table existed but nothing ever filled it.
+
+    price_for took a configurable table from the start and the summary
+    passed an empty dict, so every model except the free rits/* ones was
+    unpriced forever with no way for a user to fix it. A configurable knob
+    nothing can reach is not a feature.
+    """
+    from enmaas_cli.config import load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[prices."gpt-6-sol"]\n'
+        "input = 1.25\n"
+        "output = 10.0\n"
+        '[prices."gemini-"]\n'
+        "input = 2.0\n"
+        "output = 8.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.warnings == []
+    assert config.prices["gpt-6-sol"].input_per_mtok == 1.25
+    assert config.prices["gpt-6-sol"].output_per_mtok == 10.0
+    assert config.prices["gemini-"].input_per_mtok == 2.0
+
+
+def test_a_malformed_price_is_warned_about_not_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    """A price that quietly vanishes makes a model look free."""
+    from enmaas_cli.config import load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[prices."m"]\ninput = "free"\noutput = 1.0\n', encoding="utf-8"
+    )
+
+    config = load_config(path)
+
+    assert config.prices == {}
+    assert any("price" in w.lower() for w in config.warnings)
+
+
+def test_a_negative_price_is_rejected(tmp_path: Path) -> None:
+    from enmaas_cli.config import load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text('[prices."m"]\ninput = -1.0\noutput = 1.0\n', encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.prices == {}
+    assert config.warnings
+
+
+def test_the_summary_uses_configured_prices_end_to_end(
+    tmp_path: Path, monkeypatch: object, capsys: object
+) -> None:
+    """The link that was missing: config -> summary.
+
+    Without it the knob exists, parses, and changes nothing.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from enmaas_cli.cli import main
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    ledger = tmp_path / "enmaas" / "runs" / "usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        json.dumps({
+            "timestamp": datetime.now(UTC).isoformat(), "command": "ask",
+            "model": "gpt-6-sol", "dialect": "openai",
+            "input_tokens": 1_000_000, "cached_tokens": 0,
+            "output_tokens": 100_000, "reasoning_tokens": 0, "elapsed": 1.0,
+            "status": "ok", "schema_used": False, "error_kind": None,
+            "items_total": None, "items_ok": None, "items_failed": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[prices."gpt-6-sol"]\ninput = 1.0\noutput = 10.0\n', encoding="utf-8"
+    )
+
+    main(["--config", str(config), "usage"])
+
+    out = capsys.readouterr().out  # type: ignore[attr-defined]
+    # 1M input at $1 is $1.00; 100k output at $10 is $1.00.
+    assert "$2.00" in out
+    assert "unpriced" not in out.lower()
+
+
+def test_the_json_summary_carries_cost_too() -> None:
+    """A machine consumer should not get less than a human reader.
+
+    The text summary reported spend and the Opus-equivalent while --json
+    reported neither, so any script had to re-derive them and drift from
+    the tool. That is how the hand-maintained tracker went stale.
+    """
+    import json as _json
+    from datetime import UTC, datetime
+
+    from enmaas_cli.usage import UsageEvent, format_summary_json, summarize_usage
+
+    events = [
+        UsageEvent(
+            timestamp=datetime.now(UTC), command="ask",
+            model="rits/zai-org/glm-5-3", dialect="openai",
+            input_tokens=1_000_000, cached_tokens=0, output_tokens=100_000,
+            reasoning_tokens=0, elapsed=1.0, status="ok", schema_used=False,
+            error_kind=None, items_total=None, items_ok=None,
+            items_failed=None,
+        ),
+    ]
+
+    obj = _json.loads(format_summary_json(summarize_usage(events)))
+
+    assert obj["spend_usd"] == 0.0
+    assert obj["opus_equivalent_usd"] == 7.5
+    assert obj["unpriced_models"] == []
+    assert "Opus" in obj["opus_reference"]
