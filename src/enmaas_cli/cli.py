@@ -320,16 +320,22 @@ def main(argv: list[str] | None = None) -> int:
     for warning in config.warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
-    try:
-        key = resolve_key(key_file=args.key_file, env=dict(os.environ), home=Path.home())
-    except AuthError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return int(ExitCode.ERROR)
-    if key.warning:
-        print(f"warning: {key.warning}", file=sys.stderr)
+    # `usage` only reads a local ledger, so requiring a credential for it meant
+    # a new user could not even look at the tool before obtaining a key.
+    needs_key = args.command != "usage"
+    key_value = ""
+    if needs_key:
+        try:
+            key = resolve_key(key_file=args.key_file, env=dict(os.environ), home=Path.home())
+        except AuthError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return int(ExitCode.ERROR)
+        if key.warning:
+            print(f"warning: {key.warning}", file=sys.stderr)
+        key_value = key.value
 
     try:
-        return asyncio.run(_dispatch(args, config, key.value))
+        return asyncio.run(_dispatch(args, config, key_value))
     except (DialectError, ValidationError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return int(ExitCode.ERROR)
