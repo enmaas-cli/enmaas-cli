@@ -47,6 +47,30 @@ _OPENAI_THINKING_OFF: dict[str, dict[str, Any]] = {
 _OPENAI_THINKING_OFF_DEFAULT: dict[str, Any] = {"reasoning_effort": "none"}
 _ANTHROPIC_THINKING_OFF: dict[str, Any] = {"thinking": {"type": "disabled"}}
 
+# Models with a reasoning floor rather than an off switch. Measured 2026-11-03
+# against the gateway: gemini rejects "none" with a 400 naming the values it
+# will take, and "minimal" still spends about 59 reasoning tokens. Disabling
+# is therefore impossible, and saying so beats sending a value that fails.
+_OPENAI_THINKING_FLOOR: dict[str, tuple[dict[str, Any], str]] = {
+    "gemini-": (
+        {"reasoning_effort": "minimal"},
+        "gemini rejects reasoning_effort 'none'; sending 'minimal', which is "
+        "the floor for this model and still spends reasoning tokens",
+    ),
+}
+
+# Reasoning-family models took max_completion_tokens when max_tokens was
+# retired. Sending the old name is a 400 at request validation, before any
+# inference, so the model is unusable rather than merely degraded.
+_OPENAI_COMPLETION_TOKEN_PREFIXES = ("gpt-",)
+
+
+def openai_token_field(model: str) -> str:
+    """The name this model wants for its output-token ceiling."""
+    if model.startswith(_OPENAI_COMPLETION_TOKEN_PREFIXES):
+        return "max_completion_tokens"
+    return "max_tokens"
+
 
 @dataclass(frozen=True)
 class Request:
@@ -80,6 +104,9 @@ def thinking_off_payload(dialect: Dialect, model: str) -> tuple[dict[str, Any], 
     """Return the body fragment that disables reasoning, plus any warning."""
     if dialect == "anthropic":
         return dict(_ANTHROPIC_THINKING_OFF), None
+    for prefix, (payload, note) in _OPENAI_THINKING_FLOOR.items():
+        if model.startswith(prefix):
+            return dict(payload), note
     for prefix, payload in _OPENAI_THINKING_OFF.items():
         if model.startswith(prefix):
             return dict(payload), None
@@ -103,9 +130,10 @@ def build_request(
     schema_name: str | None = None,
 ) -> Request:
     """Build a dialect-correct request. The key goes in headers, never the body."""
-    body: dict[str, Any] = {"model": model, "max_tokens": max_tokens}
+    body: dict[str, Any] = {"model": model}
 
     if dialect == "anthropic":
+        body["max_tokens"] = max_tokens
         path = "/v1/messages"
         headers = {
             "x-api-key": key,
@@ -116,6 +144,7 @@ def build_request(
         if system is not None:
             body["system"] = system
     else:
+        body[openai_token_field(model)] = max_tokens
         path = "/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {key}",

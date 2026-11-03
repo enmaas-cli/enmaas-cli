@@ -199,3 +199,55 @@ def test_repr_does_not_leak_key() -> None:
     assert KEY not in r
     assert "Authorization" in r
     assert req.path in r
+
+
+def test_gpt_models_get_max_completion_tokens() -> None:
+    """gpt-6-sol rejects max_tokens with HTTP 400 and requires the other name.
+
+    Confirmed live against the gateway: sending max_tokens makes the model
+    unusable through this CLI, which is the model the skill recommends for a
+    second opinion on code.
+    """
+    request = build_request(
+        model="gpt-6-sol",
+        prompt="hi",
+        dialect="openai",
+        max_tokens=256,
+        thinking=True,
+        system=None,
+        key="k",
+    )
+
+    assert request.body["max_completion_tokens"] == 256
+    assert "max_tokens" not in request.body
+
+
+def test_other_openai_models_keep_max_tokens() -> None:
+    """The rename is per-model, not a blanket change to the dialect."""
+    request = build_request(
+        model=GLM,
+        prompt="hi",
+        dialect="openai",
+        max_tokens=256,
+        thinking=True,
+        system=None,
+        key="k",
+    )
+
+    assert request.body["max_tokens"] == 256
+    assert "max_completion_tokens" not in request.body
+
+
+def test_gemini_thinking_off_uses_minimal_not_none() -> None:
+    """Gemini rejects reasoning_effort 'none' outright.
+
+    Confirmed live: 'none' returns HTTP 400 naming the valid values as high,
+    low, max, medium and minimal. 'minimal' is accepted and is the floor;
+    it still spends about 59 reasoning tokens, so there is no true off
+    switch for this model.
+    """
+    payload, warning = thinking_off_payload("openai", "gemini-3.1-pro-preview")
+
+    assert payload == {"reasoning_effort": "minimal"}
+    assert warning is not None
+    assert "minimal" in warning

@@ -97,7 +97,16 @@ separate pool. Measured: with reasoning on, a 45 KB prompt produced a 504 after
 300 seconds on GLM, and 32,768 tokens of invisible thinking with zero text on
 DeepSeek. With reasoning off, the same prompt returned in 35.7s and 18.6s.
 
-Both `ask` and `map` therefore default to `--thinking off`.
+So `ask` and `map` default to `--thinking off` **for the hosted `rits/*`
+models only**. Frontier models manage their own budgets and are left alone
+unless you ask, so a Gemini or GPT call reasons by default and that reasoning
+comes out of the same `max_tokens`. On a long prompt it can consume the whole
+budget and return a truncated answer. Pass `--thinking off` explicitly when
+you want the output, not the thinking.
+
+`gemini-*` has no off switch: it rejects `reasoning_effort: "none"` outright,
+so `--thinking off` sends `minimal` and warns. That is a floor, not an off,
+and it still spends reasoning tokens.
 
 If a call fails with "exhausted max_tokens during reasoning, no text produced",
 the fix is `--thinking off` or a shorter prompt, not a bigger `--max-tokens`.
