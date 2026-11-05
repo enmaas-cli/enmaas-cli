@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -228,10 +229,60 @@ class EmptyResponseError(Exception):
 
 @dataclass(frozen=True)
 class Completion:
+    """A parsed response.
+
+    Anything built by `parse_response` has `text` and `reasoning` that
+    are UTF-8 encodable, which is what the five places that write or
+    print them rely on. Constructing one directly bypasses that, so
+    don't: go through the parsers.
+
+    The guarantee is not enforced in __post_init__ on purpose. Raising
+    there would turn a model quirk back into the crash this exists to
+    prevent, and re-encoding every response to check would repeat work
+    the parsers have already done.
+    """
+
     text: str
     reasoning: str
     stop: str | None
     usage: Usage
+    # How many codepoints had to be replaced to keep that guarantee.
+    # Carried rather than discarded: silently altering a model's output
+    # and saying nothing is its own kind of wrong.
+    replaced: int = 0
+
+
+# The only codepoints UTF-8 cannot encode. Verified exhaustively: of the
+# 1,114,112 codepoints, exactly these 2,048 raise UnicodeEncodeError, so
+# replacing them makes the encodable guarantee total rather than partial.
+_UNENCODABLE = re.compile("[\ud800-\udfff]")
+
+# U+FFFD REPLACEMENT CHARACTER, the standard marker for "something was
+# here that could not be represented". Chosen over dropping the
+# character, which would hide the damage, and over errors="replace" on
+# encode, which yields a bare "?" indistinguishable from real content.
+_REPLACEMENT = "�"
+
+
+def _utf8_safe(text: str) -> tuple[str, int]:
+    """Return text that can be encoded as UTF-8, and how much was replaced.
+
+    A model can emit a lone surrogate: `\\ud800` is plain ASCII in the
+    JSON body, so it survives transport and json.loads intact and only
+    fails later, at the point of writing the response to disk. That
+    raised UnicodeEncodeError, which is a ValueError rather than an
+    OSError and so matched none of the handlers, taking down an entire
+    map run over one bad character in one item.
+
+    Fast path first: the overwhelming majority of responses are clean,
+    and encoding is a C-level scan, so the regex only runs on the rare
+    broken one.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return _UNENCODABLE.subn(_REPLACEMENT, text)
+    return text, 0
 
 
 def _parse_openai(data: dict[str, Any]) -> Completion:
@@ -240,9 +291,14 @@ def _parse_openai(data: dict[str, Any]) -> Completion:
     usage = data.get("usage") or {}
     details = usage.get("completion_tokens_details") or {}
     prompt_details = usage.get("prompt_tokens_details") or {}
+    text, text_replaced = _utf8_safe(message.get("content") or "")
+    reasoning, reasoning_replaced = _utf8_safe(
+        message.get("reasoning_content") or message.get("reasoning") or ""
+    )
     return Completion(
-        text=message.get("content") or "",
-        reasoning=message.get("reasoning_content") or message.get("reasoning") or "",
+        text=text,
+        reasoning=reasoning,
+        replaced=text_replaced + reasoning_replaced,
         stop=choice.get("finish_reason"),
         usage=Usage(
             # prompt_tokens already includes the cached portion.
@@ -278,13 +334,18 @@ def _parse_anthropic(data: dict[str, Any]) -> Completion:
             tool_input = b.get("input", {})
             text_parts.append(json_module.dumps(tool_input))
 
-    return Completion(
-        text="".join(text_parts),
-        reasoning="".join(
+    text, text_replaced = _utf8_safe("".join(text_parts))
+    reasoning, reasoning_replaced = _utf8_safe(
+        "".join(
             b.get("thinking", "")
             for b in blocks
             if b.get("type") in ("thinking", "redacted_thinking")
-        ),
+        )
+    )
+    return Completion(
+        text=text,
+        reasoning=reasoning,
+        replaced=text_replaced + reasoning_replaced,
         stop=data.get("stop_reason"),
         usage=Usage(
             input_tokens=total_input,

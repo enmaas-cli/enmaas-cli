@@ -24,6 +24,7 @@ from .dialect import (
     parse_response,
     resolve_dialect,
 )
+from .outputs import protect
 from .schema import ValidationError, load_schema, validate_against_schema
 
 # ValidationError moved to .schema; re-exported so existing importers keep working.
@@ -180,7 +181,14 @@ def spent_tokens(outdir: Path) -> int:
 
 
 def resume_skips(outdir: Path) -> set[str]:
-    """IDs recorded ok AND having an output file on disk."""
+    """IDs recorded ok, having an output file, and not repaired.
+
+    A repaired item succeeded, so its output stays on disk and nothing
+    is lost. But it is deliberately *not* skipped: the saved text
+    differs from what the model sent, and treating it as finished would
+    mean a rerun could never obtain a clean version of it. Offering the
+    retry costs a request, which --token-budget exists to bound.
+    """
     index = outdir / "results.jsonl"
     if not index.exists():
         return set()
@@ -192,6 +200,8 @@ def resume_skips(outdir: Path) -> set[str]:
         try:
             row = json.loads(stripped)
         except json.JSONDecodeError:
+            continue
+        if row.get("replaced") or row.get("replaced_in_request"):
             continue
         item_id = str(row.get("id", ""))
         if row.get("status") == "ok" and (outdir / f"{item_id}.md").exists():
@@ -284,6 +294,8 @@ async def run_map(
     outdir.mkdir(parents=True, exist_ok=True)
     skips = resume_skips(outdir) if resume else set()
     pending = [i for i in items if str(i["id"]) not in skips]
+    for item in pending:
+        protect(outdir / f"{item['id']}.md")
 
     resolved = resolve_dialect(model, dialect)
     tokens = max_tokens or default_max_tokens(thinking=thinking)
@@ -367,6 +379,10 @@ async def run_map(
                         "in": completion.usage.input_tokens,
                         "out": completion.usage.output_tokens,
                     },
+                    # Only present when the response had to be altered to
+                    # be writable. A bulk run prints no per-item receipt,
+                    # so without this the repair would leave no trace.
+                    **({"replaced": completion.replaced} if completion.replaced else {}),
                     "error": None,
                 }
                 counts["ok"] += 1
@@ -492,6 +508,12 @@ async def run_map(
                     continue
                 rows.append({"id": item_id, "status": "ok", "path": str(path),
                              "tokens": None, "batch_size": len(group),
+                             # Request-level, not item-level: one reply
+                             # covered the whole group and was repaired
+                             # before it could be split, so the count
+                             # cannot be attributed to a single item.
+                             **({"replaced_in_request": completion.replaced}
+                                if completion.replaced else {}),
                              "error": None})
                 counts["ok"] += 1
 

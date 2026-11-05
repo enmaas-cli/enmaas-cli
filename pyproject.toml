@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "enmaas-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Delegate work to EnMaaS-hosted models from the command line"
 requires-python = ">=3.11"
 dependencies = ["httpx>=0.27", "jsonschema>=4.18,<5"]

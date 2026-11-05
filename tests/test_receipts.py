@@ -221,3 +221,23 @@ def test_a_resumed_run_does_not_double_count_in_the_rolling_line() -> None:
     )
     assert "500 of 10,000 tokens, rolling window" in text
     assert "900" not in text
+def test_the_receipt_says_when_output_was_repaired() -> None:
+    """Altering a model's output and saying nothing is its own kind of wrong."""
+    completion = Completion(
+        text="ok � bad", reasoning="", stop="stop", usage=Usage(), replaced=1
+    )
+    text = ask_receipt(
+        model="m", dialect="openai", completion=completion,
+        path=Path("out.md"), elapsed=1.0,
+    )
+    assert "1 character the model emitted could not be encoded" in text
+    assert "U+FFFD" in text
+
+
+def test_a_clean_response_gains_no_warning() -> None:
+    completion = Completion(text="fine", reasoning="", stop="stop", usage=Usage())
+    text = ask_receipt(
+        model="m", dialect="openai", completion=completion,
+        path=Path("out.md"), elapsed=1.0,
+    )
+    assert "U+FFFD" not in text

@@ -148,11 +148,11 @@ async def test_small_map_run_completes(key: str, tmp_path: Path) -> None:
         if line.strip()
     ]
     # The index interleaves per-item rows with one charge row per request.
-    items = [r for r in rows if r.get("type") != "request"]
+    item_rows = [r for r in rows if r.get("type") != "request"]
     charges = [r for r in rows if r.get("type") == "request"]
-    assert len(items) == 5
-    assert all(r["status"] == "ok" for r in items)
-    assert all(r["tokens"]["out"] for r in items)
+    assert len(item_rows) == 5
+    assert all(r["status"] == "ok" for r in item_rows)
+    assert all(r["tokens"]["out"] for r in item_rows)
     # Five serial requests, each charged something against a real gateway.
     assert len(charges) == 5
     assert all(c["charge"] > 0 for c in charges)

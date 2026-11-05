@@ -18,6 +18,7 @@ locally is what makes `--schema` mean the same thing on both.
 from __future__ import annotations
 
 import json
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -64,4 +65,22 @@ def validate_against_schema(text: str, schema: dict[str, Any]) -> None:
     try:
         jsonschema.validate(payload, schema)
     except jsonschema.ValidationError as exc:
-        raise ValidationError(f"response does not match schema: {exc.message}") from exc
+        # jsonschema's message can contain the entire rejected response.
+        # Report the rule and a bounded field path without printing its value.
+        parts = [str(part)[:32] for part in islice(exc.absolute_path, 4)]
+        location = json.dumps(parts, ensure_ascii=True)
+        if len(location) > 120:
+            location = location[:117] + "..."
+        rule = str(exc.validator or "schema")[:48]
+        detail = ""
+        if (
+            exc.validator == "required"
+            and isinstance(exc.instance, dict)
+            and isinstance(exc.validator_value, list)
+        ):
+            missing = [name for name in exc.validator_value if name not in exc.instance]
+            names = json.dumps([name[:32] for name in missing[:4]], ensure_ascii=True)
+            detail = f"; missing fields: {names[:120]}"
+        raise ValidationError(
+            f"response does not match schema at {location}: {rule} constraint failed{detail}"
+        ) from exc

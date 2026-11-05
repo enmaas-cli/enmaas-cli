@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import os
 import secrets
 import shutil
 import time
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .dialect import Completion, Dialect
+from .outputs import state_root as state_root
 
 if TYPE_CHECKING:  # pragma: no cover
     # Import-time cycle avoidance: runner imports budget, not receipts,
@@ -20,12 +20,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from .runner import MapOutcome
 
 PREVIEW_LIMIT = 160
-
-
-def state_root() -> Path:
-    base = os.environ.get("XDG_STATE_HOME")
-    root = Path(base) if base else Path.home() / ".local" / "state"
-    return root / "enmaas" / "runs"
 
 
 def create_run_dir(root: Path) -> Path:
@@ -92,6 +86,14 @@ def ask_receipt(
     ]
     if completion.stop in ("length", "max_tokens"):
         lines.append(f"  warning   output truncated at the token limit ({completion.stop})")
+    if completion.replaced:
+        # The response was altered to make it writable. Saying so is the
+        # difference between a repaired file and a quietly corrupted one.
+        plural = "s" if completion.replaced > 1 else ""
+        lines.append(
+            f"  warning   {completion.replaced} character{plural} the model emitted "
+            f"could not be encoded and became U+FFFD"
+        )
     head = preview(completion.text)
     if head:
         lines.append(f"  preview   {head}")
