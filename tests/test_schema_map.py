@@ -75,8 +75,17 @@ async def test_map_schema_invalid_item_recorded_as_failed(tmp_path: Path) -> Non
     assert outcome.ok == 0
     assert call_count["count"] == 1
 
-    results = (outdir / "results.jsonl").read_text()
-    result_line = json.loads(results.strip())
+    rows = [
+        json.loads(line)
+        for line in (outdir / "results.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    # One charge row follows the item row, and its charge is nonzero: a
+    # response the schema rejects still cost the tokens that produced it.
+    charges = [r for r in rows if r.get("type") == "request"]
+    assert len(charges) == 1
+    assert charges[0]["charge"] > 0
+    result_line = next(r for r in rows if r.get("type") != "request")
     assert result_line["id"] == "one"
     assert result_line["status"] == "error"
     assert "schema" in result_line["error"].lower() or "validation" in result_line["error"].lower()
@@ -137,5 +146,5 @@ async def test_map_schema_invalid_counts_toward_circuit_breaker(tmp_path: Path) 
             schema_name="Test",
         )
 
-    assert outcome.aborted is True
+    assert outcome.abort_reason == "breaker"
     assert outcome.attempted < 10

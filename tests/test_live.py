@@ -147,9 +147,15 @@ async def test_small_map_run_completes(key: str, tmp_path: Path) -> None:
         for line in (outdir / "results.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert len(rows) == 5
-    assert all(r["status"] == "ok" for r in rows)
-    assert all(r["tokens"]["out"] for r in rows)
+    # The index interleaves per-item rows with one charge row per request.
+    items = [r for r in rows if r.get("type") != "request"]
+    charges = [r for r in rows if r.get("type") == "request"]
+    assert len(items) == 5
+    assert all(r["status"] == "ok" for r in items)
+    assert all(r["tokens"]["out"] for r in items)
+    # Five serial requests, each charged something against a real gateway.
+    assert len(charges) == 5
+    assert all(c["charge"] > 0 for c in charges)
 
 
 async def test_bad_model_fails_fast_without_retrying(key: str, tmp_path: Path) -> None:
@@ -173,3 +179,37 @@ async def test_bad_model_fails_fast_without_retrying(key: str, tmp_path: Path) -
         )
     assert result.exit_code == 1
     assert "FAILED" in result.receipt
+
+
+async def test_token_budget_stops_a_real_run(key: str, tmp_path: Path) -> None:
+    """A tiny ceiling against the free model. Costs nothing.
+
+    Calls run_map directly rather than shelling out to the CLI: a
+    subprocess would read the real config and append to the real usage
+    ledger, and after phase 2 an exhausted rolling budget could reject the
+    test itself.
+    """
+    items = tmp_path / "items.jsonl"
+    items.write_text(
+        "\n".join(
+            json.dumps({"id": f"i{n}", "q": "Name one colour. One word."})
+            for n in range(10)
+        ),
+        encoding="utf-8",
+    )
+    template = tmp_path / "t.txt"
+    template.write_text("{q}", encoding="utf-8")
+
+    async with httpx.AsyncClient() as client:
+        outcome = await run_map(
+            client=client, base_url=BASE, key=key, model=GLM,
+            items_path=items, template_path=template,
+            outdir=tmp_path / "out", concurrency=1, retries=0,
+            timeout=120, thinking=False, max_tokens=None,
+            dialect=None, resume=False, token_budget=50,
+        )
+
+    assert outcome.abort_reason == "budget", outcome
+    assert outcome.exit_code == 3
+    assert outcome.attempted < 10
+    assert outcome.spent >= 50

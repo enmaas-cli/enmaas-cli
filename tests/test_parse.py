@@ -105,3 +105,23 @@ def test_text_at_length_limit_is_not_an_error() -> None:
         "usage": {"prompt_tokens": 10, "completion_tokens": 20},
     }
     assert parse_response(data, "openai").text == "partial"
+
+
+def test_empty_response_error_carries_the_usage_it_cost() -> None:
+    """The README's DeepSeek case: reasoning burned the budget, no text came back.
+
+    Those tokens were charged. An exception that drops the usage makes the
+    most expensive failure mode invisible to any budget.
+    """
+    data = {
+        "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+        "usage": {
+            "prompt_tokens": 500,
+            "completion_tokens": 32768,
+            "completion_tokens_details": {"reasoning_tokens": 32768},
+        },
+    }
+    with pytest.raises(EmptyResponseError) as exc:
+        parse_response(data, "openai")
+    assert exc.value.usage.input_tokens == 500
+    assert exc.value.usage.output_tokens == 32768

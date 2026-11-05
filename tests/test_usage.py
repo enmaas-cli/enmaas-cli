@@ -10,6 +10,7 @@ from enmaas_cli.usage import (
     UsageEvent,
     append_event,
     load_events,
+    load_events_strict,
     summarize_usage,
 )
 
@@ -525,3 +526,181 @@ def test_env_var_empty_enables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     append_event(ledger, event)
     assert ledger.exists()
+
+
+def _ok_row(**overrides: object) -> dict[str, object]:
+    """A valid serialised ledger row, before any damage is applied."""
+    row: dict[str, object] = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "command": "ask",
+        "model": "m",
+        "dialect": "openai",
+        "input_tokens": 100,
+        "cached_tokens": 0,
+        "output_tokens": 10,
+        "reasoning_tokens": 0,
+        "elapsed": 1.0,
+        "status": "ok",
+        "schema_used": False,
+        "error_kind": None,
+        "items_total": None,
+        "items_ok": None,
+        "items_failed": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_a_null_row_does_not_crash_either_reader(tmp_path: Path) -> None:
+    """Pre-existing bug: data.pop() on None raises AttributeError, which is
+    NOT in load_events' suppressed set, so `enmaas usage` crashed on it."""
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text("null\n", encoding="utf-8")
+
+    assert load_events(ledger) == []
+    events, problems = load_events_strict(ledger)
+    assert events == []
+    assert len(problems) == 1
+
+
+def test_strict_reader_rejects_negative_counts(tmp_path: Path) -> None:
+    """A negative count would subtract from recorded spend."""
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(json.dumps(_ok_row(output_tokens=-100000)) + "\n", encoding="utf-8")
+
+    events, problems = load_events_strict(ledger)
+    assert events == []
+    assert any("nonnegative" in p for p in problems)
+
+
+def test_strict_reader_rejects_string_counts(tmp_path: Path) -> None:
+    """"100" passes the dataclass and breaks arithmetic downstream."""
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(json.dumps(_ok_row(input_tokens="100")) + "\n", encoding="utf-8")
+
+    events, problems = load_events_strict(ledger)
+    assert events == []
+    assert problems
+
+
+def test_strict_reader_rejects_naive_timestamps(tmp_path: Path) -> None:
+    """A naive datetime raises when compared against an aware window cutoff."""
+    ledger = tmp_path / "usage.jsonl"
+    naive = datetime.now().replace(tzinfo=None).isoformat()  # noqa: DTZ005
+    ledger.write_text(json.dumps(_ok_row(timestamp=naive)) + "\n", encoding="utf-8")
+
+    events, problems = load_events_strict(ledger)
+    assert events == []
+    assert any("naive" in p for p in problems)
+
+
+def test_strict_reader_reports_invalid_utf8(tmp_path: Path) -> None:
+    """UnicodeDecodeError is not an OSError and would escape the handler."""
+    ledger = tmp_path / "usage.jsonl"
+    # A complete, valid row first. With an incomplete one the test would
+    # pass on a missing-fields error even if decoding were handled, so it
+    # would not be testing decoding at all.
+    ledger.write_bytes(json.dumps(_ok_row()).encode() + b"\n\xff\xfe\n")
+
+    events, problems = load_events_strict(ledger)
+    assert events == []
+    assert len(problems) == 1
+    assert "could not be read" in problems[0]
+
+
+def test_strict_reader_agrees_with_the_forgiving_one_when_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+    ledger = tmp_path / "usage.jsonl"
+    for out in (10, 20):
+        append_event(ledger, UsageEvent(
+            timestamp=datetime.now(UTC), command="ask", model="m",
+            dialect="openai", input_tokens=100, cached_tokens=0,
+            output_tokens=out, reasoning_tokens=0, elapsed=1.0,
+            status="ok", schema_used=False, error_kind=None,
+            items_total=None, items_ok=None, items_failed=None,
+        ))
+    events, problems = load_events_strict(ledger)
+    assert problems == []
+    assert len(events) == len(load_events(ledger)) == 2
+
+
+def test_strict_reader_on_a_missing_ledger_is_clean(tmp_path: Path) -> None:
+    """A fresh install has no ledger and has spent nothing."""
+    events, problems = load_events_strict(tmp_path / "nope.jsonl")
+    assert events == []
+    assert problems == []
+
+
+def test_append_event_reports_a_failure_at_close_not_just_at_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A buffered line only reaches disk on close.
+
+    Combining contextlib.suppress and open in one `with` caught the
+    close error and then carried on to report success, so dropped spend
+    looked recorded and the budget warning never fired.
+    """
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+
+    class FailsOnClose:
+        def __enter__(self) -> "FailsOnClose":
+            return self
+
+        def write(self, text: str) -> int:
+            return len(text)
+
+        def __exit__(self, *exc: object) -> None:
+            raise OSError("disk full on close")
+
+    event = UsageEvent(
+        timestamp=datetime.now(UTC), command="ask", model="m", dialect="openai",
+        input_tokens=1, cached_tokens=0, output_tokens=1, reasoning_tokens=0,
+        elapsed=1.0, status="ok", schema_used=False, error_kind=None,
+        items_total=None, items_ok=None, items_failed=None,
+    )
+    monkeypatch.setattr(Path, "open", lambda *a, **k: FailsOnClose())
+
+    assert append_event(tmp_path / "usage.jsonl", event) is False
+
+
+def test_append_event_coerces_floats_so_its_own_reader_accepts_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gateway reporting 10.0 must not make the next budgeted run
+    refuse because this tool's own ledger looks corrupt."""
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+    ledger = tmp_path / "usage.jsonl"
+    event = UsageEvent(
+        timestamp=datetime.now(UTC), command="ask", model="m", dialect="openai",
+        input_tokens=10.0, cached_tokens=0, output_tokens=20.0,  # type: ignore[arg-type]
+        reasoning_tokens=0, elapsed=1.0, status="ok", schema_used=False,
+        error_kind=None, items_total=None, items_ok=None, items_failed=None,
+        charge=30.0,  # type: ignore[arg-type]
+    )
+    assert append_event(ledger, event) is True
+
+    events, problems = load_events_strict(ledger)
+    assert problems == []
+    assert events[0].charge == 30
+
+
+def test_a_ledger_mixing_old_and_new_rows_totals_correctly(tmp_path: Path) -> None:
+    """Rows written before `charge` existed must still count."""
+    from enmaas_cli.budget import rolling_spend
+
+    now = datetime.now(UTC)
+    ledger = tmp_path / "usage.jsonl"
+    old_row = _ok_row(input_tokens=10, cached_tokens=0, output_tokens=0,
+                      reasoning_tokens=3)
+    new_row = _ok_row(input_tokens=10, cached_tokens=0, output_tokens=0,
+                      reasoning_tokens=3, charge=100)
+    ledger.write_text(
+        json.dumps(old_row) + "\n" + json.dumps(new_row) + "\n", encoding="utf-8"
+    )
+
+    events, problems = load_events_strict(ledger)
+    assert problems == []
+    # Old row derives 10 + reasoning fallback 3 = 13; new row uses 100.
+    assert rolling_spend(events, window_days=30, now=now) == 113

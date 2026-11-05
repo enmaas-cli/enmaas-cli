@@ -12,6 +12,16 @@ BASE_URL = "https://api.enmaas.devshift.net"
 DEFAULT_MODEL = "rits/zai-org/glm-5-3"
 
 
+class ConfigError(Exception):
+    """A configured control that cannot be honoured as written.
+
+    Raised only for the [budget] table. Every other key degrades to its
+    default with a warning, because the others are preferences. A budget
+    is a control: silently ignoring a malformed one would permit the
+    unlimited spend the user was trying to prevent.
+    """
+
+
 @dataclass(frozen=True)
 class Config:
     base_url: str = BASE_URL
@@ -24,6 +34,11 @@ class Config:
     # family. The gateway publishes no rates, so these can only come from
     # whoever knows what their account is charged.
     prices: dict[str, ModelPrice] = field(default_factory=dict)
+    # A standing spend policy. Both keys or neither: half a budget is not
+    # a budget, and guessing the missing half would enforce something
+    # nobody asked for.
+    budget_window_days: int | None = None
+    budget_tokens: int | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -37,14 +52,22 @@ def default_config_path() -> Path:
 
 
 def load_config(path: Path) -> Config:
-    """Load config, degrading to defaults with a warning rather than failing."""
+    """Load config, degrading to defaults with a warning rather than failing.
+
+    One exception: a file that exists but cannot be parsed at all is
+    fatal. Degrading to defaults there would silently drop a configured
+    [budget] along with everything else, so a stray typo anywhere in the
+    file would run uncapped. We cannot read the table to know whether one
+    was set, and an enforcement control we cannot read must not be
+    assumed absent.
+    """
     if not path.exists():
         return Config()
 
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, OSError) as exc:
-        return Config(warnings=[f"{path} could not be parsed, using defaults: {exc}"])
+        raise ConfigError(f"{path} could not be parsed: {exc}") from exc
 
     config = Config()
     warnings: list[str] = []
@@ -56,6 +79,8 @@ def load_config(path: Path) -> Config:
             warnings.extend(price_warnings)
             if parsed:
                 updates["prices"] = parsed
+        elif key == "budget":
+            updates.update(_parse_budget(value))
         elif key == "dialect_overrides":
             if isinstance(value, dict):
                 updates["dialect_overrides"] = {str(k): str(v) for k, v in value.items()}
@@ -122,3 +147,41 @@ def _parse_prices(value: object) -> tuple[dict[str, ModelPrice], list[str]]:
             label=f"configured rate for {model}",
         )
     return parsed, warnings
+
+
+def _parse_budget(value: object) -> dict[str, int]:
+    """Read the [budget] table, raising rather than warning.
+
+    The opposite failure posture to _parse_prices above, deliberately. A
+    price that cannot be read costs you a number in a report. A budget
+    that cannot be read costs you the ceiling itself, and a warning
+    nobody reads is indistinguishable from no budget at all.
+    """
+    if not isinstance(value, dict):
+        raise ConfigError("[budget] must be a table")
+
+    unknown = sorted(set(value) - {"window_days", "tokens"})
+    if unknown:
+        raise ConfigError(
+            f"unknown key(s) in [budget]: {', '.join(unknown)}. "
+            f"A typo here would leave the ceiling unset."
+        )
+
+    parsed: dict[str, int] = {}
+    for name in ("window_days", "tokens"):
+        raw = value.get(name)
+        if raw is None:
+            raise ConfigError(
+                f"[budget] needs both window_days and tokens; {name} is missing"
+            )
+        # bool subclasses int, so `tokens = true` would otherwise pass.
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            raise ConfigError(f"[budget] {name} must be an integer, got {raw!r}")
+        if raw <= 0:
+            raise ConfigError(f"[budget] {name} must be positive, got {raw!r}")
+        parsed[name] = raw
+
+    return {
+        "budget_window_days": parsed["window_days"],
+        "budget_tokens": parsed["tokens"],
+    }

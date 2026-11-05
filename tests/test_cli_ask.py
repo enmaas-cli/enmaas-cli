@@ -1,8 +1,17 @@
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from enmaas_cli.cli import ExitCode, assemble_prompt, build_parser, resolve_thinking
+from enmaas_cli.cli import (
+    ExitCode,
+    assemble_prompt,
+    build_parser,
+    resolve_thinking,
+    rolling_check,
+)
+from enmaas_cli.config import Config
 
 
 def test_files_are_wrapped_in_labelled_blocks(tmp_path: Path) -> None:
@@ -118,3 +127,93 @@ def test_every_subcommand_defines_what_dispatch_reads(argv: list[str]) -> None:
     args = build_parser().parse_args(argv)
     for attribute in ("timeout", "json", "dialect", "command"):
         assert hasattr(args, attribute), f"{argv[0]} is missing {attribute}"
+
+
+def _spend_row(tokens: int, *, days_ago: int = 0) -> str:
+    """One serialised ok event costing exactly `tokens` metered tokens."""
+    return json.dumps({
+        "timestamp": (datetime.now(UTC) - timedelta(days=days_ago)).isoformat(),
+        "command": "ask", "model": "m", "dialect": "openai",
+        "input_tokens": tokens, "cached_tokens": 0, "output_tokens": 0,
+        "reasoning_tokens": 0, "elapsed": 1.0, "status": "ok",
+        "schema_used": False, "error_kind": None,
+        "items_total": None, "items_ok": None, "items_failed": None,
+    })
+
+
+def test_rolling_check_refuses_once_the_budget_is_spent(tmp_path: Path) -> None:
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(_spend_row(60_000) + "\n", encoding="utf-8")
+    config = Config(budget_window_days=30, budget_tokens=50_000)
+
+    check = rolling_check(config, ledger)
+
+    assert check.message is not None
+    assert "60,000 of 50,000" in check.message
+
+
+def test_rolling_check_allows_work_under_the_ceiling(tmp_path: Path) -> None:
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(_spend_row(10_000) + "\n", encoding="utf-8")
+    config = Config(budget_window_days=30, budget_tokens=50_000)
+
+    check = rolling_check(config, ledger)
+
+    assert check.message is None
+    assert check.spent == 10_000
+    assert check.ceiling == 50_000
+
+
+def test_spend_outside_the_window_does_not_count(tmp_path: Path) -> None:
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(_spend_row(60_000, days_ago=31) + "\n", encoding="utf-8")
+    config = Config(budget_window_days=30, budget_tokens=50_000)
+
+    check = rolling_check(config, ledger)
+    assert check.message is None
+    # Not just "allowed": the ceiling must survive, because run_map
+    # seeds its rolling accumulator from it. Returning (0, None, None)
+    # would pass a bare message check while silently dropping it.
+    assert check.spent == 0
+    assert check.ceiling == 50_000
+
+
+def test_a_corrupt_ledger_blocks_only_when_a_budget_is_configured(
+    tmp_path: Path,
+) -> None:
+    """Enforcement that cannot read its own state must not wave work through.
+
+    With no budget configured the same ledger is just a notebook, and a
+    damaged notebook must not stop work.
+    """
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text("not json at all\n", encoding="utf-8")
+
+    enforced = Config(budget_window_days=30, budget_tokens=50_000)
+    assert rolling_check(enforced, ledger).message is not None
+    assert rolling_check(Config(), ledger).message is None
+
+
+def test_a_missing_ledger_never_blocks(tmp_path: Path) -> None:
+    """A fresh install has spent nothing."""
+    config = Config(budget_window_days=30, budget_tokens=50_000)
+    check = rolling_check(config, tmp_path / "nope.jsonl")
+    assert check.message is None
+    assert check.spent == 0
+    assert check.ceiling == 50_000
+
+
+def test_disabled_logging_blocks_a_configured_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spend that is never recorded means a ceiling that can never bind."""
+    monkeypatch.setenv("ENMAAS_NO_USAGE_LOG", "1")
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(_spend_row(10) + "\n", encoding="utf-8")
+
+    enforced = Config(budget_window_days=30, budget_tokens=50_000)
+    message = rolling_check(enforced, ledger).message
+    assert message is not None
+    assert "ENMAAS_NO_USAGE_LOG" in message
+    # Without a budget it is merely a preference, so it must not block.
+    assert rolling_check(Config(), ledger).message is None

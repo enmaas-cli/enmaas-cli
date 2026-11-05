@@ -36,6 +36,18 @@ class UsageEvent:
     items_total: int | None  # For map command
     items_ok: int | None
     items_failed: int | None
+    # Exact metered tokens this event cost, summed per request at the
+    # point each one completed. Not derivable from the counts above: a
+    # map event aggregates them, and max(0, sum_in - sum_cached) is not
+    # the sum of the per-request clamps. Measured at 102 versus 12 on two
+    # requests of (10 in, 100 cached) and (100 in, 0 cached).
+    #
+    # Also the only field that sees requests which consumed tokens and
+    # then failed, since the counters above record successes only.
+    #
+    # Optional because rows written before this field existed have none;
+    # rolling_spend falls back to deriving one for those.
+    charge: int | None = None
 
 
 @dataclass(frozen=True)
@@ -52,44 +64,153 @@ class UsageSummary:
     by_command: dict[str, dict[str, int | float]]
 
 
+_COUNT_FIELDS = (
+    "input_tokens",
+    "cached_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "charge",
+)
+
+
 def _is_disabled() -> bool:
     """Check if usage logging is disabled via environment variable."""
     return bool(os.environ.get("ENMAAS_NO_USAGE_LOG", ""))
 
 
-def append_event(ledger: Path, event: UsageEvent) -> None:
-    """Write one event as a JSON line. Failure is silent, never breaks the call."""
-    if _is_disabled():
-        return
+def append_event(ledger: Path, event: UsageEvent) -> bool:
+    """Write one event as a JSON line. Returns whether it was recorded.
 
-    with contextlib.suppress(OSError):
+    Failure never breaks the call: the work is already done and paid for
+    by the time this runs, so raising here would turn a bookkeeping
+    problem into a lost result.
+
+    But it does report. A ledger that silently refuses writes is
+    indistinguishable from one showing no spend, so a caller enforcing a
+    budget needs to know the ceiling just stopped tracking.
+    """
+    if _is_disabled():
+        return False
+
+    try:
         ledger.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError), ledger.open("a", encoding="utf-8") as f:
-            # Convert datetime to ISO string for JSON
-            data = asdict(event)
-            data["timestamp"] = event.timestamp.isoformat()
-            f.write(json.dumps(data) + "\n")
+    except OSError:
+        return False
+
+    # Convert datetime to ISO string for JSON
+    data = asdict(event)
+    data["timestamp"] = event.timestamp.isoformat()
+    # Coerce counts on the way out. A gateway reporting 10.0 instead of
+    # 10 would otherwise be written verbatim, and the strict reader
+    # would then reject this tool's own ledger as corrupt on the next
+    # budgeted run.
+    for name in _COUNT_FIELDS:
+        value = data.get(name)
+        if isinstance(value, float):
+            data[name] = max(0, int(value))
+
+    # try/except around the whole `with`, not contextlib.suppress inside
+    # it. A buffered write only reaches the disk on close, so the close
+    # must be inside the guarded region; combining suppress and open in
+    # one `with` statement would catch the close error and then carry on
+    # to report success, which is the dropped spend this return value
+    # exists to surface.
+    try:
+        with ledger.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(data) + "\n")
+    except OSError:
+        return False
+    return True
+
+
+
+
+def _event_from_row(data: object) -> UsageEvent:
+    """Parse one ledger row, rejecting what must not be trusted.
+
+    Validation matters here in a way it did not when this was purely a
+    reporting path. A negative count subtracts from recorded spend, a
+    string count breaks the arithmetic downstream, and a timezone-naive
+    timestamp raises when compared against an aware window cutoff. A
+    budget that read any of those would be wrong rather than merely
+    incomplete.
+    """
+    if not isinstance(data, dict):
+        raise TypeError(f"expected a JSON object, got {type(data).__name__}")
+
+    row = dict(data)
+    timestamp = datetime.fromisoformat(row.pop("timestamp"))
+    if timestamp.tzinfo is None:
+        raise ValueError("timestamp is timezone-naive")
+
+    for name in _COUNT_FIELDS:
+        count = row.get(name)
+        if count is None:
+            continue
+        # bool first: it subclasses int, so True would pass as 1.
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"{name} must be a nonnegative integer, got {count!r}")
+
+    return UsageEvent(timestamp=timestamp, **row)
 
 
 def load_events(ledger: Path) -> list[UsageEvent]:
-    """Load all valid events, tolerating corrupt final line or missing file."""
+    """Load all valid events, tolerating corrupt final line or missing file.
+
+    Deliberately forgiving: `enmaas usage` should report what it can
+    rather than crash. Enforcement uses load_events_strict instead.
+    """
     if not ledger.exists():
         return []
 
     events: list[UsageEvent] = []
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, UnicodeDecodeError):
         content = ledger.read_text(encoding="utf-8")
         for line in content.splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
-            with contextlib.suppress(json.JSONDecodeError, KeyError, TypeError, ValueError):
-                data = json.loads(stripped)
-                # Parse timestamp back to datetime
-                ts_str = data.pop("timestamp")
-                timestamp = datetime.fromisoformat(ts_str)
-                events.append(UsageEvent(timestamp=timestamp, **data))
+            # AttributeError is in the set because a row of JSON `null`
+            # reaches .pop on a None and used to crash this function.
+            with contextlib.suppress(
+                json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError
+            ):
+                events.append(_event_from_row(json.loads(stripped)))
     return events
+
+
+def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
+    """Read the ledger, reporting what load_events deliberately hides.
+
+    A forgiving reader and a strict reader cannot be the same function.
+    Reporting should degrade; enforcement must not. A budget that mistook
+    an unreadable ledger for one showing zero spend would never bind.
+
+    A missing file is not a problem: a fresh install has spent nothing.
+    """
+    if not ledger.exists():
+        return [], []
+
+    try:
+        # Bytes then decode, so invalid UTF-8 is reportable rather than
+        # escaping as an exception that is not an OSError.
+        text = ledger.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], [f"{ledger} could not be read: {exc}"]
+
+    events: list[UsageEvent] = []
+    problems: list[str] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            events.append(_event_from_row(json.loads(stripped)))
+        except (
+            json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError
+        ) as exc:
+            problems.append(f"{ledger} line {number}: {type(exc).__name__}: {exc}")
+    return events, problems
 
 
 def summarize_usage(events: list[UsageEvent]) -> UsageSummary:

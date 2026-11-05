@@ -79,3 +79,33 @@ def test_all_failures_trips() -> None:
     for _ in range(20):
         breaker.record(ok=False)
     assert breaker.should_abort() is True
+
+
+def test_outcome_reports_why_it_aborted() -> None:
+    """'aborted' alone sends users looking for failures that did not happen."""
+    from pathlib import Path
+
+    from enmaas_cli.runner import MapOutcome
+
+    outcome = MapOutcome(
+        ok=0, failed=6, skipped=0, attempted=6, total=20,
+        abort_reason="breaker",
+        input_tokens=0, output_tokens=0, cached_tokens=0, reasoning_tokens=0,
+        elapsed=1.0, outdir=Path("out"), failures=[],
+    )
+    assert outcome.abort_reason == "breaker"
+    assert outcome.exit_code == 3
+
+
+def test_outcome_without_an_abort_reason_is_not_aborted() -> None:
+    from pathlib import Path
+
+    from enmaas_cli.runner import MapOutcome
+
+    outcome = MapOutcome(
+        ok=20, failed=0, skipped=0, attempted=20, total=20,
+        abort_reason=None,
+        input_tokens=0, output_tokens=0, cached_tokens=0, reasoning_tokens=0,
+        elapsed=1.0, outdir=Path("out"), failures=[],
+    )
+    assert outcome.exit_code == 0
