@@ -2,8 +2,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+import pytest
 
-from enmaas_cli.cli import run_ask, run_models
+from enmaas_cli.cli import ExitCode, run_ask, run_models
 
 
 def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
@@ -123,3 +124,89 @@ async def test_models_merges_both_dialects() -> None:
     assert by_id["rits/zai-org/glm-5-3"]["dialects"] == ["anthropic", "openai"]
     assert by_id["gpt-6-sol"]["dialects"] == ["openai"]
     assert by_id["claude-opus-5-5"]["dialects"] == ["anthropic"]
+
+
+def test_an_over_budget_ask_exits_three_without_calling_the_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Refusal happens before the HTTP client is opened, so it costs nothing."""
+    import json
+    from datetime import UTC, datetime
+
+    from enmaas_cli.cli import main
+
+    state = tmp_path / "state"
+    # state_root() is XDG_STATE_HOME/enmaas/runs, and the ledger sits
+    # inside it, so the fixture must match that exact path.
+    (state / "enmaas" / "runs").mkdir(parents=True)
+    (state / "enmaas" / "runs" / "usage.jsonl").write_text(
+        json.dumps({
+            "timestamp": datetime.now(UTC).isoformat(), "command": "ask",
+            "model": "m", "dialect": "openai", "input_tokens": 60_000,
+            "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+            "elapsed": 1.0, "status": "ok", "schema_used": False,
+            "error_kind": None, "items_total": None, "items_ok": None,
+            "items_failed": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    monkeypatch.setenv("ENMAAS_KEY", "k")
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[budget]\nwindow_days = 30\ntokens = 50_000\n", encoding="utf-8"
+    )
+
+    def explode(*a: object, **k: object) -> None:
+        raise AssertionError("a refused command must not open a client")
+
+    monkeypatch.setattr(httpx, "AsyncClient", explode)
+
+    code = main(["--config", str(config), "ask", "-p", "hi"])
+
+    assert code == int(ExitCode.ABORTED)
+    assert "60,000 of 50,000" in capsys.readouterr().err
+
+
+def test_an_over_budget_json_run_still_emits_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 3 alone cannot distinguish a refusal from a breaker abort.
+
+    A --json caller that got an empty stdout on refusal would have to
+    guess why the run stopped.
+    """
+    import json as json_mod
+    from datetime import UTC, datetime
+
+    from enmaas_cli.cli import main
+
+    state = tmp_path / "state"
+    (state / "enmaas" / "runs").mkdir(parents=True)
+    (state / "enmaas" / "runs" / "usage.jsonl").write_text(
+        json_mod.dumps({
+            "timestamp": datetime.now(UTC).isoformat(), "command": "ask",
+            "model": "m", "dialect": "openai", "input_tokens": 60_000,
+            "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+            "elapsed": 1.0, "status": "ok", "schema_used": False,
+            "error_kind": None, "items_total": None, "items_ok": None,
+            "items_failed": None, "charge": 60_000,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    monkeypatch.setenv("ENMAAS_KEY", "k")
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+
+    config = tmp_path / "config.toml"
+    config.write_text("[budget]\nwindow_days = 30\ntokens = 50_000\n", encoding="utf-8")
+
+    code = main(["--config", str(config), "ask", "-p", "hi", "--json"])
+
+    assert code == int(ExitCode.ABORTED)
+    payload = json_mod.loads(capsys.readouterr().out)
+    assert payload["abort_reason"] == "budget"
+    assert payload["budget"]["tripped"] == "rolling"
+    assert payload["budget"]["rolling"]["spent"] == 60_000

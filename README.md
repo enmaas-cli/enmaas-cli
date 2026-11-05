@@ -103,6 +103,7 @@ If no prompt is given via `-p` or `--prompt-file`, stdin is read.
 - `--concurrency N`: Number of concurrent requests. Must be positive. Defaults to 1.
 - `--retries N`: Number of retries per item. Defaults to 3.
 - `--resume`: Skip items that already have an output file and an `ok` row in `results.jsonl`.
+- `--token-budget N`: Stop the run once it has spent N metered tokens. Not the same as `--max-tokens`, which caps the output of a single request. See [Token budget](#token-budget).
 
 ## Model selection
 
@@ -134,7 +135,7 @@ Measured on a 45 KB prompt with `rits/*` models:
 | 0 | Success |
 | 1 | Error (includes usage errors like invalid flags) |
 | 2 | Partial failure (some items failed in a map run) |
-| 3 | Circuit breaker tripped |
+| 3 | Run stopped early: circuit breaker tripped, or token budget spent |
 
 Usage errors (invalid flags, missing required arguments) exit 1, so exit code 2 unambiguously means partial failure.
 
@@ -146,7 +147,41 @@ The circuit breaker aborts a bulk map run on:
 - 6 consecutive failures, or
 - More than 50% failures in a full 20-item window
 
-Whichever comes first. This prevents spending the entire budget on a misconfigured run.
+Whichever comes first. This catches a run that is failing, but not one where
+every call succeeds and the spend is the problem. That is what the token budget
+below is for.
+
+## Token budget
+
+`--token-budget N` stops a map run once it has spent N metered tokens, exiting 3
+the way a tripped circuit breaker does.
+
+**Metered means uncached input plus output.** Cached input is excluded, so
+batching helps a run go further under the same ceiling. Cache writes are charged,
+because writing a cache entry is real work. Reasoning is charged too, but it needs
+no separate term: it is already inside the output count on both dialects.
+
+**It stops scheduling rather than hard-stopping.** At `--concurrency N`, up to
+N-1 further requests are already in flight and will finish. With `--batch`, those
+are N-1 further groups, which can be a lot of tokens. There is no fixed token
+bound without bounding request size.
+
+**The ceiling belongs to the job, not to one command.** Every request appends a
+`{"type": "request", "charge": N}` row to `results.jsonl`, and a resumed run adds
+those up before spending anything. So `--resume` on its own re-trips immediately.
+To carry on, raise the ceiling deliberately:
+
+```bash
+enmaas map ... --token-budget 2000000 --resume
+```
+
+That is the intended friction. A budget that reset on every invocation could be
+bypassed by pressing up-arrow and Enter.
+
+**What it does not catch.** `call` retries internally, and a non-200 response
+carries no usage for the client to read, so tokens burned by an attempt that
+failed in transport are invisible here. That spend is unknowable from this side
+rather than merely unimplemented.
 
 ## Configuration
 
@@ -165,6 +200,54 @@ timeout = 280
 All fields shown are the defaults except `dialect_overrides`.
 
 The `dialect_overrides` table maps model names to dialect strings (`"anthropic"` or `"openai"`). An explicit `--dialect` flag on the command line takes precedence. Invalid dialect values are ignored with a warning.
+
+### Rolling token budget
+
+```toml
+[budget]
+window_days = 30
+tokens = 50_000_000
+```
+
+With this set, `ask` and `map` refuse to start once the usage ledger shows more
+than `tokens` metered tokens inside the last `window_days` days, exiting 3. A map
+run that crosses the ceiling partway through stops there rather than waiting to be
+caught next time. The window matches `enmaas usage --since DAYS`, so reporting and
+enforcement count the same way.
+
+Configuration rather than a flag on purpose: a standing policy you have to
+remember to type is not a guard. For a one-off run against different settings, the
+global `--config PATH` already exists.
+
+**A malformed `[budget]` table is an error, not a warning.** Every other key in
+this file degrades to its default; this one does not. A half-written budget is a
+request for enforcement that cannot be honoured, and warning while running
+uncapped would be the same false assurance as a flag that silently does nothing.
+Both keys are required, a typo in a key name is rejected, and values must be
+positive integers.
+
+A config file that exists but cannot be parsed at all is also fatal, for the same
+reason: falling back to defaults would drop a configured `[budget]` along with
+everything else, so a stray typo anywhere in the file would run uncapped.
+
+For the same reason the command refuses, rather than proceeding, when a budget is
+configured and the ledger cannot be read, or when `ENMAAS_NO_USAGE_LOG` disables
+recording. An unreadable ledger looks exactly like one showing zero spend. With no
+budget configured the ledger is never consulted for enforcement at all, so a
+damaged one does not stop work; `enmaas usage` keeps reporting what it can from
+the rows it understands.
+
+If a run finishes but its usage cannot be written back, and a budget is
+configured, it prints a warning. That spend will not count against the ceiling, so
+the ceiling has quietly stopped tracking.
+
+**Single process only.** Each run reads the ledger at startup and writes its event
+at the end. Two runs started together against 9,000,000 spent of a 10,000,000
+ceiling will each believe 1,000,000 remains, and together spend 2,000,000. A run
+killed partway writes no event, so its spend goes unrecorded. This is a guard
+against your own drift over time, not an enforcement boundary against concurrent
+use. Enforcing that properly needs a server-side budget, which a client cannot
+provide.
 
 ## Development
 

@@ -17,19 +17,21 @@ from typing import Any, NoReturn
 import httpx
 
 from .auth import AuthError, redact, resolve_key
+from .budget import TokenBudget, metered, rolling_spend
 from .client import GatewayError, call
-from .config import Config, default_config_path, load_config
+from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
     Dialect,
     DialectError,
     EmptyResponseError,
+    Usage,
     build_request,
     default_max_tokens,
     parse_response,
     resolve_dialect,
 )
-from .receipts import ask_receipt, create_run_dir, prune_runs, state_root
+from .receipts import ask_receipt, create_run_dir, map_receipt, prune_runs, state_root
 from .runner import run_map
 from .schema import ValidationError, load_schema, validate_against_schema
 from .usage import (
@@ -38,6 +40,7 @@ from .usage import (
     format_summary,
     format_summary_json,
     load_events,
+    load_events_strict,
     summarize_usage,
 )
 
@@ -157,6 +160,16 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--template", type=Path, required=True)
     mp.add_argument("--outdir", type=Path, required=True)
     mp.add_argument("--concurrency", type=positive_int)
+    mp.add_argument(
+        "--token-budget",
+        type=positive_int,
+        metavar="N",
+        help=(
+            "stop the run once it has spent N metered tokens (uncached "
+            "input plus output). Not --max-tokens, which caps the output "
+            "of a single request."
+        ),
+    )
     mp.add_argument("--retries", type=int, default=3)
     mp.add_argument("--timeout", type=positive_float)
     mp.add_argument("--thinking", choices=["on", "off"], default=None)
@@ -362,9 +375,79 @@ def _read_prompt(args: argparse.Namespace) -> str:
     raise ValueError("no prompt: pass -p, --prompt-file, or pipe text on stdin")
 
 
+def _warn_if_untracked(recorded: bool, config: Config) -> None:
+    """Say so when spend a budget depends on was not written down.
+
+    An unwritable ledger looks exactly like one showing no spend, so a
+    configured ceiling would quietly stop binding. The work is already
+    paid for, so this warns rather than failing.
+    """
+    if not recorded and config.budget_tokens is not None:
+        print(
+            "warning: a token budget is configured but this run's usage was "
+            "not recorded, so it will not count against the ceiling",
+            file=sys.stderr,
+        )
+
+
+@dataclass(frozen=True)
+class RollingCheck:
+    """Whether a standing budget permits this invocation, and where it stands."""
+
+    spent: int
+    ceiling: int | None
+    message: str | None  # set when the command must refuse
+
+
+def rolling_check(config: Config, ledger: Path) -> RollingCheck:
+    """Decide whether a configured rolling budget allows more work.
+
+    Returns the spend as well as the verdict, because a map run needs to
+    carry the remaining allowance into run_map rather than recompute it.
+
+    A function returning a message is testable without capturing stdout,
+    which is why the decision lives here rather than inline in main.
+    """
+    if config.budget_tokens is None or config.budget_window_days is None:
+        return RollingCheck(spent=0, ceiling=None, message=None)
+
+    if os.environ.get("ENMAAS_NO_USAGE_LOG"):
+        # Nothing is being recorded, so the ceiling could never bind and
+        # every run would see zero spent. Enforcement that cannot observe
+        # itself must say so rather than wave the work through.
+        return RollingCheck(0, config.budget_tokens, message=(
+            "a token budget is configured but ENMAAS_NO_USAGE_LOG disables "
+            "the ledger, so spend cannot be tracked"
+        ))
+
+    events, problems = load_events_strict(ledger)
+    if problems:
+        # An unreadable ledger is indistinguishable from one showing zero
+        # spend. Without a budget configured this would only warn.
+        return RollingCheck(0, config.budget_tokens, message=(
+            "a token budget is configured but the usage ledger could not "
+            f"be read: {'; '.join(problems[:3])}"
+        ))
+
+    spent = rolling_spend(events, window_days=config.budget_window_days)
+    if spent >= config.budget_tokens:
+        return RollingCheck(spent, config.budget_tokens, message=(
+            f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
+            f"{config.budget_window_days} days"
+        ))
+    return RollingCheck(spent, config.budget_tokens, message=None)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    config = load_config(args.config or default_config_path())
+    try:
+        config = load_config(args.config or default_config_path())
+    except ConfigError as exc:
+        # A malformed [budget] table is the only fatal config error.
+        # Proceeding would run uncapped, which is what it was written to
+        # prevent, so refuse rather than warn.
+        print(f"enmaas: {exc}", file=sys.stderr)
+        return 1
     for warning in config.warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
@@ -396,7 +479,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
         # construction. Recording is a subcommand rather than a library
         # function so a caller in any language can be counted without
         # taking a dependency on this package.
-        append_event(
+        recorded = append_event(
             state_root() / "usage.jsonl",
             UsageEvent(
                 timestamp=datetime.now(UTC),
@@ -414,8 +497,19 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                 items_total=None,
                 items_ok=None,
                 items_failed=None,
+                # Derived the same way metered() would, so externally
+                # recorded work counts against a budget identically.
+                charge=metered(
+                    Usage(
+                        input_tokens=args.input,
+                        cached_tokens=args.cached,
+                        output_tokens=args.output,
+                        reasoning_tokens=args.reasoning,
+                    )
+                ),
             ),
         )
+        _warn_if_untracked(recorded, config)
         return int(ExitCode.OK)
 
     # Handle usage command first (no timeout argument)
@@ -435,6 +529,35 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             print(format_summary(summary, since_days=args.since, prices=config.prices))
 
         return int(ExitCode.OK)
+
+    # Both spending commands pass through here. Checked before the client
+    # is opened, so an over-budget invocation costs nothing at all.
+    rolling = rolling_check(config, state_root() / "usage.jsonl")
+    if rolling.message and args.command in ("ask", "map"):
+        if getattr(args, "json", False):
+            # Exit 3 already means "stopped early", so a bare exit code
+            # cannot distinguish a budget refusal from a breaker abort.
+            # A --json caller gets the same abort_reason vocabulary it
+            # would get from a run that started and then stopped.
+            print(json.dumps({
+                "status": "refused",
+                "abort_reason": "budget",
+                "budget": {
+                    "per_run": None,
+                    "rolling": {
+                        "ceiling": rolling.ceiling,
+                        "spent": rolling.spent,
+                    },
+                    "tripped": "rolling",
+                },
+                "error": rolling.message,
+            }, indent=2))
+        else:
+            print(
+                f"enmaas {args.command} refused\n  budget    {rolling.message}",
+                file=sys.stderr,
+            )
+        return int(ExitCode.ABORTED)
 
     timeout = args.timeout if args.timeout is not None else config.timeout
     async with httpx.AsyncClient() as client:
@@ -503,7 +626,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                     error_kind = "ValidationError"
                 else:
                     error_kind = "Error"
-            append_event(
+            recorded = append_event(
                 state_root() / "usage.jsonl",
                 UsageEvent(
                     timestamp=datetime.now(UTC),
@@ -521,8 +644,10 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                     items_total=None,
                     items_ok=None,
                     items_failed=None,
+                    charge=metered(usage_obj) if usage_obj else 0,
                 ),
             )
+            _warn_if_untracked(recorded, config)
 
             if args.json:
                 # Machine-readable output
@@ -579,14 +704,28 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             schema_file=args.schema,
             schema_name=args.schema_name,
             batch=args.batch,
+            token_budget=args.token_budget,
+            # Seeded with what the window has already consumed, so a long
+            # run that crosses the standing ceiling partway stops there
+            # rather than only being caught at the next invocation.
+            rolling_budget=(
+                TokenBudget(rolling.ceiling, spent=rolling.spent)
+                if rolling.ceiling is not None
+                else None
+            ),
         )
 
         # Log usage (resolve dialect for logging)
         resolved_dialect = resolve_dialect(args.model, dialect)
         error_kind = None
-        if outcome.aborted or outcome.failed > 0:
-            error_kind = "CircuitBreakerError" if outcome.aborted else "PartialFailure"
-        append_event(
+        if outcome.abort_reason is not None or outcome.failed > 0:
+            # Was hardcoded to CircuitBreakerError for any abort, which
+            # would have filed a budget stop as a breaker trip.
+            error_kind = {
+                "breaker": "CircuitBreakerError",
+                "budget": "TokenBudgetExceeded",
+            }.get(outcome.abort_reason or "", "PartialFailure")
+        recorded = append_event(
             state_root() / "usage.jsonl",
             UsageEvent(
                 timestamp=datetime.now(UTC),
@@ -598,19 +737,29 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                 output_tokens=outcome.output_tokens,
                 reasoning_tokens=outcome.reasoning_tokens,
                 elapsed=outcome.elapsed,
-                status="error" if outcome.aborted else "ok",
+                status="error" if outcome.abort_reason is not None else "ok",
                 schema_used=args.schema is not None,
                 error_kind=error_kind,
                 items_total=outcome.total,
                 items_ok=outcome.ok,
                 items_failed=outcome.failed,
+                # Not derived from the counters above: this is the sum of
+                # what each request actually cost, failures included.
+                charge=outcome.charged,
             ),
         )
+        _warn_if_untracked(recorded, config)
 
         if args.json:
-            status = "aborted" if outcome.aborted else ("partial" if outcome.failed > 0 else "ok")
+            status = (
+                "aborted" if outcome.abort_reason is not None
+                else ("partial" if outcome.failed > 0 else "ok")
+            )
             obj: dict[str, Any] = {
                 "status": status,
+                # Which of the two stop conditions fired. "aborted" alone
+                # cannot distinguish failures from overspending.
+                "abort_reason": outcome.abort_reason,
                 "total": outcome.total,
                 "ok": outcome.ok,
                 "failed": outcome.failed,
@@ -623,28 +772,50 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                     "output": outcome.output_tokens,
                 },
                 "elapsed": outcome.elapsed,
+                # Both ceilings reported separately, and "tripped"
+                # names which one stopped the run. A single flattened
+                # object could not say whether to raise the flag or the
+                # config, which are different remedies.
+                "budget": {
+                    "per_run": (
+                        None
+                        if not args.token_budget
+                        else {
+                            # Job-wide when resumed, matching what the
+                            # ceiling is compared against.
+                            "ceiling": args.token_budget,
+                            "spent": outcome.spent,
+                        }
+                    ),
+                    "rolling": (
+                        None
+                        if rolling.ceiling is None
+                        else {
+                            "ceiling": rolling.ceiling,
+                            # The accumulator, not rolling.spent +
+                            # outcome.spent: on a resumed job the latter
+                            # already carries prior invocations and so
+                            # counts them twice.
+                            "spent": (
+                                outcome.rolling_spent
+                                if outcome.rolling_spent is not None
+                                else rolling.spent + outcome.charged
+                            ),
+                        }
+                    ),
+                    "tripped": outcome.tripped_budget,
+                },
                 "failures": [
                     {"id": item_id, "error": message} for item_id, message in outcome.failures
                 ],
             }
             print(json.dumps(obj, indent=2))
         else:
-            status = "ABORTED" if outcome.aborted else "ok"
-            not_attempted = outcome.total - outcome.attempted - outcome.skipped
-            print(f"enmaas map {status}")
-            print(f"  model     {args.model}")
-            print(
-                f"  items     {outcome.total} total: {outcome.attempted} attempted, "
-                f"{outcome.ok} ok, {outcome.failed} failed, {outcome.skipped} skipped"
-            )
-            if not_attempted > 0:
-                print(f"            {not_attempted} not attempted")
-            print(f"  outdir    {outcome.outdir}")
-            print(f"  index     {outcome.outdir / 'results.jsonl'}")
-            print(f"  tokens    in {outcome.input_tokens:,}   out {outcome.output_tokens:,}")
-            print(f"  elapsed   {outcome.elapsed:.1f}s")
-            for item_id, message in outcome.failures[:20]:
-                print(f"  failure   {item_id}  {message}")
-            if outcome.aborted:
-                print("  resume    re-run with --resume to continue")
+            print(map_receipt(
+                outcome,
+                model=args.model,
+                token_budget=args.token_budget,
+                rolling_ceiling=rolling.ceiling,
+                rolling_spent=rolling.spent,
+            ))
         return outcome.exit_code
