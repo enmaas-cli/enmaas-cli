@@ -31,7 +31,8 @@ from .dialect import (
     parse_response,
     resolve_dialect,
 )
-from .receipts import ask_receipt, create_run_dir, map_receipt, prune_runs, state_root
+from .outputs import MAX_INSPECT_CHARS, allow_read, inspect_file, protect, state_root
+from .receipts import ask_receipt, create_run_dir, map_receipt, prune_runs
 from .runner import run_map
 from .schema import ValidationError, load_schema, validate_against_schema
 from .usage import (
@@ -55,6 +56,10 @@ class ExitCode(enum.IntEnum):
 class Parser(argparse.ArgumentParser):
     """ArgumentParser that exits 1 on usage errors instead of 2."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
         self.exit(int(ExitCode.ERROR), f"{self.prog}: error: {message}\n")
@@ -66,6 +71,13 @@ def positive_int(value: str) -> int:
     if ival <= 0:
         raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
     return ival
+
+
+def inspect_chars(value: str) -> int:
+    number = positive_int(value)
+    if number > MAX_INSPECT_CHARS:
+        raise argparse.ArgumentTypeError(f"max-chars cannot exceed {MAX_INSPECT_CHARS}")
+    return number
 
 
 def nonnegative_int(value: str) -> int:
@@ -211,6 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument("--json", action="store_true")
     usage.add_argument("--since", type=positive_int, metavar="DAYS", help="limit to last N days")
 
+    inspect = sub.add_parser("inspect", help="print a bounded prefix of one file")
+    inspect.add_argument("path", type=Path)
+    inspect.add_argument("--max-chars", type=inspect_chars, default=MAX_INSPECT_CHARS)
+
+    allow = sub.add_parser("allow-read", help="allow a full read of one protected output")
+    allow.add_argument("path", type=Path)
+
     return parser
 
 
@@ -248,6 +267,10 @@ async def run_ask(
     prune_runs(run_root)
     run_dir = create_run_dir(run_root)
     path = output if output is not None else run_dir / "response.md"
+
+    protect(path)
+    if save_thinking:
+        protect(run_dir / "thinking.md")
 
     schema = load_schema(schema_file) if schema_file is not None else None
 
@@ -297,11 +320,22 @@ async def run_ask(
             error_msg = str(exc)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(completion.text, encoding="utf-8")
+            # The altered response is still written to disk above, so the
+            # repair has to be reported even on the failure path. Without
+            # this, a schema error would be the only thing mentioned while
+            # the saved file silently differs from what the model sent.
+            repaired = (
+                f"\n  warning   {completion.replaced} character(s) could not be "
+                f"encoded and became U+FFFD"
+                if completion.replaced
+                else ""
+            )
             return AskResult(
                 receipt=(
                     f"enmaas ask FAILED\n"
                     f"  model     {model}  ({resolved} dialect)\n"
-                    f"  error     {error_msg}"
+                    f"  output    {path}\n"
+                    f"  error     {error_msg}{repaired}"
                 ),
                 path=path,
                 exit_code=ExitCode.ERROR,
@@ -440,6 +474,16 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in {"inspect", "allow-read"}:
+        try:
+            if args.command == "inspect":
+                sys.stdout.write(inspect_file(args.path, max_chars=args.max_chars))
+            else:
+                allow_read(args.path)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return int(ExitCode.ERROR)
+        return int(ExitCode.OK)
     try:
         config = load_config(args.config or default_config_path())
     except ConfigError as exc:
@@ -451,9 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     for warning in config.warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
-    # `usage` only reads a local ledger, so requiring a credential for it meant
-    # a new user could not even look at the tool before obtaining a key.
-    needs_key = args.command != "usage"
+    needs_key = args.command in {"models", "ask", "map"}
     key_value = ""
     if needs_key:
         try:
@@ -656,7 +698,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                     "status": "ok" if result.exit_code == ExitCode.OK else "error",
                     "model": result.model,
                     "dialect": result.dialect,
-                    "path": str(result.path) if result.error is None else None,
+                    "path": str(result.path) if result.completion is not None else None,
                     "tokens": {
                         "input": usage.input_tokens if usage else None,
                         "cached": usage.cached_tokens if usage else None,
@@ -664,6 +706,12 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                         "reasoning": usage.reasoning_tokens if usage else None,
                     },
                     "elapsed": result.elapsed,
+                    # --json suppresses the receipt, so without this a
+                    # repaired response would look untouched to a caller
+                    # that only reads the machine-readable output.
+                    "replaced": (
+                        result.completion.replaced if result.completion else 0
+                    ),
                     "error": result.error,
                 }
                 print(json.dumps(ask_obj, indent=2))

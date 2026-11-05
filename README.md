@@ -20,6 +20,7 @@ uv tool install -e .
 ```
 
 The API key is read from `--key-file`, then `$ENMAAS_KEY`, then `~/.secrets/enmaas`.
+Local `inspect`, `allow-read`, `usage`, and `record` commands need no API key.
 
 ## Commands
 
@@ -72,6 +73,31 @@ Each item in `items.jsonl` must have an `id` field. The `id` value must be a saf
 
 The `--resume` flag skips items that both have an output file in the outdir and an `ok` row in `results.jsonl`, allowing you to continue an interrupted bulk run without re-processing completed items.
 
+### Inspect an answer
+
+```bash
+enmaas inspect out/f001.md
+enmaas inspect out/f001.md --max-chars 500
+```
+
+The default and maximum output is 2,000 characters, including the truncation
+notice and final newline. This is a prefix, not a summary. The command reads one
+regular file and provides no pagination or full-output option.
+
+### Allow a deliberate full read
+
+Run this in your own terminal to let an assistant read one protected output:
+
+```bash
+enmaas allow-read out/f001.md
+```
+
+The exception lasts until the next enmaas generation for that path. The plugin
+hook blocks assistant attempts to grant exceptions. The CLI creates exact file
+markers, but enforcement requires an enabled host hook. See
+[output protection](../skills/enmaas/references/output-protection.md) for
+coverage and troubleshooting.
+
 ## Options
 
 ### Common flags
@@ -90,6 +116,7 @@ The `--resume` flag skips items that both have an output file in the outdir and 
 - `--system TEXT`: System message.
 - `-o, --output PATH`: Write response to this path instead of a timestamped run directory.
 - `--stdout`: Print the response body to stdout and the receipt to stderr.
+  The plugin hook blocks assistant use of this option.
 - `--save-thinking`: Save reasoning tokens to a separate file (when available).
 - `--retries N`: Number of retries on transient failures. Defaults to 3.
 
@@ -98,7 +125,7 @@ If no prompt is given via `-p` or `--prompt-file`, stdin is read.
 ### Map-specific flags
 
 - `--items PATH`: JSONL file with items to process. Each item must have an `id` field.
-- `--template PATH`: Jinja2 template file for generating prompts.
+- `--template PATH`: Python `str.format` template file for generating prompts.
 - `--outdir PATH`: Output directory for response files.
 - `--concurrency N`: Number of concurrent requests. Must be positive. Defaults to 1.
 - `--retries N`: Number of retries per item. Defaults to 3.
@@ -127,6 +154,27 @@ Hosted `rits/*` models default to `--thinking off` for this reason. Frontier mod
 Measured on a 45 KB prompt with `rits/*` models:
 - With `--thinking on`: GLM returned a 504 at 300s; DeepSeek produced 32,768 tokens of invisible reasoning and zero text.
 - With `--thinking off`: GLM returned 8,258 chars in 35.7s; DeepSeek returned 12,587 chars in 18.6s.
+
+## Unencodable model output
+
+Lone surrogates (U+D800 to U+DFFF) are the only codepoints UTF-8 cannot encode, and
+a model can emit one: it travels as a plain ASCII `\ud800` escape in the JSON body,
+so it survives transport intact and only fails at the point of writing the response
+to disk.
+
+That raised `UnicodeEncodeError`, which is a `ValueError` rather than an `OSError`
+and so matched none of the handlers, taking down an entire map run over one bad
+character in one item.
+
+Such characters are now replaced with U+FFFD at parse time, before anything tries
+to write them. The replacement is never silent: `ask` prints a warning line and
+reports `replaced` under `--json`, and `map` records a count on that item's row in
+`results.jsonl`.
+
+A repaired item still counts as a success and its output is kept, but `--resume`
+does **not** skip it. The saved text differs from what the model sent, so treating
+it as finished would mean a rerun could never obtain a clean version. Retrying it
+costs a request, which `--token-budget` can bound.
 
 ## Exit codes
 

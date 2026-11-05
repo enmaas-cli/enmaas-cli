@@ -5,9 +5,11 @@ description: Use when delegating work to a cheaper or different model - bulk mec
 
 # Delegating work to EnMaaS models
 
-You run on Opus via Vertex. The `enmaas` CLI reaches a separate gateway holding
-Claude, GPT, Gemini, and two free self-hosted open-weight models. Use it to
-avoid doing expensive work yourself.
+The `enmaas` CLI reaches the Red Hat gateway from Claude Code or Codex. It can
+delegate independent work and keep the resulting answers outside this session.
+
+For first-time setup, a missing command, or an unavailable hook, read
+[setup](references/setup.md). Skip setup when the installation already works.
 
 ## When to use this
 
@@ -16,16 +18,34 @@ avoid doing expensive work yourself.
 - **One-shot analysis.** A long document or diff you want examined once.
 - **A second opinion** on work you just finished.
 
+Repetition alone does not prove independence. Do not send debugging, test-and-fix
+loops, or work that depends on earlier item results to `map`. Enmaas cannot run
+tools or react to their results. Routing remains a judgment call.
+
 ## The point is the file, not the answer
 
-`ask` writes the response to a file and prints a short receipt. Read the
-`preview` line first. Only open the file if the preview suggests the answer is
-worth your context.
+`ask` writes the response to a protected file and prints a short receipt. Its
+`preview` line is a prefix, not a summary. `map` reports counts and paths. Start
+with those receipts and keep full answers outside the parent context.
 
-This is the whole reason the tool exists. If you pull a full 8,000-token answer
-into your context, you have paid Opus prices to read it and saved nothing. Use
-`--stdout` only when you genuinely intend to consume the entire response, which
-is usually just the second-opinion case.
+For a spot check, use `enmaas inspect PATH`. It prints at most 2,000 characters
+including a truncation notice. `--max-chars 500` lowers the limit. Do not inspect
+every answer, concatenate previews, or use another reader after a hook denial.
+Do not copy files, remove markers, or change hook settings to bypass the guard.
+
+If a full answer is needed, explain why and give the user
+`enmaas allow-read PATH` to run in their own terminal. Do not run that command
+yourself. After the user grants the exception, the file can be read normally.
+The next enmaas generation for that path restores protection. Do not use
+`ask --stdout` from assistant tools; the hook blocks it.
+
+Counts prove completion status, not answer correctness. The usage ledger covers
+gateway calls, not the parent context. Do not claim a measured monetary saving
+from that ledger alone. Enmaas works without agent-efficiency.
+
+For an unexpected read denial, protection during resume, or questions about
+which files and tools are covered, read
+[output protection](references/output-protection.md).
 
 ## Model selection
 
@@ -36,11 +56,9 @@ is usually just the second-opinion case.
 | Second opinion on code | `gpt-6-sol` | budget |
 | Second opinion, long context | `gemini-3.1-pro-preview` | budget |
 
-**For a second opinion, do not pick a `claude-*` model.** It shares training
-lineage with you and therefore shares your blind spots. A different family
-disagrees in more useful ways.
+For a second opinion, choose a different model family from the current assistant.
 
-Run `enmaas models` for the live catalog, currently 31 entries. Neither
+Run `enmaas models` for the live catalog. Neither
 dialect's catalog is complete on its own, so the merged view is the real one.
 
 ## Invocation
@@ -93,10 +111,12 @@ truncated.
 One-shot analysis, response to a file:
 
     enmaas ask -m gpt-6-sol -f path/to/file.py <<'PROMPT'
-    Review this for correctness bugs. Cite line numbers.
+    Review this for correctness bugs. Name functions and quote short code fragments.
     PROMPT
 
-Add `--stdout` when you want to read the whole thing.
+Inspect a bounded prefix first. Use the user-granted exception described above
+when the task requires the full answer. Verify any model-supplied coordinates
+against the source before citing them.
 
 ## Structured output
 
@@ -159,7 +179,7 @@ can be counted without importing this package.
 | 0 | all succeeded | continue |
 | 1 | config, auth, or validation error | read the message, it names the fix |
 | 2 | partial failure | check `results.jsonl` in the outdir |
-| 3 | circuit breaker tripped | re-run the identical command with `--resume` |
+| 3 | circuit breaker or token budget stopped the run | read the receipt; raise a spent budget before using `--resume` |
 
 The breaker aborts a bulk run on 6 consecutive failures, or more than 50% of a
 full 20-item window. `--resume` skips items already recorded `ok` with an

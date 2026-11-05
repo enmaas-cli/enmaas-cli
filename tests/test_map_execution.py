@@ -657,3 +657,173 @@ async def test_outcome_charged_equals_the_charge_rows_the_run_wrote(
     assert outcome.charged != max(
         0, outcome.input_tokens - outcome.cached_tokens
     ) + outcome.output_tokens
+def _raw_body(content_escape: str, *, prompt: int = 5, completion: int = 1) -> bytes:
+    """A response exactly as a gateway would put it on the wire.
+
+    The surrogate is an ASCII escape here, so the body is valid UTF-8 in
+    transit and only becomes a lone surrogate after json.loads. Building
+    this with httpx's json= would fail inside httpx instead, which tests
+    httpx rather than this code.
+    """
+    return (
+        '{"choices":[{"finish_reason":"stop","message":{"content":"'
+        + content_escape
+        + '"}}],"usage":{"prompt_tokens":'
+        + str(prompt)
+        + ',"completion_tokens":'
+        + str(completion)
+        + "}}"
+    ).encode("ascii")
+
+
+def _json_response(raw: bytes) -> httpx.Response:
+    return httpx.Response(200, content=raw, headers={"content-type": "application/json"})
+
+
+async def test_one_unencodable_character_does_not_kill_the_run(
+    tmp_path: Path,
+) -> None:
+    """A lone surrogate in one item used to take down the whole map.
+
+    UnicodeEncodeError is a ValueError, not an OSError, so it matched
+    none of the handlers and escaped through asyncio.gather. Five good
+    items were lost to one bad character in the third.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Keyed off the prompt, not a call counter, so the poisoned item
+        # is the same one whatever order concurrency delivers them in.
+        prompt = json.loads(request.content)["messages"][-1]["content"]
+        bad = prompt.strip() == "do 2"
+        return _json_response(_raw_body(r"ok \ud800 bad" if bad else "fine"))
+
+    outcome = await _run(tmp_path, handler, count=6)
+
+    assert outcome.ok == 6
+    assert outcome.failed == 0
+    assert len(sorted((tmp_path / "out").glob("*.md"))) == 6
+    assert (tmp_path / "out" / "i2.md").read_text(encoding="utf-8") == "ok � bad"
+
+
+async def test_a_batched_run_survives_an_unencodable_character(
+    tmp_path: Path,
+) -> None:
+    """The batched path writes per item and had the same hole."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        ids = [f"i{n}" for n in range(6) if f"=== ITEM i{n} ===" in prompt]
+        answers = "".join(
+            f"=== ANSWER {i} ===\\nbad \\ud800 here\\n" for i in ids
+        )
+        return _json_response(
+            (
+                '{"choices":[{"finish_reason":"stop","message":{"content":"'
+                + answers
+                + '"}}],"usage":{"prompt_tokens":40,"completion_tokens":10}}'
+            ).encode("ascii")
+        )
+
+    outcome = await _run(
+        tmp_path, handler, count=6,
+        template_path_override=_batch_template(tmp_path), batch=3,
+    )
+
+    assert outcome.ok == 6
+    assert (tmp_path / "out" / "i0.md").read_text(encoding="utf-8") == "bad � here"
+
+
+async def test_a_repaired_item_is_marked_in_the_index(tmp_path: Path) -> None:
+    """A bulk run prints no per-item receipt, so the row is the only trace."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompt = json.loads(request.content)["messages"][-1]["content"]
+        bad = prompt.strip() == "do 1"
+        return _json_response(_raw_body(r"x \ud800 y" if bad else "fine"))
+
+    await _run(tmp_path, handler, count=3)
+
+    # The index interleaves per-item rows with charge rows, which carry
+    # no id, so filter to the item rows before keying on it.
+    parsed = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "results.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    rows = {r["id"]: r for r in parsed if r.get("type") != "request"}
+    assert rows["i1"]["replaced"] == 1
+    assert "replaced" not in rows["i0"]
+
+
+async def test_a_repaired_batch_item_is_marked_in_the_index(tmp_path: Path) -> None:
+    """A batched reply is repaired before it is split, so the count is
+    recorded per request rather than per item, and must still appear."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        ids = [f"i{n}" for n in range(3) if f"=== ITEM i{n} ===" in prompt]
+        answers = "".join(f"=== ANSWER {i} ===\\nbad \\ud800 here\\n" for i in ids)
+        return _json_response(
+            (
+                '{"choices":[{"finish_reason":"stop","message":{"content":"'
+                + answers
+                + '"}}],"usage":{"prompt_tokens":40,"completion_tokens":10}}'
+            ).encode("ascii")
+        )
+
+    await _run(
+        tmp_path, handler, count=3,
+        template_path_override=_batch_template(tmp_path), batch=3,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "results.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    # Charge rows share this file and carry no status, so filter first.
+    items = [r for r in rows if r.get("type") != "request"]
+    assert len(items) == 3
+    assert all(r["status"] == "ok" for r in items)
+    # Three items in one request, three repairs in that one reply.
+    assert all(r["replaced_in_request"] == 3 for r in items)
+
+
+async def test_a_repaired_item_is_retried_on_resume(tmp_path: Path) -> None:
+    """Repaired output is kept, but the item is not treated as finished.
+
+    The saved text differs from what the model sent, so skipping it
+    forever would mean a rerun could never obtain a clean version.
+    """
+    state = {"poison": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompt = json.loads(request.content)["messages"][-1]["content"]
+        bad = state["poison"] and prompt.strip() == "do 1"
+        return _json_response(_raw_body(r"x \ud800 y" if bad else "clean"))
+
+    first = await _run(tmp_path, handler, count=3)
+    assert first.ok == 3
+    assert (tmp_path / "out" / "i1.md").read_text(encoding="utf-8") == "x � y"
+
+    # The model behaves on the retry.
+    state["poison"] = False
+    second = await _run(tmp_path, handler, count=3, resume=True)
+
+    assert second.skipped == 2, "the two clean items stay done"
+    assert second.attempted == 1, "the repaired one is offered again"
+    assert (tmp_path / "out" / "i1.md").read_text(encoding="utf-8") == "clean"
+
+
+async def test_clean_items_are_still_skipped_on_resume(tmp_path: Path) -> None:
+    """The repair exception must not disturb ordinary resume behaviour."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_raw_body("fine"))
+
+    await _run(tmp_path, handler, count=4)
+    second = await _run(tmp_path, handler, count=4, resume=True)
+
+    assert second.skipped == 4
+    assert second.attempted == 0
