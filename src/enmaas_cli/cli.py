@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import httpx
 
@@ -137,6 +137,38 @@ def assemble_prompt(*, prompt: str, files: list[Path]) -> str:
     return "\n".join(parts)
 
 
+def _resolve_model(flag: str | None, config: Config) -> tuple[str, bool]:
+    """The model to call and whether it came from config rather than the flag.
+
+    The second value exists so receipts can mark a defaulted model. A
+    silent default is worse than an explicit one.
+    """
+    if flag is not None:
+        return flag, False
+    return config.default_model, True
+
+
+def _resolve_dialect_override(model: str, flag: Dialect | None, config: Config) -> Dialect | None:
+    """Apply a configured dialect override unless the flag was given.
+
+    Returns the Literal type run_ask and run_map require. The config
+    value is a plain str, so it is checked and then cast rather than
+    returned as is; mypy strict rejects str where Dialect is expected.
+    """
+    if flag is not None:
+        return flag
+    override = config.dialect_overrides.get(model)
+    if override is None:
+        return None
+    if override in ("anthropic", "openai"):
+        return cast(Dialect, override)
+    print(
+        f"warning: invalid dialect override '{override}' for {model}, ignoring",
+        file=sys.stderr,
+    )
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = Parser(prog="enmaas")
     parser.add_argument("--key-file", type=Path)
@@ -167,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--schema-name")
 
     mp = sub.add_parser("map", help="fan out one call per JSONL item")
-    mp.add_argument("-m", "--model", required=True)
+    mp.add_argument("-m", "--model", help="defaults to default_model from config")
     mp.add_argument("--items", type=Path, required=True)
     mp.add_argument("--template", type=Path, required=True)
     mp.add_argument("--outdir", type=Path, required=True)
@@ -188,11 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument(
         "--batch",
         type=positive_int,
-        default=1,
+        default=None,
         metavar="N",
-        help="items per request (default 1). N>1 needs the template to mark "
-        "its per-item part; see the skill. Cuts input sharply on bulk "
-        "jobs because the shared preamble is sent once per batch.",
+        help="items per request. Defaults to 10 when the template contains "
+        "the ===PER ITEM=== marker and 1 otherwise. Cuts input sharply "
+        "on bulk jobs because the shared preamble is sent once per batch.",
     )
     mp.add_argument("--resume", action="store_true")
     mp.add_argument("--json", action="store_true")
@@ -267,6 +299,7 @@ async def run_ask(
     save_thinking: bool,
     schema_file: Path | None = None,
     schema_name: str | None = None,
+    model_defaulted: bool = False,
 ) -> AskResult:
     prune_runs(run_root)
     run_dir = create_run_dir(run_root)
@@ -279,6 +312,7 @@ async def run_ask(
     schema = load_schema(schema_file) if schema_file is not None else None
 
     resolved = resolve_dialect(model, dialect)
+    model_mark = "  (default)" if model_defaulted else ""
     request = build_request(
         model=model,
         prompt=prompt,
@@ -304,7 +338,7 @@ async def run_ask(
         return AskResult(
             receipt=(
                 f"enmaas ask FAILED\n"
-                f"  model     {model}  ({resolved} dialect)\n"
+                f"  model     {model}{model_mark}  ({resolved} dialect)\n"
                 f"  error     {error_msg}"
             ),
             path=path,
@@ -337,7 +371,7 @@ async def run_ask(
             return AskResult(
                 receipt=(
                     f"enmaas ask FAILED\n"
-                    f"  model     {model}  ({resolved} dialect)\n"
+                    f"  model     {model}{model_mark}  ({resolved} dialect)\n"
                     f"  output    {path}\n"
                     f"  error     {error_msg}{repaired}"
                 ),
@@ -363,6 +397,7 @@ async def run_ask(
             completion=completion,
             path=path,
             elapsed=elapsed,
+            model_defaulted=model_defaulted,
         ),
         path=path,
         exit_code=ExitCode.OK,
@@ -644,17 +679,8 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             return int(ExitCode.OK)
 
         if args.command == "ask":
-            model = args.model if args.model is not None else config.default_model
-            dialect = args.dialect
-            if dialect is None and model in config.dialect_overrides:
-                override = config.dialect_overrides[model]
-                if override in ("anthropic", "openai"):
-                    dialect = override
-                else:
-                    print(
-                        f"warning: invalid dialect override '{override}' for {model}, ignoring",
-                        file=sys.stderr,
-                    )
+            model, model_defaulted = _resolve_model(args.model, config)
+            dialect = _resolve_dialect_override(model, args.dialect, config)
 
             prompt = assemble_prompt(prompt=_read_prompt(args), files=args.file)
             result = await run_ask(
@@ -674,6 +700,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                 save_thinking=args.save_thinking,
                 schema_file=args.schema,
                 schema_name=args.schema_name,
+                model_defaulted=model_defaulted,
             )
 
             # Log usage
@@ -742,29 +769,22 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                 print(result.receipt, file=stream)
             return result.exit_code
 
-        dialect = args.dialect
-        if dialect is None and args.model in config.dialect_overrides:
-            override = config.dialect_overrides[args.model]
-            if override in ("anthropic", "openai"):
-                dialect = override
-            else:
-                print(
-                    f"warning: invalid dialect override '{override}' for {args.model}, ignoring",
-                    file=sys.stderr,
-                )
+        model, model_defaulted = _resolve_model(args.model, config)
+        dialect = _resolve_dialect_override(model, args.dialect, config)
+        batch_defaulted = args.batch is None
 
         outcome = await run_map(
             client=client,
             base_url=config.base_url,
             key=key,
-            model=args.model,
+            model=model,
             items_path=args.items,
             template_path=args.template,
             outdir=args.outdir,
             concurrency=args.concurrency if args.concurrency is not None else config.concurrency,
             retries=args.retries,
             timeout=timeout,
-            thinking=resolve_thinking(args.thinking, args.model),
+            thinking=resolve_thinking(args.thinking, model),
             max_tokens=args.max_tokens,
             dialect=dialect,
             resume=args.resume,
@@ -783,7 +803,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
         )
 
         # Log usage (resolve dialect for logging)
-        resolved_dialect = resolve_dialect(args.model, dialect)
+        resolved_dialect = resolve_dialect(model, dialect)
         error_kind = None
         if outcome.abort_reason is not None or outcome.failed > 0:
             # Was hardcoded to CircuitBreakerError for any abort, which
@@ -797,7 +817,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             UsageEvent(
                 timestamp=datetime.now(UTC),
                 command="map",
-                model=args.model,
+                model=model,
                 dialect=resolved_dialect,
                 input_tokens=outcome.input_tokens,
                 cached_tokens=outcome.cached_tokens,
@@ -825,6 +845,9 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             )
             obj: dict[str, Any] = {
                 "status": status,
+                "model": model,
+                "batch": outcome.batch,
+                "defaulted": {"model": model_defaulted, "batch": batch_defaulted},
                 # Which of the two stop conditions fired. "aborted" alone
                 # cannot distinguish failures from overspending.
                 "abort_reason": outcome.abort_reason,
@@ -882,10 +905,12 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             print(
                 map_receipt(
                     outcome,
-                    model=args.model,
+                    model=model,
                     token_budget=args.token_budget,
                     rolling_ceiling=rolling.ceiling,
                     rolling_spent=rolling.spent,
+                    model_defaulted=model_defaulted,
+                    batch_defaulted=batch_defaulted,
                 )
             )
         return outcome.exit_code

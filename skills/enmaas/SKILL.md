@@ -1,6 +1,6 @@
 ---
 name: enmaas
-description: Use when delegating work to a cheaper or different model - bulk mechanical work across many items, one-shot analysis of files or diffs, or a second opinion on your own work. Routes through the Red Hat EnMaaS gateway via the enmaas CLI, which writes responses to files rather than your context.
+description: Use when work is independent per item, needs no tool calls, and is useful as a file - bulk mechanical work across many items, one-shot analysis of a document or diff, or a second opinion. Routes through the Red Hat EnMaaS gateway via the enmaas CLI, which applies the configured default model, batches when the template allows, and writes responses to files rather than your context.
 ---
 
 # Delegating work to EnMaaS models
@@ -13,14 +13,32 @@ For first-time setup, a missing command, or an unavailable hook, read
 
 ## When to use this
 
-- **Bulk mechanical work.** Classifying findings, rewriting strings, extracting
-  fields across many items. Use `enmaas map` with a free hosted model.
-- **One-shot analysis.** A long document or diff you want examined once.
-- **A second opinion** on work you just finished.
+Delegate when all three hold: the work is independent per item or per
+document, it needs no tool calls, and the answer is useful as a file.
 
-Repetition alone does not prove independence. Do not send debugging, test-and-fix
-loops, or work that depends on earlier item results to `map`. Enmaas cannot run
-tools or react to their results. Routing remains a judgment call.
+Delegate:
+
+- Bulk mechanical work: classifying findings, rewriting strings, extracting
+  fields, triaging a list. Use `enmaas map`; the configured default model
+  (free unless the config changes it) and a batch size are chosen for you.
+- One-shot analysis of a long document, diff, log or module. Use `enmaas ask`.
+- A second opinion on work you just finished, from a different model family.
+- Any task where you were about to read many files into context only to
+  summarize them.
+
+Do not delegate:
+
+- Debugging, test-and-fix loops, or anything that needs a tool run between
+  steps. Enmaas cannot run tools or react to results.
+- Work where item N depends on the answer to item N-1.
+- Anything you already know will need the whole answer back in context to
+  continue. The output is protected on purpose. If a full read turns out to be
+  needed after the work is done, use the user-granted exception described
+  below instead of pulling the answer in by other means.
+- Decisions. Enmaas produces drafts and classifications; you and the user
+  decide.
+
+Repetition alone does not prove independence. Routing remains a judgment call.
 
 ## The point is the file, not the answer
 
@@ -56,6 +74,11 @@ which files and tools are covered, read
 | Second opinion on code | `gpt-6-sol` | budget |
 | Second opinion, long context | `gemini-3.1-pro-preview` | budget |
 
+`-m` is optional on both `ask` and `map`. Without it the configured
+`default_model` is used and the receipt marks it `(default)`. The built-in
+default is `rits/zai-org/glm-5-3`, which is free; a config file can set a paid
+one, so check the receipt. Name a model only when the task needs a specific one.
+
 For a second opinion, choose a different model family from the current assistant.
 
 Run `enmaas models` for the live catalog. Neither
@@ -65,8 +88,7 @@ dialect's catalog is complete on its own, so the merged view is the real one.
 
 Bulk work, one output file per item:
 
-    enmaas map -m rits/zai-org/glm-5-3 \
-      --items findings.jsonl --template classify.txt \
+    enmaas map --items findings.jsonl --template classify.txt \
       --outdir /tmp/triage --concurrency 4
 
 `items.jsonl` is one JSON object per line, each needing an `id` field. The
@@ -77,12 +99,13 @@ times.
 ### Batch the items
 
 One call per item re-sends the whole template every time. On a bulk job most
-of each prompt is the shared instructions, so `--batch N` sends them once per
-group instead:
+of each prompt is the shared instructions, so batching sends them once per
+group. When the template carries the `===PER ITEM===` marker, `map` batches
+10 items per call by default and the receipt says so. Without the marker it
+runs one item per call. `--batch N` overrides either way:
 
-    enmaas map -m rits/zai-org/glm-5-3 \
-      --items findings.jsonl --template classify.txt \
-      --outdir /tmp/triage --batch 10 --concurrency 3
+    enmaas map --items findings.jsonl --template classify.txt \
+      --outdir /tmp/triage --batch 5 --concurrency 3
 
 Measured on a 50-item job: 18,712 input tokens and 50 calls unbatched,
 against 8,047 and 5 calls at `--batch 10`. 57% less input, 61% faster, same
@@ -103,6 +126,10 @@ request rather than silently re-sending everything.
 Answers come back matched by item id, never by position, so a reply that
 skips an item cannot shift the rest onto the wrong items. An item with no
 answer is reported failed and `--resume` will retry it.
+
+A failed call fails every item in its group; a reply that omits one item
+fails only that item. Both count toward the breaker. `--resume` retries
+either kind.
 
 Pick N by how long one item is. Large items in large groups risk running
 into `max_tokens` for the whole reply; start at 10 and drop it if items get
@@ -202,6 +229,9 @@ you want the output, not the thinking.
 `gemini-*` has no off switch: it rejects `reasoning_effort: "none"` outright,
 so `--thinking off` sends `minimal` and warns. That is a floor, not an off,
 and it still spends reasoning tokens.
+
+`gpt-5-*` behaves the same way: it rejects `none`, so `--thinking off` sends
+`minimal` and warns. `gpt-6-*` accepts `none`.
 
 If a call fails with "exhausted max_tokens during reasoning, no text produced",
 the fix is `--thinking off` or a shorter prompt, not a bigger `--max-tokens`.

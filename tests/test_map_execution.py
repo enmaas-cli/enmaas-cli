@@ -1,10 +1,12 @@
 import asyncio
 import json
+import re
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from enmaas_cli.budget import TokenBudget
 from enmaas_cli.runner import MapOutcome, run_map
@@ -65,6 +67,7 @@ async def _run(
     template_path_override: Path | None = None,
     concurrency: int = 2,
     resume: bool = False,
+    retries: int = 0,
     **kw: Any,
 ) -> MapOutcome:
     # concurrency and resume are explicit parameters rather than **kw
@@ -81,7 +84,7 @@ async def _run(
             template_path=template_path_override or _template(tmp_path),
             outdir=outdir,
             concurrency=concurrency,
-            retries=0,
+            retries=retries,
             timeout=5,
             thinking=False,
             max_tokens=None,
@@ -894,3 +897,302 @@ async def test_clean_items_are_still_skipped_on_resume(tmp_path: Path) -> None:
 
     assert second.skipped == 4
     assert second.attempted == 0
+
+
+async def test_batch_defaults_to_one_without_marker(tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=OK)
+
+    outcome = await _run(tmp_path, handler, count=5, batch=None)
+    assert calls == 5
+    assert outcome.batch == 1
+    assert outcome.ok == 5
+
+
+async def test_batch_defaults_to_ten_with_marker(tmp_path: Path) -> None:
+    groups: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        ids = re.findall(r"=== ITEM (\S+) ===", prompt)
+        groups.append(ids)
+        text = "\n".join(f"=== ANSWER {i} ===\ndone" for i in ids)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": text}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    template = tmp_path / "batched.txt"
+    template.write_text("shared\n===PER ITEM===\ndo {x}\n", encoding="utf-8")
+    outcome = await _run(tmp_path, handler, count=25, batch=None, template_path_override=template)
+    # Concurrency is above one, so requests can arrive in any order.
+    assert sorted(len(g) for g in groups) == [5, 10, 10]
+    assert {i for g in groups for i in g} == {f"i{n}" for n in range(25)}
+    assert outcome.batch == 10
+    assert outcome.ok == 25
+
+
+async def test_explicit_batch_still_wins(tmp_path: Path) -> None:
+    groups: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        ids = re.findall(r"=== ITEM (\S+) ===", prompt)
+        groups.append(ids)
+        text = "\n".join(f"=== ANSWER {i} ===\ndone" for i in ids)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": text}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    template = tmp_path / "batched.txt"
+    template.write_text("shared\n===PER ITEM===\ndo {x}\n", encoding="utf-8")
+    outcome = await _run(tmp_path, handler, count=25, batch=5, template_path_override=template)
+    # Concurrency is above one, so requests can arrive in any order.
+    assert sorted(len(g) for g in groups) == [5, 5, 5, 5, 5]
+    assert {i for g in groups for i in g} == {f"i{n}" for n in range(25)}
+    assert outcome.batch == 5
+
+
+async def test_explicit_batch_one_wins_over_the_marker(tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=OK)
+
+    template = tmp_path / "batched.txt"
+    template.write_text("shared\n===PER ITEM===\ndo {x}\n", encoding="utf-8")
+    outcome = await _run(tmp_path, handler, count=5, batch=1, template_path_override=template)
+    assert calls == 5
+    assert outcome.batch == 1
+    assert outcome.ok == 5
+
+
+async def test_a_failed_batched_call_fails_every_item_in_the_group(tmp_path: Path) -> None:
+    prompts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompts.append(body["messages"][-1]["content"])
+        return httpx.Response(500, text="upstream down")
+
+    template = tmp_path / "batched.txt"
+    template.write_text("shared\n===PER ITEM===\ndo {x}\n", encoding="utf-8")
+    outcome = await _run(
+        tmp_path,
+        handler,
+        count=4,
+        batch=4,
+        template_path_override=template,
+        retries=0,
+    )
+    assert len(prompts) == 1, f"made {len(prompts)} requests, expected 1"
+    for n in range(4):
+        assert f"=== ITEM i{n} ===" in prompts[0]
+    assert outcome.failed == 4
+    assert outcome.ok == 0
+    assert len(outcome.failures) == 4
+
+
+def test_map_json_names_model_and_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The machine-readable output must carry the resolved choices too."""
+    from enmaas_cli.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        ids = re.findall(r"=== ITEM (\S+) ===", body["messages"][-1]["content"])
+        return httpx.Response(200, json=_answers(ids) if ids else OK)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),
+    )
+    items = _items(tmp_path, 2)
+    template = _template(tmp_path)
+    code = main(
+        [
+            "map",
+            "--items",
+            str(items),
+            "--template",
+            str(template),
+            "--outdir",
+            str(tmp_path / "out"),
+            "--json",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert out["model"] == "rits/zai-org/glm-5-3"
+    assert out["batch"] == 1
+    assert out["defaulted"] == {"model": True, "batch": True}
+
+    # Explicit choices are reported as given and not marked as defaults. A
+    # batch above one needs the marker, so this run uses a marked template.
+    marked = tmp_path / "batched.txt"
+    marked.write_text("shared\n===PER ITEM===\ndo {x}\n", encoding="utf-8")
+    code = main(
+        [
+            "map",
+            "-m",
+            "gpt-6-sol",
+            "--batch",
+            "2",
+            "--items",
+            str(_items(tmp_path, 2)),
+            "--template",
+            str(marked),
+            "--outdir",
+            str(tmp_path / "out-explicit"),
+            "--json",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert out["model"] == "gpt-6-sol"
+    assert out["batch"] == 2
+    assert out["defaulted"] == {"model": False, "batch": False}
+
+
+def test_map_json_reports_the_marker_batch_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no flags, a marker-present template reports batch 10 as a default."""
+    from enmaas_cli.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        ids = re.findall(r"=== ITEM (\S+) ===", prompt)
+        return httpx.Response(200, json=_answers(ids))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),
+    )
+    template = tmp_path / "batched.txt"
+    template.write_text("shared\n===PER ITEM===\ndo {x}\n", encoding="utf-8")
+    code = main(
+        [
+            "map",
+            "--items",
+            str(_items(tmp_path, 3)),
+            "--template",
+            str(template),
+            "--outdir",
+            str(tmp_path / "out"),
+            "--json",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert out["batch"] == 10
+    assert out["defaulted"]["batch"] is True
+
+
+async def test_map_prints_the_reasoning_floor_warning_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # stderr as it stood when the first request arrived. The warning must
+    # already be there: a caller reading it mid-run needs it before spend.
+    before_first: str | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal before_first
+        if before_first is None:
+            before_first = capsys.readouterr().err
+        return httpx.Response(200, json=OK)
+
+    outdir = tmp_path / "out"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await run_map(
+            client=client,
+            base_url="https://g.test",
+            key="k",
+            model="gpt-5-mini",
+            items_path=_items(tmp_path, 5),
+            template_path=_template(tmp_path),
+            outdir=outdir,
+            concurrency=2,
+            retries=0,
+            timeout=5,
+            thinking=False,
+            max_tokens=None,
+            dialect=None,
+            resume=False,
+        )
+    assert before_first is not None
+    assert "sending 'minimal'" in before_first
+    # readouterr() consumed the buffer, so the whole run is both parts.
+    err = before_first + capsys.readouterr().err
+    assert err.count("sending 'minimal'") == 1
+
+
+async def _run_capturing_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], *, model: str, thinking: bool
+) -> str:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=OK)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await run_map(
+            client=client,
+            base_url="https://g.test",
+            key="k",
+            model=model,
+            items_path=_items(tmp_path, 3),
+            template_path=_template(tmp_path),
+            outdir=tmp_path / "out",
+            concurrency=2,
+            retries=0,
+            timeout=5,
+            thinking=thinking,
+            max_tokens=None,
+            dialect=None,
+            resume=False,
+        )
+    return capsys.readouterr().err
+
+
+async def test_map_prints_no_reasoning_warning_with_thinking_on(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = await _run_capturing_stderr(tmp_path, capsys, model="gpt-5-mini", thinking=True)
+    assert "reasoning_effort" not in err
+    assert "sending 'minimal'" not in err
+
+
+async def test_map_prints_no_reasoning_warning_for_a_verified_off_knob(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = await _run_capturing_stderr(
+        tmp_path, capsys, model="rits/zai-org/glm-5-3", thinking=False
+    )
+    assert "reasoning" not in err
+    assert "warning" not in err

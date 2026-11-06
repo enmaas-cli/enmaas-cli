@@ -74,6 +74,105 @@ async def test_ask_surfaces_empty_response_as_failure(tmp_path: Path) -> None:
     assert "--thinking off" in result.receipt
 
 
+async def test_ask_gateway_failure_marks_a_defaulted_model(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    async with _client(handler) as client:
+        result = await run_ask(
+            client=client,
+            base_url="https://g.test",
+            key="sk-oai-x",
+            model="rits/zai-org/glm-5-3",
+            prompt="hi",
+            system=None,
+            dialect=None,
+            thinking=True,
+            max_tokens=None,
+            timeout=5,
+            retries=0,
+            output=None,
+            run_root=tmp_path,
+            save_thinking=False,
+            model_defaulted=True,
+        )
+    assert result.exit_code == 1
+    assert "  model     rits/zai-org/glm-5-3  (default)" in result.receipt
+
+
+async def test_ask_schema_rejection_marks_a_defaulted_model(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": "not json"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+            },
+        )
+
+    schema = tmp_path / "schema.json"
+    schema.write_text('{"type": "object"}', encoding="utf-8")
+    async with _client(handler) as client:
+        result = await run_ask(
+            client=client,
+            base_url="https://g.test",
+            key="sk-oai-x",
+            model="rits/zai-org/glm-5-3",
+            prompt="hi",
+            system=None,
+            dialect=None,
+            thinking=True,
+            max_tokens=None,
+            timeout=5,
+            retries=0,
+            output=None,
+            run_root=tmp_path,
+            save_thinking=False,
+            schema_file=schema,
+            model_defaulted=True,
+        )
+    assert result.exit_code == 1
+    assert "  model     rits/zai-org/glm-5-3  (default)" in result.receipt
+
+
+@pytest.mark.parametrize("defaulted", [True, False])
+async def test_ask_success_receipt_marks_only_a_defaulted_model(
+    tmp_path: Path, defaulted: bool
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": "ANSWER"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3},
+            },
+        )
+
+    async with _client(handler) as client:
+        result = await run_ask(
+            client=client,
+            base_url="https://g.test",
+            key="sk-oai-x",
+            model="rits/zai-org/glm-5-3",
+            prompt="hi",
+            system=None,
+            dialect=None,
+            thinking=False,
+            max_tokens=None,
+            timeout=5,
+            retries=0,
+            output=None,
+            run_root=tmp_path,
+            save_thinking=False,
+            model_defaulted=defaulted,
+        )
+    assert result.exit_code == 0
+    if defaulted:
+        assert "  model     rits/zai-org/glm-5-3  (default)" in result.receipt
+    else:
+        assert "(default)" not in result.receipt
+
+
 async def test_ask_redacts_the_key_from_errors(tmp_path: Path) -> None:
     key = "sk-oai-secret-value"
 

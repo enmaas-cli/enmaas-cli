@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from typing import Any
 import httpx
 
 from .auth import redact
-from .batching import build_batch_prompt, split_batch_response, split_template
+from .batching import PER_ITEM_MARKER, build_batch_prompt, split_batch_response, split_template
 from .budget import TokenBudget, charge_from_rows, metered
 from .client import GatewayError, call
 from .dialect import (
@@ -23,6 +24,7 @@ from .dialect import (
     default_max_tokens,
     parse_response,
     resolve_dialect,
+    thinking_off_payload,
 )
 from .outputs import protect
 from .schema import ValidationError, load_schema, validate_against_schema
@@ -250,6 +252,9 @@ class MapOutcome:
     # rolling.spent + outcome.spent instead double-counts a resumed
     # job, because outcome.spent already carries the prior runs.
     rolling_spent: int | None = None
+    # The group size the run used, after defaulting. Carried so the
+    # receipt can say what was chosen when the caller did not choose.
+    batch: int = 1
 
     @property
     def exit_code(self) -> int:
@@ -278,7 +283,7 @@ async def run_map(
     resume: bool,
     schema_file: Path | None = None,
     schema_name: str | None = None,
-    batch: int = 1,
+    batch: int | None = None,
     token_budget: int | None = None,
     rolling_budget: TokenBudget | None = None,
 ) -> MapOutcome:
@@ -287,6 +292,11 @@ async def run_map(
     validate_all(template, items)
     # Split once, up front. A template that cannot be batched should fail
     # before any request, not after the first group has been paid for.
+    if batch is None:
+        # The marker is the template author's declaration that the
+        # template is batch-safe. Without it, one item per call is the
+        # only shape that is known to work.
+        batch = 10 if PER_ITEM_MARKER in template else 1
     preamble, per_item = split_template(template) if batch > 1 else ("", "")
 
     schema = load_schema(schema_file) if schema_file is not None else None
@@ -298,6 +308,13 @@ async def run_map(
         protect(outdir / f"{item['id']}.md")
 
     resolved = resolve_dialect(model, dialect)
+    if not thinking:
+        # Printed once here. build_request computes the same note per
+        # request, but a bulk run would print it per group, and ask is
+        # the only path that printed it at all.
+        _, note = thinking_off_payload(resolved, model)
+        if note is not None:
+            print(f"warning: {note}", file=sys.stderr)
     tokens = max_tokens or default_max_tokens(thinking=thinking)
     breaker = CircuitBreaker()
     semaphore = asyncio.Semaphore(concurrency)
@@ -614,4 +631,5 @@ async def run_map(
         elapsed=time.monotonic() - started,
         outdir=outdir,
         failures=failures,
+        batch=batch,
     )

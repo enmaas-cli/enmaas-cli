@@ -269,3 +269,42 @@ def test_a_clean_response_gains_no_warning() -> None:
         elapsed=1.0,
     )
     assert "U+FFFD" not in text
+
+
+def test_map_receipt_shows_the_batch_size() -> None:
+    text = map_receipt(_outcome(batch=10), model="m")
+    assert "  batch     10" in text
+
+
+def test_map_receipt_marks_a_defaulted_model() -> None:
+    text = map_receipt(_outcome(), model="m", model_defaulted=True)
+    assert "  model     m  (default)" in text
+
+
+def test_map_receipt_marks_a_defaulted_batch() -> None:
+    text = map_receipt(_outcome(batch=10), model="m", batch_defaulted=True)
+    assert "  batch     10  (default: template has ===PER ITEM===)" in text
+    text = map_receipt(_outcome(batch=1), model="m", batch_defaulted=True)
+    assert "  batch     1  (default: template has no ===PER ITEM===)" in text
+
+
+def test_map_receipt_does_not_mark_explicit_choices() -> None:
+    text = map_receipt(_outcome(batch=5), model="m")
+    assert "(default" not in text
+
+
+def test_ask_receipt_marks_a_defaulted_model(tmp_path: Path) -> None:
+    path = tmp_path / "a.md"
+    path.write_text("x", encoding="utf-8")
+    completion = Completion(
+        text="x", reasoning="", stop="stop", usage=Usage(input_tokens=10, output_tokens=1)
+    )
+    text = ask_receipt(
+        model="m",
+        dialect="openai",
+        completion=completion,
+        path=path,
+        elapsed=0.1,
+        model_defaulted=True,
+    )
+    assert "  model     m  (default)  (openai dialect)" in text
