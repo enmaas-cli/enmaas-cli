@@ -95,11 +95,23 @@ def test_ask_receipt_flags_truncation(tmp_path: Path) -> None:
 
 def _outcome(**kw: object) -> MapOutcome:
     base: dict[str, object] = dict(
-        ok=3, failed=0, skipped=0, attempted=3, total=10,
-        abort_reason=None, input_tokens=600, output_tokens=600,
-        cached_tokens=0, reasoning_tokens=0, elapsed=2.0,
-        outdir=Path("out"), failures=[], spent=1200, tripped_budget=None,
-        charged=1200, rolling_spent=None,
+        ok=3,
+        failed=0,
+        skipped=0,
+        attempted=3,
+        total=10,
+        abort_reason=None,
+        input_tokens=600,
+        output_tokens=600,
+        cached_tokens=0,
+        reasoning_tokens=0,
+        elapsed=2.0,
+        outdir=Path("out"),
+        failures=[],
+        spent=1200,
+        tripped_budget=None,
+        charged=1200,
+        rolling_spent=None,
     )
     base.update(kw)
     return MapOutcome(**base)  # type: ignore[arg-type]
@@ -128,7 +140,8 @@ def test_the_receipt_reports_the_job_total_not_the_invocation() -> None:
     """A resumed run that attempted nothing must not claim it spent nothing."""
     text = map_receipt(
         _outcome(abort_reason="budget", attempted=0, ok=0, skipped=10, spent=1200),
-        model="m", token_budget=1000,
+        model="m",
+        token_budget=1000,
     )
     assert "1,200 of 1,000 tokens" in text
 
@@ -169,9 +182,10 @@ def test_the_breaker_header_says_why() -> None:
 def test_a_rolling_stop_blames_the_config_not_the_flag() -> None:
     """Raising --token-budget cannot release a standing ceiling."""
     text = map_receipt(
-        _outcome(abort_reason="budget", tripped_budget="rolling",
-                 rolling_spent=50_100),
-        model="m", rolling_ceiling=50_000, rolling_spent=48_900,
+        _outcome(abort_reason="budget", tripped_budget="rolling", rolling_spent=50_100),
+        model="m",
+        rolling_ceiling=50_000,
+        rolling_spent=48_900,
     )
     assert "rolling window" in text
     assert "50,100 of 50,000" in text
@@ -182,7 +196,10 @@ def test_a_rolling_stop_blames_the_config_not_the_flag() -> None:
 def test_a_per_run_stop_still_blames_the_flag() -> None:
     text = map_receipt(
         _outcome(abort_reason="budget", tripped_budget="per_run"),
-        model="m", token_budget=1000, rolling_ceiling=50_000, rolling_spent=100,
+        model="m",
+        token_budget=1000,
+        rolling_ceiling=50_000,
+        rolling_spent=100,
     )
     assert "raise --token-budget" in text
     assert "config.toml" not in text
@@ -190,9 +207,11 @@ def test_a_per_run_stop_still_blames_the_flag() -> None:
 
 def test_both_ceilings_are_shown_and_only_one_is_marked() -> None:
     text = map_receipt(
-        _outcome(abort_reason="budget", tripped_budget="rolling",
-                 rolling_spent=50_100),
-        model="m", token_budget=99_999, rolling_ceiling=50_000, rolling_spent=48_900,
+        _outcome(abort_reason="budget", tripped_budget="rolling", rolling_spent=50_100),
+        model="m",
+        token_budget=99_999,
+        rolling_ceiling=50_000,
+        rolling_spent=48_900,
     )
     assert text.count("stopped here") == 1
     assert "this run" in text
@@ -202,9 +221,10 @@ def test_both_ceilings_are_shown_and_only_one_is_marked() -> None:
 def test_a_rolling_ceiling_is_shown_even_without_the_flag() -> None:
     """Otherwise a standing-budget stop prints no ceiling and looks unexplained."""
     text = map_receipt(
-        _outcome(abort_reason="budget", tripped_budget="rolling",
-                 rolling_spent=50_100),
-        model="m", rolling_ceiling=50_000, rolling_spent=48_900,
+        _outcome(abort_reason="budget", tripped_budget="rolling", rolling_spent=50_100),
+        model="m",
+        rolling_ceiling=50_000,
+        rolling_spent=48_900,
     )
     assert "50,000" in text
 
@@ -217,18 +237,23 @@ def test_a_resumed_run_does_not_double_count_in_the_rolling_line() -> None:
     """
     text = map_receipt(
         _outcome(spent=500, charged=100, rolling_spent=500),
-        model="m", rolling_ceiling=10_000, rolling_spent=400,
+        model="m",
+        rolling_ceiling=10_000,
+        rolling_spent=400,
     )
     assert "500 of 10,000 tokens, rolling window" in text
     assert "900" not in text
+
+
 def test_the_receipt_says_when_output_was_repaired() -> None:
     """Altering a model's output and saying nothing is its own kind of wrong."""
-    completion = Completion(
-        text="ok � bad", reasoning="", stop="stop", usage=Usage(), replaced=1
-    )
+    completion = Completion(text="ok � bad", reasoning="", stop="stop", usage=Usage(), replaced=1)
     text = ask_receipt(
-        model="m", dialect="openai", completion=completion,
-        path=Path("out.md"), elapsed=1.0,
+        model="m",
+        dialect="openai",
+        completion=completion,
+        path=Path("out.md"),
+        elapsed=1.0,
     )
     assert "1 character the model emitted could not be encoded" in text
     assert "U+FFFD" in text
@@ -237,7 +262,10 @@ def test_the_receipt_says_when_output_was_repaired() -> None:
 def test_a_clean_response_gains_no_warning() -> None:
     completion = Completion(text="fine", reasoning="", stop="stop", usage=Usage())
     text = ask_receipt(
-        model="m", dialect="openai", completion=completion,
-        path=Path("out.md"), elapsed=1.0,
+        model="m",
+        dialect="openai",
+        completion=completion,
+        path=Path("out.md"),
+        elapsed=1.0,
     )
     assert "U+FFFD" not in text

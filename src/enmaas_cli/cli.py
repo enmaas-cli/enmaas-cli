@@ -186,10 +186,13 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--timeout", type=positive_float)
     mp.add_argument("--thinking", choices=["on", "off"], default=None)
     mp.add_argument(
-        "--batch", type=positive_int, default=1, metavar="N",
+        "--batch",
+        type=positive_int,
+        default=1,
+        metavar="N",
         help="items per request (default 1). N>1 needs the template to mark "
-             "its per-item part; see the skill. Cuts input sharply on bulk "
-             "jobs because the shared preamble is sent once per batch.",
+        "its per-item part; see the skill. Cuts input sharply on bulk "
+        "jobs because the shared preamble is sent once per batch.",
     )
     mp.add_argument("--resume", action="store_true")
     mp.add_argument("--json", action="store_true")
@@ -206,7 +209,9 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument(
         # Explicit dest: argparse already uses "command" for the subcommand
         # name, and colliding would overwrite it with this value.
-        "--command", required=True, dest="command_name",
+        "--command",
+        required=True,
+        dest="command_name",
         help="what did the work, e.g. the calling tool's name",
     )
     rec.add_argument("--input", type=nonnegative_int, required=True)
@@ -216,8 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--elapsed", type=nonnegative_float, default=0.0)
     rec.add_argument("--status", choices=["ok", "error"], default="ok")
     rec.add_argument("--error-kind", help="class name only, never a message")
-    rec.add_argument("--dialect", choices=["openai", "anthropic"],
-                     default="openai")
+    rec.add_argument("--dialect", choices=["openai", "anthropic"], default="openai")
 
     usage = sub.add_parser("usage", help="show usage statistics")
     usage.add_argument("--json", action="store_true")
@@ -449,26 +453,38 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
         # Nothing is being recorded, so the ceiling could never bind and
         # every run would see zero spent. Enforcement that cannot observe
         # itself must say so rather than wave the work through.
-        return RollingCheck(0, config.budget_tokens, message=(
-            "a token budget is configured but ENMAAS_NO_USAGE_LOG disables "
-            "the ledger, so spend cannot be tracked"
-        ))
+        return RollingCheck(
+            0,
+            config.budget_tokens,
+            message=(
+                "a token budget is configured but ENMAAS_NO_USAGE_LOG disables "
+                "the ledger, so spend cannot be tracked"
+            ),
+        )
 
     events, problems = load_events_strict(ledger)
     if problems:
         # An unreadable ledger is indistinguishable from one showing zero
         # spend. Without a budget configured this would only warn.
-        return RollingCheck(0, config.budget_tokens, message=(
-            "a token budget is configured but the usage ledger could not "
-            f"be read: {'; '.join(problems[:3])}"
-        ))
+        return RollingCheck(
+            0,
+            config.budget_tokens,
+            message=(
+                "a token budget is configured but the usage ledger could not "
+                f"be read: {'; '.join(problems[:3])}"
+            ),
+        )
 
     spent = rolling_spend(events, window_days=config.budget_window_days)
     if spent >= config.budget_tokens:
-        return RollingCheck(spent, config.budget_tokens, message=(
-            f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
-            f"{config.budget_window_days} days"
-        ))
+        return RollingCheck(
+            spent,
+            config.budget_tokens,
+            message=(
+                f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
+                f"{config.budget_window_days} days"
+            ),
+        )
     return RollingCheck(spent, config.budget_tokens, message=None)
 
 
@@ -581,19 +597,24 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             # cannot distinguish a budget refusal from a breaker abort.
             # A --json caller gets the same abort_reason vocabulary it
             # would get from a run that started and then stopped.
-            print(json.dumps({
-                "status": "refused",
-                "abort_reason": "budget",
-                "budget": {
-                    "per_run": None,
-                    "rolling": {
-                        "ceiling": rolling.ceiling,
-                        "spent": rolling.spent,
+            print(
+                json.dumps(
+                    {
+                        "status": "refused",
+                        "abort_reason": "budget",
+                        "budget": {
+                            "per_run": None,
+                            "rolling": {
+                                "ceiling": rolling.ceiling,
+                                "spent": rolling.spent,
+                            },
+                            "tripped": "rolling",
+                        },
+                        "error": rolling.message,
                     },
-                    "tripped": "rolling",
-                },
-                "error": rolling.message,
-            }, indent=2))
+                    indent=2,
+                )
+            )
         else:
             print(
                 f"enmaas {args.command} refused\n  budget    {rolling.message}",
@@ -709,9 +730,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
                     # --json suppresses the receipt, so without this a
                     # repaired response would look untouched to a caller
                     # that only reads the machine-readable output.
-                    "replaced": (
-                        result.completion.replaced if result.completion else 0
-                    ),
+                    "replaced": (result.completion.replaced if result.completion else 0),
                     "error": result.error,
                 }
                 print(json.dumps(ask_obj, indent=2))
@@ -800,7 +819,8 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
 
         if args.json:
             status = (
-                "aborted" if outcome.abort_reason is not None
+                "aborted"
+                if outcome.abort_reason is not None
                 else ("partial" if outcome.failed > 0 else "ok")
             )
             obj: dict[str, Any] = {
@@ -859,11 +879,13 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             }
             print(json.dumps(obj, indent=2))
         else:
-            print(map_receipt(
-                outcome,
-                model=args.model,
-                token_budget=args.token_budget,
-                rolling_ceiling=rolling.ceiling,
-                rolling_spent=rolling.spent,
-            ))
+            print(
+                map_receipt(
+                    outcome,
+                    model=args.model,
+                    token_budget=args.token_budget,
+                    rolling_ceiling=rolling.ceiling,
+                    rolling_spent=rolling.spent,
+                )
+            )
         return outcome.exit_code

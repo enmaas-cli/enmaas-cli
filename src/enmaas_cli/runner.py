@@ -330,8 +330,16 @@ async def run_map(
     # counted by one and not the other. That predates budgets and is left
     # alone here; it is the reason the budget keeps its own total rather
     # than deriving one from these.
-    counts = {"ok": 0, "failed": 0, "attempted": 0, "in": 0, "out": 0,
-              "cached": 0, "reasoning": 0, "charge": 0}
+    counts = {
+        "ok": 0,
+        "failed": 0,
+        "attempted": 0,
+        "in": 0,
+        "out": 0,
+        "cached": 0,
+        "reasoning": 0,
+        "charge": 0,
+    }
     failures: list[tuple[str, str]] = []
 
     async def process(item: dict[str, Any]) -> None:
@@ -456,9 +464,7 @@ async def run_map(
             rows: list[dict[str, Any]] = []
             charge = 0
             try:
-                data = await call(
-                    client, base_url, request, timeout=timeout, retries=retries
-                )
+                data = await call(client, base_url, request, timeout=timeout, retries=retries)
                 completion = parse_response(data, resolved)
                 # Before split_batch_response, so a reply this group cannot
                 # be split out of is still charged.
@@ -476,8 +482,15 @@ async def run_map(
                 message = redact(str(exc), key)
                 answers = {}
                 for item_id in ids:
-                    rows.append({"id": item_id, "status": "error", "path": None,
-                                 "tokens": None, "error": message})
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "status": "error",
+                            "path": None,
+                            "tokens": None,
+                            "error": message,
+                        }
+                    )
                     failures.append((item_id, message))
                     counts["failed"] += 1
 
@@ -489,8 +502,15 @@ async def run_map(
                     # Not ok. A missing output file that nothing flags would
                     # be skipped forever by --resume.
                     message = f"no answer for {item_id} in the batched reply"
-                    rows.append({"id": item_id, "status": "error", "path": None,
-                                 "tokens": None, "error": message})
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "status": "error",
+                            "path": None,
+                            "tokens": None,
+                            "error": message,
+                        }
+                    )
                     failures.append((item_id, message))
                     counts["failed"] += 1
                     continue
@@ -501,20 +521,37 @@ async def run_map(
                     path.write_text(text, encoding="utf-8")
                 except (ValidationError, OSError) as exc:
                     message = redact(str(exc), key)
-                    rows.append({"id": item_id, "status": "error", "path": None,
-                                 "tokens": None, "error": message})
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "status": "error",
+                            "path": None,
+                            "tokens": None,
+                            "error": message,
+                        }
+                    )
                     failures.append((item_id, message))
                     counts["failed"] += 1
                     continue
-                rows.append({"id": item_id, "status": "ok", "path": str(path),
-                             "tokens": None, "batch_size": len(group),
-                             # Request-level, not item-level: one reply
-                             # covered the whole group and was repaired
-                             # before it could be split, so the count
-                             # cannot be attributed to a single item.
-                             **({"replaced_in_request": completion.replaced}
-                                if completion.replaced else {}),
-                             "error": None})
+                rows.append(
+                    {
+                        "id": item_id,
+                        "status": "ok",
+                        "path": str(path),
+                        "tokens": None,
+                        "batch_size": len(group),
+                        # Request-level, not item-level: one reply
+                        # covered the whole group and was repaired
+                        # before it could be split, so the count
+                        # cannot be attributed to a single item.
+                        **(
+                            {"replaced_in_request": completion.replaced}
+                            if completion.replaced
+                            else {}
+                        ),
+                        "error": None,
+                    }
+                )
                 counts["ok"] += 1
 
             async with lock:
@@ -551,7 +588,7 @@ async def run_map(
                             tripped_budget = name
 
     if batch > 1:
-        groups = [pending[n:n + batch] for n in range(0, len(pending), batch)]
+        groups = [pending[n : n + batch] for n in range(0, len(pending), batch)]
         await asyncio.gather(*(process_batch(g) for g in groups))
     else:
         await asyncio.gather(*(process(item) for item in pending))

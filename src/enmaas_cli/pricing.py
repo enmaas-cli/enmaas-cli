@@ -78,10 +78,7 @@ def cost_for(
     price = price_for(model, table)
     if price is None:
         return None
-    return (
-        input_tokens / 1e6 * price.input_per_mtok
-        + output_tokens / 1e6 * price.output_per_mtok
-    )
+    return input_tokens / 1e6 * price.input_per_mtok + output_tokens / 1e6 * price.output_per_mtok
 
 
 def opus_equivalent(input_tokens: int, output_tokens: int) -> float:

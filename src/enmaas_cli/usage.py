@@ -123,8 +123,6 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
     return True
 
 
-
-
 def _event_from_row(data: object) -> UsageEvent:
     """Parse one ledger row, rejecting what must not be trusted.
 
@@ -206,9 +204,7 @@ def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
             continue
         try:
             events.append(_event_from_row(json.loads(stripped)))
-        except (
-            json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError
-        ) as exc:
+        except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as exc:
             problems.append(f"{ledger} line {number}: {type(exc).__name__}: {exc}")
     return events, problems
 
@@ -331,9 +327,7 @@ def format_summary(
     return "\n".join(lines)
 
 
-def format_summary_json(
-    summary: UsageSummary, prices: dict[str, ModelPrice] | None = None
-) -> str:
+def format_summary_json(summary: UsageSummary, prices: dict[str, ModelPrice] | None = None) -> str:
     """Format summary as JSON for machine consumption."""
     spend, unpriced, reference = compute_costs(summary, prices)
     obj = {
@@ -380,9 +374,7 @@ def compute_costs(
     return spend, unpriced, opus_equivalent(total_in, total_out)
 
 
-def _cost_lines(
-    summary: UsageSummary, table: dict[str, ModelPrice]
-) -> list[str]:
+def _cost_lines(summary: UsageSummary, table: dict[str, ModelPrice]) -> list[str]:
     """Spend and the reference comparison, kept clearly apart.
 
     Spend is what the gateway charged, and is known only for models with a
@@ -395,8 +387,7 @@ def _cost_lines(
     lines = [f"Spend:            ${spend:,.2f}"]
     if unpriced:
         lines.append(
-            f"  unpriced:       {', '.join(unpriced)} "
-            f"(no rate configured, so not counted above)"
+            f"  unpriced:       {', '.join(unpriced)} (no rate configured, so not counted above)"
         )
     lines.append(f"Opus-equivalent:  ${reference:,.2f}")
     lines.append(f"  reference:      {OPUS_REFERENCE.label}")

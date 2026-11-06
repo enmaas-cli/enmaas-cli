@@ -29,9 +29,7 @@ def _ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _rows(path: Path) -> list[dict[str, object]]:
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
@@ -40,10 +38,21 @@ def test_record_appends_a_row_another_tool_can_be_counted_by(
 ) -> None:
     ledger = _ledger(tmp_path, monkeypatch)
 
-    rc = main([
-        "record", "--model", "rits/zai-org/glm-5-3", "--command", "bug-hunt",
-        "--input", "1067793", "--output", "49242", "--elapsed", "612.5",
-    ])
+    rc = main(
+        [
+            "record",
+            "--model",
+            "rits/zai-org/glm-5-3",
+            "--command",
+            "bug-hunt",
+            "--input",
+            "1067793",
+            "--output",
+            "49242",
+            "--elapsed",
+            "612.5",
+        ]
+    )
 
     assert rc == 0
     rows = _rows(ledger)
@@ -56,15 +65,25 @@ def test_record_appends_a_row_another_tool_can_be_counted_by(
 
 
 def test_a_recorded_run_shows_up_in_usage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The point of the feature: the number stops being invisible."""
     _ledger(tmp_path, monkeypatch)
-    main([
-        "record", "--model", "rits/zai-org/glm-5-3", "--command", "bug-hunt",
-        "--input", "1000000", "--output", "50000",
-    ])
+    main(
+        [
+            "record",
+            "--model",
+            "rits/zai-org/glm-5-3",
+            "--command",
+            "bug-hunt",
+            "--input",
+            "1000000",
+            "--output",
+            "50000",
+        ]
+    )
     capsys.readouterr()
 
     main(["usage"])
@@ -79,10 +98,23 @@ def test_record_carries_cached_and_reasoning_when_given(
 ) -> None:
     ledger = _ledger(tmp_path, monkeypatch)
 
-    main([
-        "record", "--model", "m", "--command", "c", "--input", "10",
-        "--output", "2", "--cached", "7", "--reasoning", "3",
-    ])
+    main(
+        [
+            "record",
+            "--model",
+            "m",
+            "--command",
+            "c",
+            "--input",
+            "10",
+            "--output",
+            "2",
+            "--cached",
+            "7",
+            "--reasoning",
+            "3",
+        ]
+    )
 
     row = _rows(ledger)[0]
     assert row["cached_tokens"] == 7
@@ -95,19 +127,30 @@ def test_a_failed_run_can_be_recorded_as_such(
     """A ledger that only holds successes overstates how well things went."""
     ledger = _ledger(tmp_path, monkeypatch)
 
-    main([
-        "record", "--model", "m", "--command", "c", "--input", "5",
-        "--output", "0", "--status", "error", "--error-kind", "GatewayError",
-    ])
+    main(
+        [
+            "record",
+            "--model",
+            "m",
+            "--command",
+            "c",
+            "--input",
+            "5",
+            "--output",
+            "0",
+            "--status",
+            "error",
+            "--error-kind",
+            "GatewayError",
+        ]
+    )
 
     row = _rows(ledger)[0]
     assert row["status"] == "error"
     assert row["error_kind"] == "GatewayError"
 
 
-def test_record_rejects_a_negative_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_record_rejects_a_negative_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Garbage in the ledger is worse than a gap in it.
 
     Usage errors exit 1 here rather than returning, which is this CLI's
@@ -116,23 +159,44 @@ def test_record_rejects_a_negative_count(
     ledger = _ledger(tmp_path, monkeypatch)
 
     with pytest.raises(SystemExit) as excinfo:
-        main([
-            "record", "--model", "m", "--command", "c", "--input", "-1",
-            "--output", "2",
-        ])
+        main(
+            [
+                "record",
+                "--model",
+                "m",
+                "--command",
+                "c",
+                "--input",
+                "-1",
+                "--output",
+                "2",
+            ]
+        )
 
     assert excinfo.value.code == 1
     assert not ledger.exists(), "a rejected row must not reach the ledger"
 
 
-def test_zero_tokens_are_allowed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_zero_tokens_are_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A call that produced nothing still happened and still counts."""
     ledger = _ledger(tmp_path, monkeypatch)
 
-    assert main([
-        "record", "--model", "m", "--command", "c", "--input", "0",
-        "--output", "0", "--status", "error",
-    ]) == 0
+    assert (
+        main(
+            [
+                "record",
+                "--model",
+                "m",
+                "--command",
+                "c",
+                "--input",
+                "0",
+                "--output",
+                "0",
+                "--status",
+                "error",
+            ]
+        )
+        == 0
+    )
     assert _rows(ledger)[0]["input_tokens"] == 0

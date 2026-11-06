@@ -126,15 +126,13 @@ def _parse_prices(value: object) -> tuple[dict[str, ModelPrice], list[str]]:
             raw = entry.get(field_name)
             if not isinstance(raw, (int, float)) or isinstance(raw, bool):
                 warnings.append(
-                    f"price for {model!r} needs a numeric {field_name}, "
-                    f"ignoring this entry"
+                    f"price for {model!r} needs a numeric {field_name}, ignoring this entry"
                 )
                 bad = True
                 break
             if raw < 0:
                 warnings.append(
-                    f"price for {model!r} has a negative {field_name}, "
-                    f"ignoring this entry"
+                    f"price for {model!r} has a negative {field_name}, ignoring this entry"
                 )
                 bad = True
                 break
@@ -171,9 +169,7 @@ def _parse_budget(value: object) -> dict[str, int]:
     for name in ("window_days", "tokens"):
         raw = value.get(name)
         if raw is None:
-            raise ConfigError(
-                f"[budget] needs both window_days and tokens; {name} is missing"
-            )
+            raise ConfigError(f"[budget] needs both window_days and tokens; {name} is missing")
         # bool subclasses int, so `tokens = true` would otherwise pass.
         if not isinstance(raw, int) or isinstance(raw, bool):
             raise ConfigError(f"[budget] {name} must be an integer, got {raw!r}")

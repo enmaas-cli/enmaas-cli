@@ -131,14 +131,25 @@ def test_every_subcommand_defines_what_dispatch_reads(argv: list[str]) -> None:
 
 def _spend_row(tokens: int, *, days_ago: int = 0) -> str:
     """One serialised ok event costing exactly `tokens` metered tokens."""
-    return json.dumps({
-        "timestamp": (datetime.now(UTC) - timedelta(days=days_ago)).isoformat(),
-        "command": "ask", "model": "m", "dialect": "openai",
-        "input_tokens": tokens, "cached_tokens": 0, "output_tokens": 0,
-        "reasoning_tokens": 0, "elapsed": 1.0, "status": "ok",
-        "schema_used": False, "error_kind": None,
-        "items_total": None, "items_ok": None, "items_failed": None,
-    })
+    return json.dumps(
+        {
+            "timestamp": (datetime.now(UTC) - timedelta(days=days_ago)).isoformat(),
+            "command": "ask",
+            "model": "m",
+            "dialect": "openai",
+            "input_tokens": tokens,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "elapsed": 1.0,
+            "status": "ok",
+            "schema_used": False,
+            "error_kind": None,
+            "items_total": None,
+            "items_ok": None,
+            "items_failed": None,
+        }
+    )
 
 
 def test_rolling_check_refuses_once_the_budget_is_spent(tmp_path: Path) -> None:

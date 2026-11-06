@@ -192,8 +192,7 @@ async def test_token_budget_stops_a_real_run(key: str, tmp_path: Path) -> None:
     items = tmp_path / "items.jsonl"
     items.write_text(
         "\n".join(
-            json.dumps({"id": f"i{n}", "q": "Name one colour. One word."})
-            for n in range(10)
+            json.dumps({"id": f"i{n}", "q": "Name one colour. One word."}) for n in range(10)
         ),
         encoding="utf-8",
     )
@@ -202,11 +201,21 @@ async def test_token_budget_stops_a_real_run(key: str, tmp_path: Path) -> None:
 
     async with httpx.AsyncClient() as client:
         outcome = await run_map(
-            client=client, base_url=BASE, key=key, model=GLM,
-            items_path=items, template_path=template,
-            outdir=tmp_path / "out", concurrency=1, retries=0,
-            timeout=120, thinking=False, max_tokens=None,
-            dialect=None, resume=False, token_budget=50,
+            client=client,
+            base_url=BASE,
+            key=key,
+            model=GLM,
+            items_path=items,
+            template_path=template,
+            outdir=tmp_path / "out",
+            concurrency=1,
+            retries=0,
+            timeout=120,
+            thinking=False,
+            max_tokens=None,
+            dialect=None,
+            resume=False,
+            token_budget=50,
         )
 
     assert outcome.abort_reason == "budget", outcome

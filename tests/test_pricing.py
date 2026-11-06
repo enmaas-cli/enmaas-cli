@@ -56,9 +56,7 @@ def test_a_configured_prefix_covers_its_models() -> None:
 def test_an_exact_id_beats_a_prefix() -> None:
     table = {
         "gemini-": ModelPrice(input_per_mtok=2.0, output_per_mtok=8.0),
-        "gemini-3.1-pro-preview": ModelPrice(
-            input_per_mtok=5.0, output_per_mtok=20.0
-        ),
+        "gemini-3.1-pro-preview": ModelPrice(input_per_mtok=5.0, output_per_mtok=20.0),
     }
 
     price = price_for("gemini-3.1-pro-preview", table)
@@ -112,11 +110,20 @@ def test_the_summary_reports_cost_and_the_reference_comparison() -> None:
 
     events = [
         UsageEvent(
-            timestamp=datetime.now(UTC), command="ask",
-            model="rits/zai-org/glm-5-3", dialect="openai",
-            input_tokens=1_000_000, cached_tokens=0, output_tokens=100_000,
-            reasoning_tokens=0, elapsed=1.0, status="ok", schema_used=False,
-            error_kind=None, items_total=None, items_ok=None,
+            timestamp=datetime.now(UTC),
+            command="ask",
+            model="rits/zai-org/glm-5-3",
+            dialect="openai",
+            input_tokens=1_000_000,
+            cached_tokens=0,
+            output_tokens=100_000,
+            reasoning_tokens=0,
+            elapsed=1.0,
+            status="ok",
+            schema_used=False,
+            error_kind=None,
+            items_total=None,
+            items_ok=None,
             items_failed=None,
         ),
     ]
@@ -124,9 +131,7 @@ def test_the_summary_reports_cost_and_the_reference_comparison() -> None:
     text = format_summary(summarize_usage(events), since_days=None)
 
     assert "$0.00" in text, "a free model should report zero spend"
-    assert "7.50" in text, (
-        "1M input and 100k output at the Opus reference is $7.50"
-    )
+    assert "7.50" in text, "1M input and 100k output at the Opus reference is $7.50"
     assert "Opus" in text
 
 
@@ -138,11 +143,21 @@ def test_the_summary_names_models_it_cannot_price() -> None:
 
     events = [
         UsageEvent(
-            timestamp=datetime.now(UTC), command="ask", model="gpt-6-sol",
-            dialect="openai", input_tokens=1000, cached_tokens=0,
-            output_tokens=100, reasoning_tokens=0, elapsed=1.0, status="ok",
-            schema_used=False, error_kind=None, items_total=None,
-            items_ok=None, items_failed=None,
+            timestamp=datetime.now(UTC),
+            command="ask",
+            model="gpt-6-sol",
+            dialect="openai",
+            input_tokens=1000,
+            cached_tokens=0,
+            output_tokens=100,
+            reasoning_tokens=0,
+            elapsed=1.0,
+            status="ok",
+            schema_used=False,
+            error_kind=None,
+            items_total=None,
+            items_ok=None,
+            items_failed=None,
         ),
     ]
 
@@ -188,9 +203,7 @@ def test_a_malformed_price_is_warned_about_not_silently_dropped(
     from enmaas_cli.config import load_config
 
     path = tmp_path / "config.toml"
-    path.write_text(
-        '[prices."m"]\ninput = "free"\noutput = 1.0\n', encoding="utf-8"
-    )
+    path.write_text('[prices."m"]\ninput = "free"\noutput = 1.0\n', encoding="utf-8")
 
     config = load_config(path)
 
@@ -226,20 +239,30 @@ def test_the_summary_uses_configured_prices_end_to_end(
     ledger = tmp_path / "enmaas" / "runs" / "usage.jsonl"
     ledger.parent.mkdir(parents=True)
     ledger.write_text(
-        json.dumps({
-            "timestamp": datetime.now(UTC).isoformat(), "command": "ask",
-            "model": "gpt-6-sol", "dialect": "openai",
-            "input_tokens": 1_000_000, "cached_tokens": 0,
-            "output_tokens": 100_000, "reasoning_tokens": 0, "elapsed": 1.0,
-            "status": "ok", "schema_used": False, "error_kind": None,
-            "items_total": None, "items_ok": None, "items_failed": None,
-        }) + "\n",
+        json.dumps(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "command": "ask",
+                "model": "gpt-6-sol",
+                "dialect": "openai",
+                "input_tokens": 1_000_000,
+                "cached_tokens": 0,
+                "output_tokens": 100_000,
+                "reasoning_tokens": 0,
+                "elapsed": 1.0,
+                "status": "ok",
+                "schema_used": False,
+                "error_kind": None,
+                "items_total": None,
+                "items_ok": None,
+                "items_failed": None,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     config = tmp_path / "config.toml"
-    config.write_text(
-        '[prices."gpt-6-sol"]\ninput = 1.0\noutput = 10.0\n', encoding="utf-8"
-    )
+    config.write_text('[prices."gpt-6-sol"]\ninput = 1.0\noutput = 10.0\n', encoding="utf-8")
 
     main(["--config", str(config), "usage"])
 
@@ -263,11 +286,20 @@ def test_the_json_summary_carries_cost_too() -> None:
 
     events = [
         UsageEvent(
-            timestamp=datetime.now(UTC), command="ask",
-            model="rits/zai-org/glm-5-3", dialect="openai",
-            input_tokens=1_000_000, cached_tokens=0, output_tokens=100_000,
-            reasoning_tokens=0, elapsed=1.0, status="ok", schema_used=False,
-            error_kind=None, items_total=None, items_ok=None,
+            timestamp=datetime.now(UTC),
+            command="ask",
+            model="rits/zai-org/glm-5-3",
+            dialect="openai",
+            input_tokens=1_000_000,
+            cached_tokens=0,
+            output_tokens=100_000,
+            reasoning_tokens=0,
+            elapsed=1.0,
+            status="ok",
+            schema_used=False,
+            error_kind=None,
+            items_total=None,
+            items_ok=None,
             items_failed=None,
         ),
     ]
