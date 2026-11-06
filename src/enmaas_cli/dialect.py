@@ -58,6 +58,15 @@ _OPENAI_THINKING_FLOOR: dict[str, tuple[dict[str, Any], str]] = {
         "gemini rejects reasoning_effort 'none'; sending 'minimal', which is "
         "the floor for this model and still spends reasoning tokens",
     ),
+    # Measured 2026-11-05: gpt-5-mini returns 400 for "none". "minimal" is
+    # the lowest value it accepts. gpt-6-* is in neither map and takes the
+    # unverified "none" fallback with a warning, which works for it, so the
+    # prefix is the hyphenated 5-series only.
+    "gpt-5-": (
+        {"reasoning_effort": "minimal"},
+        "gpt-5-* rejects reasoning_effort 'none'; sending 'minimal', which is "
+        "the floor for this family and still spends reasoning tokens",
+    ),
 }
 
 # Reasoning-family models took max_completion_tokens when max_tokens was

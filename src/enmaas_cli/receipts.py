@@ -75,11 +75,13 @@ def ask_receipt(
     completion: Completion,
     path: Path,
     elapsed: float,
+    model_defaulted: bool = False,
 ) -> str:
     size = path.stat().st_size if path.exists() else 0
+    model_mark = "  (default)" if model_defaulted else ""
     lines = [
         "enmaas ask ok",
-        f"  model     {model}  ({dialect} dialect)",
+        f"  model     {model}{model_mark}  ({dialect} dialect)",
         f"  output    {path}  ({size:,} B)",
         _token_line(completion),
         f"  elapsed   {elapsed:.1f}s",
@@ -107,6 +109,8 @@ def map_receipt(
     token_budget: int | None = None,
     rolling_ceiling: int | None = None,
     rolling_spent: int = 0,
+    model_defaulted: bool = False,
+    batch_defaulted: bool = False,
 ) -> str:
     """The fixed-shape receipt for a bulk run.
 
@@ -122,9 +126,16 @@ def map_receipt(
         header = "enmaas map ok"
 
     not_attempted = outcome.total - outcome.attempted - outcome.skipped
+    model_mark = "  (default)" if model_defaulted else ""
+    if batch_defaulted:
+        has = "has" if outcome.batch > 1 else "has no"
+        batch_mark = f"  (default: template {has} ===PER ITEM===)"
+    else:
+        batch_mark = ""
     lines = [
         header,
-        f"  model     {model}",
+        f"  model     {model}{model_mark}",
+        f"  batch     {outcome.batch}{batch_mark}",
         f"  items     {outcome.total} total: {outcome.attempted} attempted, "
         f"{outcome.ok} ok, {outcome.failed} failed, {outcome.skipped} skipped",
     ]

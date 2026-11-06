@@ -222,3 +222,46 @@ async def test_token_budget_stops_a_real_run(key: str, tmp_path: Path) -> None:
     assert outcome.exit_code == 3
     assert outcome.attempted < 10
     assert outcome.spent >= 50
+
+
+async def test_default_batch_on_the_default_model_finishes_in_time(
+    key: str, tmp_path: Path
+) -> None:
+    """Ten short items, one request, well inside the 280 s client deadline."""
+    items = tmp_path / "items.jsonl"
+    items.write_text(
+        "\n".join(
+            json.dumps({"id": f"i{n}", "word": w})
+            for n, w in enumerate(
+                ["red", "blue", "green", "cyan", "black", "white", "grey", "pink", "gold", "teal"]
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    template = tmp_path / "t.txt"
+    template.write_text(
+        "Answer with one word: is the colour warm or cool?\n===PER ITEM===\nCOLOUR: {word}\n",
+        encoding="utf-8",
+    )
+    async with httpx.AsyncClient() as client:
+        outcome = await run_map(
+            client=client,
+            base_url="https://api.enmaas.devshift.net",
+            key=key,
+            model="rits/zai-org/glm-5-3",
+            items_path=items,
+            template_path=template,
+            outdir=tmp_path / "out",
+            concurrency=1,
+            retries=0,
+            timeout=280,
+            thinking=False,
+            max_tokens=None,
+            dialect=None,
+            resume=False,
+        )
+    assert outcome.batch == 10
+    assert outcome.ok == 10
+    assert outcome.elapsed < 280
+    print(f"default batch live run: {outcome.elapsed:.1f}s for 10 items in 1 request")

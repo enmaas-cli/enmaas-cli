@@ -251,3 +251,27 @@ def test_gemini_thinking_off_uses_minimal_not_none() -> None:
     assert payload == {"reasoning_effort": "minimal"}
     assert warning is not None
     assert "minimal" in warning
+
+
+def test_gpt5_family_floors_at_minimal_and_warns() -> None:
+    """gpt-5-mini rejects reasoning_effort 'none'; 'minimal' is its floor.
+
+    Measured 2026-11-05: 40 of 40 batched items failed with the default
+    knob, which is the silent path a caller cannot see.
+    """
+    payload, warning = thinking_off_payload("openai", "gpt-5-mini")
+    assert payload == {"reasoning_effort": "minimal"}
+    assert warning is not None
+    assert "minimal" in warning
+
+
+def test_gpt5_floor_does_not_catch_gpt5_point_one() -> None:
+    """The floor prefix is the hyphenated 5-series only.
+
+    gpt-5.1 models accept "none", so a bare "gpt-5" prefix would send them
+    "minimal" and spend reasoning tokens the caller asked to switch off.
+    """
+    payload, warning = thinking_off_payload("openai", "gpt-5.1-mini")
+    assert payload == {"reasoning_effort": "none"}
+    assert warning is not None
+    assert "minimal" not in warning
