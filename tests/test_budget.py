@@ -141,31 +141,58 @@ def test_budget_ignores_a_negative_charge() -> None:
 
 
 def test_charge_from_rows_sums_only_request_rows() -> None:
-    assert charge_from_rows([
-        {"id": "a", "status": "ok", "tokens": {"in": 999, "out": 999}},
-        {"type": "request", "charge": 200, "items": 1},
-        {"type": "request", "charge": 50, "items": 5},
-    ]) == 250
+    assert (
+        charge_from_rows(
+            [
+                {"id": "a", "status": "ok", "tokens": {"in": 999, "out": 999}},
+                {"type": "request", "charge": 200, "items": 1},
+                {"type": "request", "charge": 50, "items": 5},
+            ]
+        )
+        == 250
+    )
 
 
 def test_charge_from_rows_rejects_charges_that_would_hand_budget_back() -> None:
-    assert charge_from_rows([
-        {"type": "request", "charge": -100, "items": 1},
-        {"type": "request", "charge": 30.0, "items": 1},
-        {"type": "request", "charge": True, "items": 1},
-        {"type": "request", "charge": "200", "items": 1},
-        {"type": "request", "charge": 10, "items": 1},
-    ]) == 10
+    assert (
+        charge_from_rows(
+            [
+                {"type": "request", "charge": -100, "items": 1},
+                {"type": "request", "charge": 30.0, "items": 1},
+                {"type": "request", "charge": True, "items": 1},
+                {"type": "request", "charge": "200", "items": 1},
+                {"type": "request", "charge": 10, "items": 1},
+            ]
+        )
+        == 10
+    )
 
 
-def _event(now: datetime, *, days_ago: int = 0, inp: int = 0,
-           cached: int = 0, out: int = 0, status: str = "ok") -> UsageEvent:
+def _event(
+    now: datetime,
+    *,
+    days_ago: int = 0,
+    inp: int = 0,
+    cached: int = 0,
+    out: int = 0,
+    status: str = "ok",
+) -> UsageEvent:
     return UsageEvent(
-        timestamp=now - timedelta(days=days_ago), command="ask", model="m",
-        dialect="openai", input_tokens=inp, cached_tokens=cached,
-        output_tokens=out, reasoning_tokens=0, elapsed=1.0, status=status,
-        schema_used=False, error_kind=None,
-        items_total=None, items_ok=None, items_failed=None,
+        timestamp=now - timedelta(days=days_ago),
+        command="ask",
+        model="m",
+        dialect="openai",
+        input_tokens=inp,
+        cached_tokens=cached,
+        output_tokens=out,
+        reasoning_tokens=0,
+        elapsed=1.0,
+        status=status,
+        schema_used=False,
+        error_kind=None,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
     )
 
 
@@ -239,10 +266,21 @@ def test_legacy_rows_fall_back_to_the_reasoning_breakdown() -> None:
     """Rows predating `charge` must not read as free when output is absent."""
     now = datetime.now(UTC)
     legacy = UsageEvent(
-        timestamp=now, command="ask", model="m", dialect="openai",
-        input_tokens=0, cached_tokens=0, output_tokens=0, reasoning_tokens=100,
-        elapsed=1.0, status="ok", schema_used=False, error_kind=None,
-        items_total=None, items_ok=None, items_failed=None,
+        timestamp=now,
+        command="ask",
+        model="m",
+        dialect="openai",
+        input_tokens=0,
+        cached_tokens=0,
+        output_tokens=0,
+        reasoning_tokens=100,
+        elapsed=1.0,
+        status="ok",
+        schema_used=False,
+        error_kind=None,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
     )
     assert legacy.charge is None
     assert rolling_spend([legacy], window_days=30, now=now) == 100

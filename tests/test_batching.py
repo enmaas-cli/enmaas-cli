@@ -69,14 +69,12 @@ def test_the_batch_prompt_is_smaller_than_separate_prompts() -> None:
     a function of how much of each prompt is shared.
     """
     realistic = (
-        "You classify findings. " + ("Consider the following rule. " * 60)
+        "You classify findings. "
+        + ("Consider the following rule. " * 60)
         + f"\n\n{PER_ITEM_MARKER}\nTEXT: {{text}}\nWHERE: {{where}}\n"
     )
     preamble, per_item = split_template(realistic)
-    many = [
-        {"id": f"i{n}", "text": f"text {n}" * 8, "where": f"ch{n}"}
-        for n in range(10)
-    ]
+    many = [{"id": f"i{n}", "text": f"text {n}" * 8, "where": f"ch{n}"} for n in range(10)]
 
     batched = len(build_batch_prompt(preamble, per_item, many))
     separate = sum(len(realistic.format(**item)) for item in many)
@@ -96,10 +94,7 @@ def test_every_item_id_appears_so_answers_can_be_matched_back() -> None:
 
 
 def test_split_batch_response_returns_an_answer_per_item() -> None:
-    response = (
-        "=== ANSWER a1 ===\nCATEGORY: A\n"
-        "=== ANSWER b2 ===\nCATEGORY: B\n"
-    )
+    response = "=== ANSWER a1 ===\nCATEGORY: A\n=== ANSWER b2 ===\nCATEGORY: B\n"
 
     answers = split_batch_response(response, ["a1", "b2"])
 

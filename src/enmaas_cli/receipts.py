@@ -132,17 +132,13 @@ def map_receipt(
         lines.append(f"            {not_attempted} not attempted")
     lines.append(f"  outdir    {outcome.outdir}")
     lines.append(f"  index     {outcome.outdir / 'results.jsonl'}")
-    lines.append(
-        f"  tokens    in {outcome.input_tokens:,}   out {outcome.output_tokens:,}"
-    )
+    lines.append(f"  tokens    in {outcome.input_tokens:,}   out {outcome.output_tokens:,}")
     if token_budget:
         # outcome.spent, not a figure derived from the token counts above:
         # on a resumed run the ceiling is compared against the job total,
         # and those counters only cover this invocation's successes.
         mark = "  <-- stopped here" if outcome.tripped_budget == "per_run" else ""
-        lines.append(
-            f"  budget    {outcome.spent:,} of {token_budget:,} tokens, this run{mark}"
-        )
+        lines.append(f"  budget    {outcome.spent:,} of {token_budget:,} tokens, this run{mark}")
     if rolling_ceiling is not None:
         # Shown whenever a standing budget is configured, even if the
         # per-run flag was not used. Otherwise a rolling stop would print
@@ -154,9 +150,7 @@ def map_receipt(
         total = outcome.rolling_spent
         if total is None:
             total = rolling_spent + outcome.charged
-        lines.append(
-            f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}"
-        )
+        lines.append(f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}")
     lines.append(f"  elapsed   {outcome.elapsed:.1f}s")
     for item_id, message in outcome.failures[:20]:
         lines.append(f"  failure   {item_id}  {message}")
@@ -171,9 +165,7 @@ def map_receipt(
         # Not the plain --resume hint below. A budget stop resumed at the
         # same ceiling re-trips at once, so telling the user to "re-run
         # with --resume" would be advice that cannot work.
-        lines.append(
-            "  resume    raise --token-budget, then re-run with --resume"
-        )
+        lines.append("  resume    raise --token-budget, then re-run with --resume")
     elif outcome.abort_reason is not None:
         lines.append("  resume    re-run with --resume to continue")
     return "\n".join(lines)

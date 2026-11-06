@@ -140,14 +140,26 @@ def test_an_over_budget_ask_exits_three_without_calling_the_gateway(
     # inside it, so the fixture must match that exact path.
     (state / "enmaas" / "runs").mkdir(parents=True)
     (state / "enmaas" / "runs" / "usage.jsonl").write_text(
-        json.dumps({
-            "timestamp": datetime.now(UTC).isoformat(), "command": "ask",
-            "model": "m", "dialect": "openai", "input_tokens": 60_000,
-            "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
-            "elapsed": 1.0, "status": "ok", "schema_used": False,
-            "error_kind": None, "items_total": None, "items_ok": None,
-            "items_failed": None,
-        }) + "\n",
+        json.dumps(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "command": "ask",
+                "model": "m",
+                "dialect": "openai",
+                "input_tokens": 60_000,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "elapsed": 1.0,
+                "status": "ok",
+                "schema_used": False,
+                "error_kind": None,
+                "items_total": None,
+                "items_ok": None,
+                "items_failed": None,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
@@ -155,9 +167,7 @@ def test_an_over_budget_ask_exits_three_without_calling_the_gateway(
     monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
 
     config = tmp_path / "config.toml"
-    config.write_text(
-        "[budget]\nwindow_days = 30\ntokens = 50_000\n", encoding="utf-8"
-    )
+    config.write_text("[budget]\nwindow_days = 30\ntokens = 50_000\n", encoding="utf-8")
 
     def explode(*a: object, **k: object) -> None:
         raise AssertionError("a refused command must not open a client")
@@ -186,14 +196,27 @@ def test_an_over_budget_json_run_still_emits_json(
     state = tmp_path / "state"
     (state / "enmaas" / "runs").mkdir(parents=True)
     (state / "enmaas" / "runs" / "usage.jsonl").write_text(
-        json_mod.dumps({
-            "timestamp": datetime.now(UTC).isoformat(), "command": "ask",
-            "model": "m", "dialect": "openai", "input_tokens": 60_000,
-            "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
-            "elapsed": 1.0, "status": "ok", "schema_used": False,
-            "error_kind": None, "items_total": None, "items_ok": None,
-            "items_failed": None, "charge": 60_000,
-        }) + "\n",
+        json_mod.dumps(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "command": "ask",
+                "model": "m",
+                "dialect": "openai",
+                "input_tokens": 60_000,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "elapsed": 1.0,
+                "status": "ok",
+                "schema_used": False,
+                "error_kind": None,
+                "items_total": None,
+                "items_ok": None,
+                "items_failed": None,
+                "charge": 60_000,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("XDG_STATE_HOME", str(state))

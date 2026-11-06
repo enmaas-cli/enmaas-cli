@@ -574,7 +574,7 @@ def test_strict_reader_rejects_negative_counts(tmp_path: Path) -> None:
 
 
 def test_strict_reader_rejects_string_counts(tmp_path: Path) -> None:
-    """"100" passes the dataclass and breaks arithmetic downstream."""
+    """ "100" passes the dataclass and breaks arithmetic downstream."""
     ledger = tmp_path / "usage.jsonl"
     ledger.write_text(json.dumps(_ok_row(input_tokens="100")) + "\n", encoding="utf-8")
 
@@ -614,13 +614,26 @@ def test_strict_reader_agrees_with_the_forgiving_one_when_healthy(
     monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
     ledger = tmp_path / "usage.jsonl"
     for out in (10, 20):
-        append_event(ledger, UsageEvent(
-            timestamp=datetime.now(UTC), command="ask", model="m",
-            dialect="openai", input_tokens=100, cached_tokens=0,
-            output_tokens=out, reasoning_tokens=0, elapsed=1.0,
-            status="ok", schema_used=False, error_kind=None,
-            items_total=None, items_ok=None, items_failed=None,
-        ))
+        append_event(
+            ledger,
+            UsageEvent(
+                timestamp=datetime.now(UTC),
+                command="ask",
+                model="m",
+                dialect="openai",
+                input_tokens=100,
+                cached_tokens=0,
+                output_tokens=out,
+                reasoning_tokens=0,
+                elapsed=1.0,
+                status="ok",
+                schema_used=False,
+                error_kind=None,
+                items_total=None,
+                items_ok=None,
+                items_failed=None,
+            ),
+        )
     events, problems = load_events_strict(ledger)
     assert problems == []
     assert len(events) == len(load_events(ledger)) == 2
@@ -655,10 +668,21 @@ def test_append_event_reports_a_failure_at_close_not_just_at_write(
             raise OSError("disk full on close")
 
     event = UsageEvent(
-        timestamp=datetime.now(UTC), command="ask", model="m", dialect="openai",
-        input_tokens=1, cached_tokens=0, output_tokens=1, reasoning_tokens=0,
-        elapsed=1.0, status="ok", schema_used=False, error_kind=None,
-        items_total=None, items_ok=None, items_failed=None,
+        timestamp=datetime.now(UTC),
+        command="ask",
+        model="m",
+        dialect="openai",
+        input_tokens=1,
+        cached_tokens=0,
+        output_tokens=1,
+        reasoning_tokens=0,
+        elapsed=1.0,
+        status="ok",
+        schema_used=False,
+        error_kind=None,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
     )
     monkeypatch.setattr(Path, "open", lambda *a, **k: FailsOnClose())
 
@@ -673,10 +697,21 @@ def test_append_event_coerces_floats_so_its_own_reader_accepts_them(
     monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
     ledger = tmp_path / "usage.jsonl"
     event = UsageEvent(
-        timestamp=datetime.now(UTC), command="ask", model="m", dialect="openai",
-        input_tokens=10.0, cached_tokens=0, output_tokens=20.0,  # type: ignore[arg-type]
-        reasoning_tokens=0, elapsed=1.0, status="ok", schema_used=False,
-        error_kind=None, items_total=None, items_ok=None, items_failed=None,
+        timestamp=datetime.now(UTC),
+        command="ask",
+        model="m",
+        dialect="openai",
+        input_tokens=10.0,  # type: ignore[arg-type]
+        cached_tokens=0,
+        output_tokens=20.0,  # type: ignore[arg-type]
+        reasoning_tokens=0,
+        elapsed=1.0,
+        status="ok",
+        schema_used=False,
+        error_kind=None,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
         charge=30.0,  # type: ignore[arg-type]
     )
     assert append_event(ledger, event) is True
@@ -692,13 +727,11 @@ def test_a_ledger_mixing_old_and_new_rows_totals_correctly(tmp_path: Path) -> No
 
     now = datetime.now(UTC)
     ledger = tmp_path / "usage.jsonl"
-    old_row = _ok_row(input_tokens=10, cached_tokens=0, output_tokens=0,
-                      reasoning_tokens=3)
-    new_row = _ok_row(input_tokens=10, cached_tokens=0, output_tokens=0,
-                      reasoning_tokens=3, charge=100)
-    ledger.write_text(
-        json.dumps(old_row) + "\n" + json.dumps(new_row) + "\n", encoding="utf-8"
+    old_row = _ok_row(input_tokens=10, cached_tokens=0, output_tokens=0, reasoning_tokens=3)
+    new_row = _ok_row(
+        input_tokens=10, cached_tokens=0, output_tokens=0, reasoning_tokens=3, charge=100
     )
+    ledger.write_text(json.dumps(old_row) + "\n" + json.dumps(new_row) + "\n", encoding="utf-8")
 
     events, problems = load_events_strict(ledger)
     assert problems == []

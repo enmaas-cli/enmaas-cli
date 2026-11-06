@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,12 @@ import httpx
 
 from enmaas_cli.budget import TokenBudget
 from enmaas_cli.runner import MapOutcome, run_map
+
+# The two handler shapes httpx.MockTransport accepts.
+Handler = (
+    Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+)
 
 OK = {
     "choices": [{"finish_reason": "stop", "message": {"content": "done"}}],
@@ -51,9 +58,15 @@ def _template(tmp_path: Path) -> Path:
     return path
 
 
-async def _run(tmp_path: Path, handler, count: int = 5,  # type: ignore[no-untyped-def]
-               template_path_override: Path | None = None,
-               concurrency: int = 2, resume: bool = False, **kw) -> MapOutcome:
+async def _run(
+    tmp_path: Path,
+    handler: Handler,
+    count: int = 5,
+    template_path_override: Path | None = None,
+    concurrency: int = 2,
+    resume: bool = False,
+    **kw: Any,
+) -> MapOutcome:
     # concurrency and resume are explicit parameters rather than **kw
     # entries because run_map is called with both below, and passing them
     # through kw would raise "got multiple values".
@@ -241,18 +254,14 @@ def test_map_records_cached_and_reasoning_tokens() -> None:
 
     fields = MapOutcome.__dataclass_fields__
     assert "cached_tokens" in fields, "MapOutcome carries no cached token count"
-    assert "reasoning_tokens" in fields, (
-        "MapOutcome carries no reasoning token count"
-    )
+    assert "reasoning_tokens" in fields, "MapOutcome carries no reasoning token count"
 
 
 def _batch_template(tmp_path: Path) -> Path:
     from enmaas_cli.batching import PER_ITEM_MARKER
 
     path = tmp_path / "bt.txt"
-    path.write_text(
-        f"shared instructions\n{PER_ITEM_MARKER}\ndo {{x}}\n", encoding="utf-8"
-    )
+    path.write_text(f"shared instructions\n{PER_ITEM_MARKER}\ndo {{x}}\n", encoding="utf-8")
     return path
 
 
@@ -282,15 +291,16 @@ async def test_batching_makes_one_call_per_group_not_per_item(
         return httpx.Response(200, json=_answers(ids))
 
     outcome = await _run(
-        tmp_path, handler, count=4,
-        template_path_override=_batch_template(tmp_path), batch=2,
+        tmp_path,
+        handler,
+        count=4,
+        template_path_override=_batch_template(tmp_path),
+        batch=2,
     )
 
     assert len(calls) == 2, f"made {len(calls)} calls, expected 2"
     assert outcome.ok == 4
-    assert (tmp_path / "out" / "i0.md").read_text(encoding="utf-8").strip() == (
-        "answer for i0"
-    )
+    assert (tmp_path / "out" / "i0.md").read_text(encoding="utf-8").strip() == ("answer for i0")
 
 
 async def test_an_item_the_model_skipped_is_failed_not_lost(
@@ -301,6 +311,7 @@ async def test_an_item_the_model_skipped_is_failed_not_lost(
     Reporting ok for an item with no answer would leave a missing output
     file that nothing flags, and --resume would then skip it forever.
     """
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         prompt = body["messages"][-1]["content"]
@@ -308,8 +319,11 @@ async def test_an_item_the_model_skipped_is_failed_not_lost(
         return httpx.Response(200, json=_answers(ids[:1]))
 
     outcome = await _run(
-        tmp_path, handler, count=4,
-        template_path_override=_batch_template(tmp_path), batch=4,
+        tmp_path,
+        handler,
+        count=4,
+        template_path_override=_batch_template(tmp_path),
+        batch=4,
     )
 
     assert outcome.ok == 1
@@ -348,6 +362,7 @@ async def test_a_batched_request_writes_one_charge_row_for_the_group(
 ) -> None:
     """Per-item batch rows carry "tokens": None, so the charge row is the
     only record of what a group cost."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         prompt = body["messages"][-1]["content"]
@@ -355,8 +370,11 @@ async def test_a_batched_request_writes_one_charge_row_for_the_group(
         return httpx.Response(200, json=_answers(ids))
 
     await _run(
-        tmp_path, handler, count=10,
-        template_path_override=_batch_template(tmp_path), batch=5,
+        tmp_path,
+        handler,
+        count=10,
+        template_path_override=_batch_template(tmp_path),
+        batch=5,
     )
     # Two groups, each 40 prompt + 10 completion, none cached.
     assert _charges(tmp_path / "out") == [50, 50]
@@ -393,8 +411,13 @@ async def test_map_stops_once_the_token_budget_is_spent(tmp_path: Path) -> None:
     reaches 1200 and trips it. Items 4-10 never run.
     """
     body = _usage_response(prompt=200, completion=200)
-    outcome = await _run(tmp_path, lambda r: httpx.Response(200, json=body),
-                         count=10, concurrency=1, token_budget=1000)
+    outcome = await _run(
+        tmp_path,
+        lambda r: httpx.Response(200, json=body),
+        count=10,
+        concurrency=1,
+        token_budget=1000,
+    )
     assert outcome.abort_reason == "budget"
     assert outcome.exit_code == 3
     assert outcome.attempted == 3
@@ -403,8 +426,9 @@ async def test_map_stops_once_the_token_budget_is_spent(tmp_path: Path) -> None:
 async def test_map_without_a_budget_runs_every_item(tmp_path: Path) -> None:
     """The flag is opt-in. Absent it, nothing changes."""
     body = _usage_response(prompt=200, completion=200)
-    outcome = await _run(tmp_path, lambda r: httpx.Response(200, json=body),
-                         count=10, concurrency=1)
+    outcome = await _run(
+        tmp_path, lambda r: httpx.Response(200, json=body), count=10, concurrency=1
+    )
     assert outcome.abort_reason is None
     assert outcome.attempted == 10
 
@@ -416,8 +440,13 @@ async def test_cached_tokens_do_not_consume_the_budget(tmp_path: Path) -> None:
     items cost 2000, under a 3000 ceiling, though raw prompt is 10,000.
     """
     body = _usage_response(prompt=1000, cached=900, completion=100)
-    outcome = await _run(tmp_path, lambda r: httpx.Response(200, json=body),
-                         count=10, concurrency=1, token_budget=3000)
+    outcome = await _run(
+        tmp_path,
+        lambda r: httpx.Response(200, json=body),
+        count=10,
+        concurrency=1,
+        token_budget=3000,
+    )
     assert outcome.abort_reason is None
     assert outcome.attempted == 10
     # The assertion that bites: 2000, not the 10,100 raw prompt tokens
@@ -437,10 +466,17 @@ async def test_the_breaker_wins_when_both_conditions_trip(tmp_path: Path) -> Non
     Remove either `abort_reason is None` guard and this reports "budget",
     hiding the more actionable failure.
     """
-    body = {"choices": [{"finish_reason": "length", "message": {"content": ""}}],
-            "usage": {"prompt_tokens": 500, "completion_tokens": 500}}
-    outcome = await _run(tmp_path, lambda r: httpx.Response(200, json=body),
-                         count=20, concurrency=1, token_budget=6000)
+    body = {
+        "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+        "usage": {"prompt_tokens": 500, "completion_tokens": 500},
+    }
+    outcome = await _run(
+        tmp_path,
+        lambda r: httpx.Response(200, json=body),
+        count=20,
+        concurrency=1,
+        token_budget=6000,
+    )
     assert outcome.attempted == 6
     assert outcome.spent == 6000
     assert outcome.abort_reason == "breaker"
@@ -487,8 +523,7 @@ async def test_resuming_a_budget_stopped_run_retrips_immediately(tmp_path: Path)
     first = await _run(tmp_path, handler, count=10, concurrency=1, token_budget=1000)
     assert first.abort_reason == "budget"
 
-    second = await _run(tmp_path, handler, count=10, concurrency=1,
-                        token_budget=1000, resume=True)
+    second = await _run(tmp_path, handler, count=10, concurrency=1, token_budget=1000, resume=True)
     assert second.abort_reason == "budget"
     assert second.attempted == 0
 
@@ -501,8 +536,7 @@ async def test_raising_the_ceiling_lets_a_resumed_run_continue(tmp_path: Path) -
         return httpx.Response(200, json=body)
 
     await _run(tmp_path, handler, count=10, concurrency=1, token_budget=1000)
-    second = await _run(tmp_path, handler, count=10, concurrency=1,
-                        token_budget=10000, resume=True)
+    second = await _run(tmp_path, handler, count=10, concurrency=1, token_budget=10000, resume=True)
     assert second.abort_reason is None
     assert second.ok + second.skipped == 10
 
@@ -513,6 +547,7 @@ async def test_a_resumed_batch_run_does_not_get_a_fresh_budget(tmp_path: Path) -
     Batch item rows carry "tokens": None, so seeding from them would read
     zero and hand out a full budget on every resume.
     """
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         prompt = body["messages"][-1]["content"]
@@ -520,13 +555,27 @@ async def test_a_resumed_batch_run_does_not_get_a_fresh_budget(tmp_path: Path) -
         return httpx.Response(200, json=_answers(ids))
 
     template = _batch_template(tmp_path)
-    first = await _run(tmp_path, handler, count=20, concurrency=1,
-                       template_path_override=template, batch=5, token_budget=60)
+    first = await _run(
+        tmp_path,
+        handler,
+        count=20,
+        concurrency=1,
+        template_path_override=template,
+        batch=5,
+        token_budget=60,
+    )
     assert first.abort_reason == "budget"
 
-    second = await _run(tmp_path, handler, count=20, concurrency=1,
-                        template_path_override=template, batch=5,
-                        token_budget=60, resume=True)
+    second = await _run(
+        tmp_path,
+        handler,
+        count=20,
+        concurrency=1,
+        template_path_override=template,
+        batch=5,
+        token_budget=60,
+        resume=True,
+    )
     assert second.abort_reason == "budget"
     assert second.attempted == 0
 
@@ -539,8 +588,7 @@ async def test_outcome_spent_is_the_job_total_not_the_invocation(tmp_path: Path)
         return httpx.Response(200, json=body)
 
     await _run(tmp_path, handler, count=10, concurrency=1, token_budget=1000)
-    second = await _run(tmp_path, handler, count=10, concurrency=1,
-                        token_budget=1000, resume=True)
+    second = await _run(tmp_path, handler, count=10, concurrency=1, token_budget=1000, resume=True)
     assert second.attempted == 0
     assert second.spent == 1200
 
@@ -576,8 +624,9 @@ async def test_an_exhausted_rolling_budget_sends_nothing(tmp_path: Path) -> None
         calls += 1
         return httpx.Response(200, json=_usage_response(prompt=200, completion=200))
 
-    outcome = await _run(tmp_path, handler, count=10, concurrency=1,
-                         rolling_budget=TokenBudget(1000, spent=1000))
+    outcome = await _run(
+        tmp_path, handler, count=10, concurrency=1, rolling_budget=TokenBudget(1000, spent=1000)
+    )
     assert outcome.abort_reason == "budget"
     assert outcome.attempted == 0
     assert calls == 0
@@ -593,9 +642,13 @@ async def test_rolling_ceiling_stops_a_run_that_crosses_it_midway(
     run all ten items and only be caught next invocation.
     """
     body = _usage_response(prompt=200, completion=200)
-    outcome = await _run(tmp_path, lambda r: httpx.Response(200, json=body),
-                         count=10, concurrency=1,
-                         rolling_budget=TokenBudget(10_000, spent=9_000))
+    outcome = await _run(
+        tmp_path,
+        lambda r: httpx.Response(200, json=body),
+        count=10,
+        concurrency=1,
+        rolling_budget=TokenBudget(10_000, spent=9_000),
+    )
     assert outcome.abort_reason == "budget"
     assert outcome.tripped_budget == "rolling"
     assert outcome.attempted == 3
@@ -606,9 +659,14 @@ async def test_the_per_run_ceiling_is_named_when_it_is_the_one_that_trips(
 ) -> None:
     """Both active, per-run tighter. The remedy differs, so the name must."""
     body = _usage_response(prompt=200, completion=200)
-    outcome = await _run(tmp_path, lambda r: httpx.Response(200, json=body),
-                         count=10, concurrency=1, token_budget=1000,
-                         rolling_budget=TokenBudget(10_000_000))
+    outcome = await _run(
+        tmp_path,
+        lambda r: httpx.Response(200, json=body),
+        count=10,
+        concurrency=1,
+        token_budget=1000,
+        rolling_budget=TokenBudget(10_000_000),
+    )
     assert outcome.tripped_budget == "per_run"
 
 
@@ -637,13 +695,14 @@ async def test_outcome_charged_equals_the_charge_rows_the_run_wrote(
         if calls == 2:
             # Consumed tokens, returned no text. Charged, not counted by
             # the input/output counters.
-            return httpx.Response(200, json={
-                "choices": [{"finish_reason": "length", "message": {"content": ""}}],
-                "usage": {"prompt_tokens": 300, "completion_tokens": 50},
-            })
-        return httpx.Response(
-            200, json=_usage_response(prompt=1000, cached=900, completion=100)
-        )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+                    "usage": {"prompt_tokens": 300, "completion_tokens": 50},
+                },
+            )
+        return httpx.Response(200, json=_usage_response(prompt=1000, cached=900, completion=100))
 
     outcome = await _run(tmp_path, handler, count=4, concurrency=1)
 
@@ -654,9 +713,12 @@ async def test_outcome_charged_equals_the_charge_rows_the_run_wrote(
     assert outcome.charged == 950
     # And it is genuinely not the same as the counters, which miss the
     # failure and clamp after aggregating.
-    assert outcome.charged != max(
-        0, outcome.input_tokens - outcome.cached_tokens
-    ) + outcome.output_tokens
+    assert (
+        outcome.charged
+        != max(0, outcome.input_tokens - outcome.cached_tokens) + outcome.output_tokens
+    )
+
+
 def _raw_body(content_escape: str, *, prompt: int = 5, completion: int = 1) -> bytes:
     """A response exactly as a gateway would put it on the wire.
 
@@ -689,6 +751,7 @@ async def test_one_unencodable_character_does_not_kill_the_run(
     none of the handlers and escaped through asyncio.gather. Five good
     items were lost to one bad character in the third.
     """
+
     def handler(request: httpx.Request) -> httpx.Response:
         # Keyed off the prompt, not a call counter, so the poisoned item
         # is the same one whatever order concurrency delivers them in.
@@ -708,13 +771,12 @@ async def test_a_batched_run_survives_an_unencodable_character(
     tmp_path: Path,
 ) -> None:
     """The batched path writes per item and had the same hole."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         prompt = body["messages"][-1]["content"]
         ids = [f"i{n}" for n in range(6) if f"=== ITEM i{n} ===" in prompt]
-        answers = "".join(
-            f"=== ANSWER {i} ===\\nbad \\ud800 here\\n" for i in ids
-        )
+        answers = "".join(f"=== ANSWER {i} ===\\nbad \\ud800 here\\n" for i in ids)
         return _json_response(
             (
                 '{"choices":[{"finish_reason":"stop","message":{"content":"'
@@ -724,8 +786,11 @@ async def test_a_batched_run_survives_an_unencodable_character(
         )
 
     outcome = await _run(
-        tmp_path, handler, count=6,
-        template_path_override=_batch_template(tmp_path), batch=3,
+        tmp_path,
+        handler,
+        count=6,
+        template_path_override=_batch_template(tmp_path),
+        batch=3,
     )
 
     assert outcome.ok == 6
@@ -734,6 +799,7 @@ async def test_a_batched_run_survives_an_unencodable_character(
 
 async def test_a_repaired_item_is_marked_in_the_index(tmp_path: Path) -> None:
     """A bulk run prints no per-item receipt, so the row is the only trace."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         prompt = json.loads(request.content)["messages"][-1]["content"]
         bad = prompt.strip() == "do 1"
@@ -745,9 +811,7 @@ async def test_a_repaired_item_is_marked_in_the_index(tmp_path: Path) -> None:
     # no id, so filter to the item rows before keying on it.
     parsed = [
         json.loads(line)
-        for line in (tmp_path / "out" / "results.jsonl").read_text(
-            encoding="utf-8"
-        ).splitlines()
+        for line in (tmp_path / "out" / "results.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     rows = {r["id"]: r for r in parsed if r.get("type") != "request"}
@@ -758,6 +822,7 @@ async def test_a_repaired_item_is_marked_in_the_index(tmp_path: Path) -> None:
 async def test_a_repaired_batch_item_is_marked_in_the_index(tmp_path: Path) -> None:
     """A batched reply is repaired before it is split, so the count is
     recorded per request rather than per item, and must still appear."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         prompt = body["messages"][-1]["content"]
@@ -772,15 +837,16 @@ async def test_a_repaired_batch_item_is_marked_in_the_index(tmp_path: Path) -> N
         )
 
     await _run(
-        tmp_path, handler, count=3,
-        template_path_override=_batch_template(tmp_path), batch=3,
+        tmp_path,
+        handler,
+        count=3,
+        template_path_override=_batch_template(tmp_path),
+        batch=3,
     )
 
     rows = [
         json.loads(line)
-        for line in (tmp_path / "out" / "results.jsonl").read_text(
-            encoding="utf-8"
-        ).splitlines()
+        for line in (tmp_path / "out" / "results.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     # Charge rows share this file and carry no status, so filter first.
@@ -819,6 +885,7 @@ async def test_a_repaired_item_is_retried_on_resume(tmp_path: Path) -> None:
 
 async def test_clean_items_are_still_skipped_on_resume(tmp_path: Path) -> None:
     """The repair exception must not disturb ordinary resume behaviour."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(_raw_body("fine"))
 

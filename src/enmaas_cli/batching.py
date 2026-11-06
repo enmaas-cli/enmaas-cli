@@ -37,9 +37,7 @@ def split_template(template: str) -> tuple[str, str]:
     return preamble.rstrip() + "\n", per_item.lstrip("\n")
 
 
-def build_batch_prompt(
-    preamble: str, per_item: str, items: list[dict[str, Any]]
-) -> str:
+def build_batch_prompt(preamble: str, per_item: str, items: list[dict[str, Any]]) -> str:
     """One prompt covering every item, with the preamble sent once."""
     parts = [preamble, ""]
     parts.append(

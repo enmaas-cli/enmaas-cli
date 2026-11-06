@@ -144,9 +144,7 @@ def rolling_spend(
     """
     moment = now or datetime.now(UTC)
     cutoff = moment - timedelta(days=window_days)
-    return sum(
-        event_charge(event) for event in events if event.timestamp >= cutoff
-    )
+    return sum(event_charge(event) for event in events if event.timestamp >= cutoff)
 
 
 def event_charge(event: UsageEvent) -> int:

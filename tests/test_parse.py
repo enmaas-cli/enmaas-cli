@@ -125,6 +125,8 @@ def test_empty_response_error_carries_the_usage_it_cost() -> None:
         parse_response(data, "openai")
     assert exc.value.usage.input_tokens == 500
     assert exc.value.usage.output_tokens == 32768
+
+
 # A lone surrogate is the one thing UTF-8 cannot encode, and a model can
 # emit one: `\ud800` is a plain ASCII escape in the JSON body, so it
 # survives transport and json.loads intact. Every downstream write
@@ -158,10 +160,12 @@ def test_anthropic_text_is_always_utf8_encodable() -> None:
 def test_reasoning_is_sanitised_too() -> None:
     """thinking.md is written with the same encoding as the response."""
     data = {
-        "choices": [{
-            "finish_reason": "stop",
-            "message": {"content": "fine", "reasoning_content": "hmm \ud800"},
-        }],
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": "fine", "reasoning_content": "hmm \ud800"},
+            }
+        ],
         "usage": {"prompt_tokens": 5, "completion_tokens": 1},
     }
     completion = parse_response(data, "openai")
@@ -171,7 +175,7 @@ def test_reasoning_is_sanitised_too() -> None:
 
 def test_clean_text_is_left_exactly_alone() -> None:
     """Sanitising must not touch astral planes, emoji, or combining marks."""
-    tricky = "héllo 👩‍👩‍👧‍👦 \U0010FFFF ﷽ é"
+    tricky = "héllo 👩‍👩‍👧‍👦 \U0010ffff ﷽ é"
     data = {
         "choices": [{"finish_reason": "stop", "message": {"content": tricky}}],
         "usage": {"prompt_tokens": 5, "completion_tokens": 1},
@@ -183,10 +187,12 @@ def test_clean_text_is_left_exactly_alone() -> None:
 
 def test_several_bad_characters_are_all_counted() -> None:
     data = {
-        "choices": [{
-            "finish_reason": "stop",
-            "message": {"content": "\ud800 a \udbff b \udfff"},
-        }],
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": "\ud800 a \udbff b \udfff"},
+            }
+        ],
         "usage": {"prompt_tokens": 5, "completion_tokens": 1},
     }
     completion = parse_response(data, "openai")
