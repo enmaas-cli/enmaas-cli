@@ -13,9 +13,14 @@ from enmaas_cli.client import call
 from enmaas_cli.dialect import Dialect, build_request, parse_response
 from enmaas_cli.runner import run_map
 
-pytestmark = pytest.mark.live
+BASE = os.environ.get("ENMAAS_BASE_URL", "").rstrip("/")
 
-BASE = "https://api.enmaas.devshift.net"
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not BASE, reason="ENMAAS_BASE_URL is not set; live tests need the gateway URL"
+    ),
+]
 GLM = "rits/zai-org/glm-5-3"
 DS = "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"
 
@@ -247,7 +252,7 @@ async def test_default_batch_on_the_default_model_finishes_in_time(
     async with httpx.AsyncClient() as client:
         outcome = await run_map(
             client=client,
-            base_url="https://api.enmaas.devshift.net",
+            base_url=BASE,
             key=key,
             model="rits/zai-org/glm-5-3",
             items_path=items,

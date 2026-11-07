@@ -1,4 +1,9 @@
-"""Optional TOML configuration. The tool is fully usable without it."""
+"""TOML configuration.
+
+Every key is optional except the gateway URL, and that one can come from
+$ENMAAS_BASE_URL instead. Commands that never call the gateway need no
+configuration at all.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,6 @@ from pathlib import Path
 
 from enmaas_cli.pricing import ModelPrice
 
-BASE_URL = "https://api.enmaas.devshift.net"
 DEFAULT_MODEL = "rits/zai-org/glm-5-3"
 
 
@@ -24,7 +28,12 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    base_url: str = BASE_URL
+    # No default: the gateway address belongs to whoever runs the gateway,
+    # so it comes from this file or from $ENMAAS_BASE_URL.
+    base_url: str | None = None
+    # A key file named here is read after $ENMAAS_KEY and before
+    # ~/.secrets/enmaas.
+    key_file: str | None = None
     default_model: str = DEFAULT_MODEL
     concurrency: int = 4
     # Below the measured ~300s gateway ceiling so our deadline fires first.
@@ -44,7 +53,13 @@ class Config:
 
 DEFAULTS = Config()
 
-_SCALARS = {"base_url": str, "default_model": str, "concurrency": int, "timeout": int}
+_SCALARS = {
+    "base_url": str,
+    "key_file": str,
+    "default_model": str,
+    "concurrency": int,
+    "timeout": int,
+}
 
 
 def default_config_path() -> Path:

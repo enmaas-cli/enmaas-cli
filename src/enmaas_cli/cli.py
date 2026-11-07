@@ -10,10 +10,12 @@ import json
 import os
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn, cast
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -45,6 +47,8 @@ from .usage import (
     load_events_strict,
     summarize_usage,
 )
+
+BASE_URL_ENV = "ENMAAS_BASE_URL"
 
 
 class ExitCode(enum.IntEnum):
@@ -288,6 +292,9 @@ class AskResult:
     completion: Any | None  # Completion object or None on error
     elapsed: float
     error: str | None
+    # Kept apart from completion: an empty answer has no completion, yet
+    # its tokens were billed and must count against the budget.
+    usage: Usage | None = None
 
 
 async def run_ask(
@@ -357,6 +364,7 @@ async def run_ask(
             completion=None,
             elapsed=elapsed,
             error=error_msg,
+            usage=exc.usage if isinstance(exc, EmptyResponseError) else None,
         )
 
     if schema is not None:
@@ -391,6 +399,7 @@ async def run_ask(
                 completion=completion,
                 elapsed=elapsed,
                 error=error_msg,
+                usage=completion.usage,
             )
 
     elapsed = time.monotonic() - started
@@ -415,6 +424,7 @@ async def run_ask(
         completion=completion,
         elapsed=elapsed,
         error=None,
+        usage=completion.usage,
     )
 
 
@@ -532,6 +542,73 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
     return RollingCheck(spent, config.budget_tokens, message=None)
 
 
+def resolve_base_url(configured: str | None, env: Mapping[str, str], config_path: Path) -> str:
+    """Pick the gateway URL: $ENMAAS_BASE_URL first, then base_url in the config.
+
+    There is no built-in default. Each organization runs its own gateway,
+    so a guessed address would send the key somewhere it was never meant
+    to go. Raises ValueError with the message to show.
+
+    The URL is the gateway root. The CLI appends /v1/... to it, so a path
+    the user typed, such as /v1, is kept as typed. The scheme is lowered,
+    the host keeps its case, and trailing slashes are removed.
+    """
+    url = env.get(BASE_URL_ENV, "").strip() or (configured or "").strip()
+    if not url:
+        raise ValueError(
+            f"no gateway URL configured: set base_url in {config_path}, "
+            f"set ${BASE_URL_ENV}, or run ./install.sh --gateway URL"
+        )
+    return _validate_gateway_url(url)
+
+
+def _validate_gateway_url(url: str) -> str:
+    def invalid(reason: str) -> ValueError:
+        return ValueError(f"gateway URL is not valid ({reason}): {url}")
+
+    if any(ch.isspace() for ch in url):
+        raise invalid("whitespace inside the URL")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        # urlsplit only raises here for a malformed bracketed IPv6 host.
+        raise invalid("missing host") from None
+    if parts.scheme.lower() not in {"http", "https"}:
+        raise invalid("scheme must be http or https")
+    # Checked on the raw text: "https://h?" has an empty query, yet the
+    # appended request path would still land after the "?".
+    if "?" in url or "#" in url:
+        raise invalid("query and fragment are not allowed")
+    # The key travels in a header. Credentials in the URL would be a
+    # second secret that ends up in logs and error messages.
+    if "@" in parts.netloc:
+        raise invalid("credentials in the URL are not allowed")
+    # Without a host, "https://" plus "/v1/models" would send the key to a
+    # host named "v1".
+    if not parts.hostname:
+        raise invalid("missing host")
+    try:
+        _ = parts.port
+    except ValueError:
+        # httpx would raise InvalidURL later, outside any handler.
+        raise invalid("invalid port") from None
+    # Request paths start with a slash, so a trailing one here would double it.
+    return f"{parts.scheme.lower()}://{parts.netloc}{parts.path.rstrip('/')}"
+
+
+def _setup_error(args: argparse.Namespace, message: str) -> int:
+    """Report a URL or key failure before any request is made.
+
+    A --json caller reads stdout only, so an error there must be JSON too.
+    An empty stdout would leave it guessing why the run stopped.
+    """
+    if getattr(args, "json", False):
+        print(json.dumps({"status": "error", "error": message}, indent=2))
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    return int(ExitCode.ERROR)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command in {"inspect", "allow-read"}:
@@ -544,8 +621,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return int(ExitCode.ERROR)
         return int(ExitCode.OK)
+    config_path = args.config or default_config_path()
     try:
-        config = load_config(args.config or default_config_path())
+        config = load_config(config_path)
     except ConfigError as exc:
         # A malformed [budget] table is the only fatal config error.
         # Proceeding would run uncapped, which is what it was written to
@@ -555,26 +633,37 @@ def main(argv: list[str] | None = None) -> int:
     for warning in config.warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
-    needs_key = args.command in {"models", "ask", "map"}
+    needs_gateway = args.command in {"models", "ask", "map"}
+    base_url = ""
     key_value = ""
-    if needs_key:
+    if needs_gateway:
         try:
-            key = resolve_key(key_file=args.key_file, env=dict(os.environ), home=Path.home())
+            base_url = resolve_base_url(config.base_url, os.environ, config_path)
+        except ValueError as exc:
+            return _setup_error(args, str(exc))
+        try:
+            key = resolve_key(
+                key_file=args.key_file,
+                env=dict(os.environ),
+                home=Path.home(),
+                # Passed unexpanded: a bad "~user" path must not fail a run
+                # where --key-file or $ENMAAS_KEY wins.
+                config_key_file=config.key_file or None,
+            )
         except AuthError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return int(ExitCode.ERROR)
+            return _setup_error(args, str(exc))
         if key.warning:
             print(f"warning: {key.warning}", file=sys.stderr)
         key_value = key.value
 
     try:
-        return asyncio.run(_dispatch(args, config, key_value))
+        return asyncio.run(_dispatch(args, config, base_url, key_value))
     except (DialectError, ValidationError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return int(ExitCode.ERROR)
 
 
-async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
+async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key: str) -> int:
     if args.command == "record":
         # A ledger that only sees this CLI's own calls understates reality:
         # a tool talking to the gateway directly is invisible by
@@ -672,7 +761,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             try:
                 rows = await run_models(
                     client=client,
-                    base_url=config.base_url,
+                    base_url=base_url,
                     key=key,
                     dialect=args.dialect or "both",
                     timeout=timeout,
@@ -694,7 +783,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             prompt = assemble_prompt(prompt=_read_prompt(args), files=args.file)
             result = await run_ask(
                 client=client,
-                base_url=config.base_url,
+                base_url=base_url,
                 key=key,
                 model=model,
                 prompt=prompt,
@@ -713,7 +802,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
             )
 
             # Log usage
-            usage_obj = result.completion.usage if result.completion else None
+            usage_obj = result.usage
             error_kind = None
             if result.error:
                 # Extract error kind from error message
@@ -750,7 +839,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
 
             if args.json:
                 # Machine-readable output
-                usage = result.completion.usage if result.completion else None
+                usage = result.usage
                 ask_obj = {
                     "status": "ok" if result.exit_code == ExitCode.OK else "error",
                     "model": result.model,
@@ -784,7 +873,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, key: str) -> int:
 
         outcome = await run_map(
             client=client,
-            base_url=config.base_url,
+            base_url=base_url,
             key=key,
             model=model,
             items_path=args.items,
