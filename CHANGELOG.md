@@ -5,7 +5,23 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- The output guard answers inside a three second budget and denies a search it
+  cannot finish checking, so a slow check can no longer time out into an allow.
+  `install.sh` registers the Claude Code hook with `onFailure: "block"`.
+- The guard checks the file commands inside `sed` (`r`, `R`, `w`, `W`) and `awk`
+  (`getline <`) programs.
+- `http://` gateway URLs are accepted only for localhost; everything else must be
+  `https://`. The installer applies the same rule.
+- Answers are never written through a symbolic link; an output path that already
+  exists as a link fails that item.
+- Run-directory cleanup removes only run-named directories and skips a symlinked
+  runs directory.
+- Schema-file and gateway-usage diagnostics are bounded; usage counts that are
+  not non-negative integers are recorded as unknown.
+- The key file must be a regular file of at most 4 KiB. `Retry-After` is capped at
+  60 seconds. Error bodies are redacted before they are truncated.
 
 ## [0.6.0] - 2026-11-07
 

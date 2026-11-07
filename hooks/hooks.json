@@ -6,7 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -S \"${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use.py\""
+            "command": "python3 -S \"${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use.py\"",
+            "timeout": 5,
+            "onFailure": "block"
           }
         ]
       }

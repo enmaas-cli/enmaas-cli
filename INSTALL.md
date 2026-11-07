@@ -44,7 +44,7 @@ It does five things and prints each one:
 1. Installs the `enmaas` command with `uv tool install` (or `pipx`).
 2. Writes the gateway URL as `base_url` in `~/.config/enmaas/config.toml`, keeping anything else already in that file.
 3. Copies the agent skill into `~/.claude/skills/enmaas/` and `~/.codex/skills/enmaas/`, for each host directory that exists. The skill is what teaches the assistant when to delegate and how to handle the results.
-4. Installs the output guard, a small `PreToolUse` hook, and registers it in `~/.claude/settings.json` and `~/.codex/config.toml`. The guard stops an assistant from reading a full answer file into its context. Step 6 shows what that looks like.
+4. Installs the output guard, a small `PreToolUse` hook, and registers it in `~/.claude/settings.json` and `~/.codex/config.toml`. The guard denies the ordinary file reads an assistant makes on a full answer file, so the answer stays out of its context unless you allow it. It protects against accidental reads; it is not a sandbox. Step 6 shows what that looks like.
 5. Checks the key file. If it is missing, the installer still finishes and tells you how to create it. It does not test the key itself; step 4 does.
 
 Options:

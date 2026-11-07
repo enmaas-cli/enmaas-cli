@@ -30,7 +30,9 @@ enmaas ask ok
   preview   Paris
 ```
 
-The full response is written to the file shown in the `output` line. The receipt includes a preview of at most 160 characters. Run directories under `$XDG_STATE_HOME/enmaas/runs/` (default `~/.local/state/enmaas/runs/`) are removed once they are 30 days old, at the start of the next `ask`. Pass `-o PATH` for an answer that must persist.
+The full response is written to the file shown in the `output` line. The receipt includes a preview of at most 160 characters. Run directories under `$XDG_STATE_HOME/enmaas/runs/` (default `~/.local/state/enmaas/runs/`) are removed once they are 30 days old, at the start of the next `ask`. Only directories with a run name (timestamp plus four hex characters) are removed, and nothing is removed when the runs directory is a symbolic link. Pass `-o PATH` for an answer that must persist.
+
+An answer is never written through a symbolic link. If the output path already exists as a link, `ask` fails and `map` marks that item failed with `refusing to write through a symbolic link`.
 
 On an ordinary request failure the receipt goes to stderr and the exit code is 1, so a shell script can branch on it. With `--json` the error object goes to stdout. A refusal under a rolling `[budget]` exits 3.
 
@@ -93,7 +95,7 @@ coverage and troubleshooting.
 
 These go before the subcommand: `enmaas --key-file PATH models`.
 
-- `--key-file PATH`: Read the gateway key from this file. Without it the CLI tries `$ENMAAS_KEY`, then the `key_file` set in the config file, then `~/.secrets/enmaas`.
+- `--key-file PATH`: Read the gateway key from this file. Without it the CLI tries `$ENMAAS_KEY`, then the `key_file` set in the config file, then `~/.secrets/enmaas`. The key file must be a regular file of at most 4 KiB.
 - `--config PATH`: Use this config file instead of `~/.config/enmaas/config.toml`.
 - `--version`: Print `enmaas <version>` and exit 0.
 
@@ -248,7 +250,7 @@ timeout = 280
 "rits/zai-org/glm-5-3" = "anthropic"
 ```
 
-`base_url` has no default: it must be set here or in `ENMAAS_BASE_URL`, which wins when both are set. `models`, `ask` and `map` exit 1 with a message naming the fix when neither is set; the local commands do not need it. `key_file` may name the key file when it is somewhere other than `~/.secrets/enmaas`. The other fields shown are the defaults except `dialect_overrides`.
+`base_url` has no default: it must be set here or in `ENMAAS_BASE_URL`, which wins when both are set. It must use `https://`; `http://` is accepted only for `localhost`, `127.0.0.0/8` and `::1`. `models`, `ask` and `map` exit 1 with a message naming the fix when neither is set; the local commands do not need it. `key_file` may name the key file when it is somewhere other than `~/.secrets/enmaas`. The other fields shown are the defaults except `dialect_overrides`.
 
 The `dialect_overrides` table maps model names to dialect strings (`"anthropic"` or `"openai"`). An explicit `--dialect` flag on the command line takes precedence. Invalid dialect values are ignored with a warning.
 
@@ -371,7 +373,12 @@ that failed.
 `ask` and `map` mark every answer file they are about to write, before the model
 request, by writing a record under a hidden `.enmaas-output` directory next to
 it. The guard installed by `install.sh` reads those records and denies an
-assistant's attempts to read the file. `enmaas inspect PATH` is the sanctioned
+assistant's ordinary attempts to read the file: the hosts' file tools and the
+common shell readers. It answers inside a time budget of three seconds and denies
+a search it cannot finish checking in that time, so a slow check never turns into
+a silent allow. On Claude Code it is registered with `onFailure: "block"`, so a
+hook that fails or is killed blocks the call. The guard is for accidental reads;
+an assistant that writes its own program to open the file is outside its scope. `enmaas inspect PATH` is the sanctioned
 preview and `enmaas allow-read PATH`, run by a person, is the sanctioned
 exception. Full coverage rules, resume behaviour and troubleshooting are in
 [output protection](../skills/enmaas/references/output-protection.md).
