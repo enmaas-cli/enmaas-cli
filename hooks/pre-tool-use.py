@@ -25,7 +25,7 @@ def main() -> None:
     except Exception as exc:
         reason = (
             "enmaas containment: hook could not check tool input "
-            f"({type(exc).__name__}). Check the plugin installation and event format."
+            f"({type(exc).__name__}). Run install.sh again and check the event format."
         )
     if reason is not None:
         json.dump(
