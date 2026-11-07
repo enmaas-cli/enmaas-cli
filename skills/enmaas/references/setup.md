@@ -20,8 +20,12 @@ Everything installs from a clone of `https://github.com/enmaas-cli/enmaas-cli`:
 ```bash
 git clone https://github.com/enmaas-cli/enmaas-cli.git
 cd enmaas-cli
-./install.sh
+./install.sh --gateway URL
 ```
+
+Ask the user for the gateway URL before running it. The installer writes the
+URL to the config file and cannot finish without one when it has no terminal to
+ask on.
 
 To update an existing install, `git pull` in that clone and run `./install.sh`
 again. A complete run leaves the command, the skill copy and the guard copy at
@@ -33,8 +37,8 @@ After it finishes, check `enmaas --version`, `enmaas --help` and
 
 ## Connect the user's key
 
-Credential lookup order is `--key-file`, then `ENMAAS_KEY`, then
-`~/.secrets/enmaas`. Preserve an existing working credential source.
+Credential lookup order is `--key-file`, then `ENMAAS_KEY`, then a `key_file`
+set in the config file, then `~/.secrets/enmaas`. Preserve an existing working credential source.
 
 For a new key file, create its parent directory and an empty file accessible
 only to the user. Use directory mode 700 and file mode 600. Do not truncate an

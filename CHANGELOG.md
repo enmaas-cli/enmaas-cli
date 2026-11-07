@@ -3,6 +3,19 @@
 All notable changes to enmaas. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- The gateway URL is a required setting. Set `base_url` in the config file or
+  `ENMAAS_BASE_URL`; `install.sh --gateway URL` writes it for you and asks once if
+  it is missing. Commands that call the gateway exit 1 with a message naming the
+  fix when no URL is configured.
+- `install.sh --key-file PATH` names the key file. A path other than the default is
+  recorded as `key_file` in the config and the CLI reads it after `ENMAAS_KEY`.
+- Live tests read the gateway from `ENMAAS_BASE_URL` and skip with a reason when it
+  is unset.
+
 ## [0.5.0] - 2026-11-07
 
 First release from this repository. Earlier versions shipped inside an internal
@@ -14,7 +27,8 @@ plugin marketplace.
   installs the output guard and registers it as a `PreToolUse` hook in both hosts.
   `--uninstall` reverses all of it. `--dry-run`, `--no-hook`, `--cli-only` and
   `--skill-only` narrow it. Host files are validated before any edit, edits keep
-  everything they did not write, and a second run changes nothing.
+  everything they did not write, and a second run reinstalls the selected parts
+  without duplicating a registration or touching other settings.
 - `enmaas --version`.
 - `scripts/test-install.sh` (`make check-install`) proves the installer in a
   throwaway home, including idempotency, dry run and uninstall.
@@ -55,7 +69,8 @@ plugin marketplace.
   to 2,000 characters; `enmaas allow-read PATH`, run by a person, grants a full read.
 - Token budgets: `--token-budget N` stops a `map` run once it has spent N metered
   tokens, and a `[budget]` table in the config enforces a rolling ceiling across
-  `ask` and `map`. Every request records its charge in `results.jsonl`.
+  `ask` and `map`. Every `map` request records its charge in `results.jsonl`, and
+  every `ask` records its charge in the usage ledger.
 - Unencodable characters in a model response are replaced and reported instead of
   crashing the run.
 
@@ -86,6 +101,7 @@ plugin marketplace.
 - A usage ledger with `enmaas usage`.
 - A skill that tells Claude Code and Codex when to delegate.
 
+[Unreleased]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/enmaas-cli/enmaas-cli/releases/tag/v0.5.0
 [0.4.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.2.0...v0.3.0
