@@ -1,312 +1,133 @@
-# enmaas-cli
+<p align="center">
+  <img src="docs/img/flow.svg" alt="How enmaas works: an assistant or a person runs enmaas, which sends the prompt to the EnMaaS gateway, writes the answer to a file and returns only a receipt" width="100%">
+</p>
 
-This package is distributed as part of the `enmaas` plugin in
-RedHatTraining/ptl-marketplace, which is its home. For installation,
-credentials and usage guidance, read the plugin README one directory up; this
-file documents the package itself.
+<h1 align="center">enmaas</h1>
 
-A CLI for delegating work to EnMaaS-hosted models. Responses are written to files and only a short receipt goes to stdout, so an agent that shells out to it does not pay to read the whole answer.
+<p align="center">
+  Delegate bulk and one-shot model work to the Red Hat EnMaaS gateway.<br>
+  Answers go to files. Your assistant sees a receipt.
+</p>
+
+<p align="center">
+  <a href="https://github.com/enmaas-cli/enmaas-cli/actions/workflows/check.yml"><img src="https://github.com/enmaas-cli/enmaas-cli/actions/workflows/check.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue" alt="Python 3.11 to 3.14">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="Apache 2.0">
+  <img src="https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex-8A2BE2" alt="Works with Claude Code and Codex">
+</p>
+
+---
+
+**enmaas** is a command line tool and an agent skill. You, or your coding
+assistant, hand it work that is independent per item and needs no tool calls:
+classify a few hundred findings, read a long document once, get a second opinion
+from a different model family. It sends the work to EnMaaS, which hosts Claude,
+GPT, Gemini and two free open-weight models behind one key, writes every answer
+to a file, and prints a short receipt. The answer never lands in the conversation
+that asked for it.
+
+## Why teams use it
+
+| | |
+|---|---|
+| **Free where free is enough** | On an 80-item rule-checking task scored against ground truth, the free default model matched in-session Opus (98.8% accuracy) for 95% less. The cheapest paid Claude model did worse and cost more. Price does not order capability, so the tool measures and you choose. |
+| **Context stays small** | A 150,000-token file is summarised without a token of it entering the session. Every later step is cheaper, because every tool call re-sends the whole conversation. |
+| **Bulk without the multiplier** | When an assistant loops over a list, each item carries the entire conversation. `enmaas map` sends items on their own, several at once, and batches shared instructions. |
+| **A guard, not a guideline** | A `PreToolUse` hook for Claude Code and Codex denies reading a delegated answer back. The assistant previews a bounded prefix; you decide when it may read the whole thing. |
+
+One task class was measured. Treat the numbers as evidence to check against your
+own work, and run `enmaas usage` to see what yours costs.
 
 ## Install
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
+git clone https://github.com/enmaas-cli/enmaas-cli.git
+cd enmaas-cli
+./install.sh
 ```
 
-Or with uv:
+The installer sets up the command, the skill and the guard for whichever of
+Claude Code and Codex it finds. Put your key in `~/.secrets/enmaas`, run
+`enmaas models`, and you are done. The **[install guide](INSTALL.md)** has every
+step, the host setup, and a troubleshooting table.
+
+## Use
+
+**Ask** once, answer to a file:
 
 ```bash
-uv tool install -e .
+enmaas ask -f docs/reference.md -o /tmp/summary.md <<'PROMPT'
+Summarise this reference in ten bullet points for someone who has never used the tool.
+PROMPT
 ```
 
-The API key is read from `--key-file`, then `$ENMAAS_KEY`, then `~/.secrets/enmaas`.
-Local `inspect`, `allow-read`, `usage`, and `record` commands need no API key.
-
-## Commands
-
-### List models
+**Map** over many items, one answer file each. The `===PER ITEM===` line makes
+`map` send the instructions once per group of ten:
 
 ```bash
-enmaas models
+printf '%s\n' '{"id": "a", "n": 7}' '{"id": "b", "n": 12}' '{"id": "c", "n": 31}' > items.jsonl
+printf 'Answer EVEN or ODD for each item.\n===PER ITEM===\nNUMBER: {n}\n' > template.txt
+enmaas map --items items.jsonl --template template.txt --outdir out
 ```
 
-Lists the merged catalog from both the anthropic and openai dialect endpoints.
+<p align="center">
+  <img src="docs/img/receipt.svg" alt="A map receipt: model, batch size, twelve items attempted and ok, output directory, index file, tokens and elapsed time" width="80%">
+</p>
 
-### Ask a single question
+**Look** at an answer without pulling it into an assistant, or let one read it:
 
 ```bash
-echo "Name the capital of France in one word." | enmaas ask -m rits/zai-org/glm-5-3
+enmaas inspect out/a.md          # first 2,000 characters
+enmaas allow-read out/a.md       # you, in your terminal: grant a full read
+enmaas usage --since 30          # what you have spent
 ```
 
-Output:
-
-```
-enmaas ask ok
-  model     rits/zai-org/glm-5-3  (openai dialect)
-  output    /home/user/.local/state/enmaas/runs/2026-10-26T20-01-27-cfa2/response.md  (5 B)
-  tokens    in 21   out 3
-  elapsed   1.3s
-  preview   Paris
-```
-
-The full response is written to the file shown in the `output` line. The receipt includes a short preview.
-
-On failure, the receipt goes to stderr and the exit code is 1, allowing shell-level branching on success vs. error.
-
-### Map over multiple items
-
-```bash
-enmaas map -m rits/zai-org/glm-5-3 --items items.jsonl --template template.txt --outdir out --concurrency 4
-```
-
-Output:
-
-```
-enmaas map ok
-  items     8 total: 8 ok, 0 failed, 0 skipped
-  outdir    out
-  tokens    in 224   out 40
-  elapsed   5.0s
-```
-
-Each item in `items.jsonl` must have an `id` field. The `id` value must be a safe filename (no path separators or other filesystem-sensitive characters). The template can reference any other fields using `{field_name}` syntax. Output files are written to `outdir/<id>.md`.
-
-The `--resume` flag skips items that both have an output file in the outdir and an `ok` row in `results.jsonl`, allowing you to continue an interrupted bulk run without re-processing completed items.
-
-### Inspect an answer
-
-```bash
-enmaas inspect out/f001.md
-enmaas inspect out/f001.md --max-chars 500
-```
-
-The default and maximum output is 2,000 characters, including the truncation
-notice and final newline. This is a prefix, not a summary. The command reads one
-regular file and provides no pagination or full-output option.
-
-### Allow a deliberate full read
-
-Run this in your own terminal to let an assistant read one protected output:
-
-```bash
-enmaas allow-read out/f001.md
-```
-
-The exception lasts until the next enmaas generation for that path. The plugin
-hook blocks assistant attempts to grant exceptions. The CLI creates exact file
-markers, but enforcement requires an enabled host hook. See
-[output protection](../skills/enmaas/references/output-protection.md) for
-coverage and troubleshooting.
-
-## Options
-
-### Common flags
-
-- `--json`: Emit machine-readable JSON instead of plain-text receipts. For `ask`, prints an object with `status`, `model`, `dialect`, `path`, `tokens`, `elapsed`, and `error`. For `map`, prints an object with `status`, `total`, `ok`, `failed`, `skipped`, `attempted`, `outdir`, `index`, `tokens`, `elapsed`, and `failures`.
-- `--dialect {anthropic,openai}`: Override dialect selection. By default, the dialect is inferred from the model name.
-- `--max-tokens N`: Maximum output tokens. Must be positive.
-- `--timeout SECONDS`: Request timeout. Must be positive. Defaults to 280 seconds.
-- `--thinking {on,off}`: Control reasoning token generation. Defaults to `off` for `rits/*` models and provider default for frontier models.
-
-### Ask-specific flags
-
-- `-p, --prompt TEXT`: Prompt text.
-- `--prompt-file PATH`: Read prompt from file.
-- `-f, --file PATH`: Attach a file to the prompt. Can be specified multiple times.
-- `--system TEXT`: System message.
-- `-o, --output PATH`: Write response to this path instead of a timestamped run directory.
-- `--stdout`: Print the response body to stdout and the receipt to stderr.
-  The plugin hook blocks assistant use of this option.
-- `--save-thinking`: Save reasoning tokens to a separate file (when available).
-- `--retries N`: Number of retries on transient failures. Defaults to 3.
-
-If no prompt is given via `-p` or `--prompt-file`, stdin is read.
-
-### Map-specific flags
-
-- `--items PATH`: JSONL file with items to process. Each item must have an `id` field.
-- `--template PATH`: Python `str.format` template file for generating prompts.
-- `--outdir PATH`: Output directory for response files.
-- `--concurrency N`: Number of concurrent requests. Must be positive. Defaults to 1.
-- `--retries N`: Number of retries per item. Defaults to 3.
-- `--resume`: Skip items that already have an output file and an `ok` row in `results.jsonl`.
-- `--token-budget N`: Stop the run once it has spent N metered tokens. Not the same as `--max-tokens`, which caps the output of a single request. See [Token budget](#token-budget).
-
-## Model selection
-
-**Free models** (zero usage cost):
-- `rits/zai-org/glm-5-3` (1M context)
-- `rits/deepseek-ai/DeepSeek-V4.1-Flash-1017`
-
-**Budget-consuming models**:
-- `claude-*` family
-- `gpt-*` family
-- `gemini-*` family
-
-For a second opinion on work done by a Claude model, pick a different family. Shared training lineage means shared blind spots.
-
-## Reasoning costs output budget
-
-**This is the most important operational note.** Reasoning tokens come out of `max_tokens`, so on the hosted models reasoning can consume the entire budget and return zero text with HTTP 200.
-
-Hosted `rits/*` models default to `--thinking off` for this reason. Frontier models (`gpt-*`, `claude-*`, `gemini-*`) are left to the provider's default, since they manage their own reasoning budgets and have not shown this behavior.
-
-Measured on a 45 KB prompt with `rits/*` models:
-- With `--thinking on`: GLM returned a 504 at 300s; DeepSeek produced 32,768 tokens of invisible reasoning and zero text.
-- With `--thinking off`: GLM returned 8,258 chars in 35.7s; DeepSeek returned 12,587 chars in 18.6s.
-
-## Unencodable model output
-
-Lone surrogates (U+D800 to U+DFFF) are the only codepoints UTF-8 cannot encode, and
-a model can emit one: it travels as a plain ASCII `\ud800` escape in the JSON body,
-so it survives transport intact and only fails at the point of writing the response
-to disk.
-
-That raised `UnicodeEncodeError`, which is a `ValueError` rather than an `OSError`
-and so matched none of the handlers, taking down an entire map run over one bad
-character in one item.
-
-Such characters are now replaced with U+FFFD at parse time, before anything tries
-to write them. The replacement is never silent: `ask` prints a warning line and
-reports `replaced` under `--json`, and `map` records a count on that item's row in
-`results.jsonl`.
-
-A repaired item still counts as a success and its output is kept, but `--resume`
-does **not** skip it. The saved text differs from what the model sent, so treating
-it as finished would mean a rerun could never obtain a clean version. Retrying it
-costs a request, which `--token-budget` can bound.
-
-## Exit codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Error (includes usage errors like invalid flags) |
-| 2 | Partial failure (some items failed in a map run) |
-| 3 | Run stopped early: circuit breaker tripped, or token budget spent |
-
-Usage errors (invalid flags, missing required arguments) exit 1, so exit code 2 unambiguously means partial failure.
-
-On exit code 3, re-run with `--resume` to skip already-completed items and continue from where the circuit breaker stopped the run.
-
-## Circuit breaker
-
-The circuit breaker aborts a bulk map run on:
-- 6 consecutive failures, or
-- More than 50% failures in a full 20-item window
-
-Whichever comes first. This catches a run that is failing, but not one where
-every call succeeds and the spend is the problem. That is what the token budget
-below is for.
-
-## Token budget
-
-`--token-budget N` stops a map run once it has spent N metered tokens, exiting 3
-the way a tripped circuit breaker does.
-
-**Metered means uncached input plus output.** Cached input is excluded, so
-batching helps a run go further under the same ceiling. Cache writes are charged,
-because writing a cache entry is real work. Reasoning is charged too, but it needs
-no separate term: it is already inside the output count on both dialects.
-
-**It stops scheduling rather than hard-stopping.** At `--concurrency N`, up to
-N-1 further requests are already in flight and will finish. With `--batch`, those
-are N-1 further groups, which can be a lot of tokens. There is no fixed token
-bound without bounding request size.
-
-**The ceiling belongs to the job, not to one command.** Every request appends a
-`{"type": "request", "charge": N}` row to `results.jsonl`, and a resumed run adds
-those up before spending anything. So `--resume` on its own re-trips immediately.
-To carry on, raise the ceiling deliberately:
-
-```bash
-enmaas map ... --token-budget 2000000 --resume
-```
-
-That is the intended friction. A budget that reset on every invocation could be
-bypassed by pressing up-arrow and Enter.
-
-**What it does not catch.** `call` retries internally, and a non-200 response
-carries no usage for the client to read, so tokens burned by an attempt that
-failed in transport are invisible here. That spend is unknowable from this side
-rather than merely unimplemented.
-
-## Configuration
-
-Optional config file at `~/.config/enmaas/config.toml`:
-
-```toml
-base_url = "https://api.enmaas.devshift.net"
-default_model = "rits/zai-org/glm-5-3"
-concurrency = 4
-timeout = 280
-
-[dialect_overrides]
-"rits/zai-org/glm-5-3" = "anthropic"
-```
-
-All fields shown are the defaults except `dialect_overrides`.
-
-The `dialect_overrides` table maps model names to dialect strings (`"anthropic"` or `"openai"`). An explicit `--dialect` flag on the command line takes precedence. Invalid dialect values are ignored with a warning.
-
-### Rolling token budget
-
-```toml
-[budget]
-window_days = 30
-tokens = 50_000_000
-```
-
-With this set, `ask` and `map` refuse to start once the usage ledger shows more
-than `tokens` metered tokens inside the last `window_days` days, exiting 3. A map
-run that crosses the ceiling partway through stops there rather than waiting to be
-caught next time. The window matches `enmaas usage --since DAYS`, so reporting and
-enforcement count the same way.
-
-Configuration rather than a flag on purpose: a standing policy you have to
-remember to type is not a guard. For a one-off run against different settings, the
-global `--config PATH` already exists.
-
-**A malformed `[budget]` table is an error, not a warning.** Every other key in
-this file degrades to its default; this one does not. A half-written budget is a
-request for enforcement that cannot be honoured, and warning while running
-uncapped would be the same false assurance as a flag that silently does nothing.
-Both keys are required, a typo in a key name is rejected, and values must be
-positive integers.
-
-A config file that exists but cannot be parsed at all is also fatal, for the same
-reason: falling back to defaults would drop a configured `[budget]` along with
-everything else, so a stray typo anywhere in the file would run uncapped.
-
-For the same reason the command refuses, rather than proceeding, when a budget is
-configured and the ledger cannot be read, or when `ENMAAS_NO_USAGE_LOG` disables
-recording. An unreadable ledger looks exactly like one showing zero spend. With no
-budget configured the ledger is never consulted for enforcement at all, so a
-damaged one does not stop work; `enmaas usage` keeps reporting what it can from
-the rows it understands.
-
-If a run finishes but its usage cannot be written back, and a budget is
-configured, it prints a warning. That spend will not count against the ceiling, so
-the ceiling has quietly stopped tracking.
-
-**Single process only.** Each run reads the ledger at startup and writes its event
-at the end. Two runs started together against 9,000,000 spent of a 10,000,000
-ceiling will each believe 1,000,000 remains, and together spend 2,000,000. A run
-killed partway writes no event, so its spend goes unrecorded. This is a guard
-against your own drift over time, not an enforcement boundary against concurrent
-use. Enforcing that properly needs a server-side budget, which a client cannot
-provide.
+`-m MODEL` is optional on `ask` and `map`. The built-in default,
+`rits/zai-org/glm-5-3`, is free.
+
+## The output guard
+
+<p align="center">
+  <img src="docs/img/guard.svg" alt="The guard denies an assistant's attempt to read a protected answer file; enmaas inspect shows a bounded prefix; a person can grant a full read with enmaas allow-read" width="100%">
+</p>
+
+Delegating saves little if the assistant reads the answer straight back. The
+guard denies reads of protected answer files through the hosts' file tools and
+the common shell readers, including through pipelines and globs. Receipts and
+every other file stay readable. It runs with `python3 -S` from two
+standard-library-only modules, so it needs nothing installed. The skill tells the
+assistant to respect a denial and ask you instead. Coverage and limits are in
+[output protection](skills/enmaas/references/output-protection.md).
+
+## What the assistant is told
+
+The skill gives Claude Code and Codex one rule: delegate when the work is
+independent per item, needs no tool calls, and is useful as a file. Classify,
+extract, rewrite, triage, summarise, second-opinion. Keep debugging, test-and-fix
+loops, dependent steps and decisions in the session. Read it in
+[SKILL.md](skills/enmaas/SKILL.md).
+
+## Documentation
+
+| | |
+|---|---|
+| [Install guide](INSTALL.md) | Clone to first delegation, update, remove, troubleshoot |
+| [Reference](docs/reference.md) | Every command, flag, config key, exit code, and the budget and breaker rules |
+| [Skill](skills/enmaas/SKILL.md) | What the assistant is told, and the delegate / do-not-delegate lists |
+| [Output protection](skills/enmaas/references/output-protection.md) | Which files and tools the guard covers |
+| [Changelog](CHANGELOG.md) | What changed in each release |
+| [Contributing](CONTRIBUTING.md) | How changes land |
+| [Security](SECURITY.md) | How to report a problem |
 
 ## Development
 
 ```bash
-make check
+uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
+make check            # ruff, format, mypy strict, pytest
+make check-install    # installs into a throwaway HOME and checks every step
+make live             # free hosted models against the real gateway, needs a key
 ```
 
-Runs ruff, mypy strict, and pytest (117 unit tests).
+## License
 
-```bash
-make live
-```
-
-Runs the live test suite against the real gateway. Uses only the free hosted models and costs nothing.
+Apache 2.0. See [LICENSE](LICENSE). Maintained by eparenti.

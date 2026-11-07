@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="0 0 900 300" width="900" height="300" role="img" aria-labelledby="t">
+  <title id="t">A map receipt: twelve items, one batched request group, answers in files</title>
+  <defs>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 15px; fill: #e2e8f0; white-space: pre; }
+      .dim { fill: #94a3b8; }
+      .ok { fill: #4ade80; }
+      .k { fill: #93c5fd; }
+    </style>
+  </defs>
+  <rect width="900" height="300" rx="14" fill="#0f172a"/>
+  <circle cx="26" cy="24" r="6" fill="#ef4444"/><circle cx="46" cy="24" r="6" fill="#f59e0b"/><circle cx="66" cy="24" r="6" fill="#22c55e"/>
+  <text class="mono dim" x="450" y="29" text-anchor="middle">enmaas</text>
+  <text class="mono" x="28" y="72"><tspan class="dim">$ </tspan>enmaas map --items items.jsonl --template template.txt --outdir out</text>
+  <text class="mono" x="28" y="108"><tspan class="ok">enmaas map ok</tspan></text>
+  <text class="mono" x="28" y="134"><tspan class="k">  model     </tspan>rits/zai-org/glm-5-3  <tspan class="dim">(default)</tspan></text>
+  <text class="mono" x="28" y="158"><tspan class="k">  batch     </tspan>10  <tspan class="dim">(default: template has ===PER ITEM===)</tspan></text>
+  <text class="mono" x="28" y="182"><tspan class="k">  items     </tspan>12 total: 12 attempted, 12 ok, 0 failed, 0 skipped</text>
+  <text class="mono" x="28" y="206"><tspan class="k">  outdir    </tspan>out</text>
+  <text class="mono" x="28" y="230"><tspan class="k">  index     </tspan>out/results.jsonl</text>
+  <text class="mono" x="28" y="254"><tspan class="k">  tokens    </tspan>in 1,204   out 96</text>
+  <text class="mono" x="28" y="278"><tspan class="k">  elapsed   </tspan>6.2s</text>
+</svg>
