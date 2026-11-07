@@ -1,0 +1,45 @@
+name: Bug report
+description: Something did not work as documented
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `enmaas --version`
+      placeholder: enmaas 0.4.0
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Where it happened
+      options:
+        - Terminal
+        - Claude Code
+        - Codex
+        - install.sh
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command. Remove anything confidential. Never paste your key.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The full output, including the receipt or error.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true

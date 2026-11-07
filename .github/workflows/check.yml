@@ -1,0 +1,79 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the declared floor and is tested because it is the version a
+        # colleague on an older distribution is most likely to have.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Format
+        run: ruff format --check src tests
+
+      - name: Types
+        run: mypy
+
+      # Live tests hit the real gateway and need a credential, so they are
+      # deselected by default in pyproject and never run here. A CI job that
+      # silently skipped the whole suite would be worse than no CI, so this
+      # asserts a floor on the number of tests that actually ran.
+      - name: Tests
+        run: pytest -q --tb=short
+
+      - name: Guard against an empty run
+        run: |
+          count=$(pytest --collect-only -q 2>/dev/null | tail -1 | grep -oE '^[0-9]+' || echo 0)
+          echo "collected $count tests"
+          if [ "${count:-0}" -lt 550 ]; then
+            echo "::error::only $count tests collected, expected at least 550"
+            exit 1
+          fi
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv
+
+      # Runs install.sh against a throwaway HOME: command, skill, guard, both
+      # host registrations, a second idempotent run, dry run and uninstall.
+      - name: Install test
+        run: make check-install

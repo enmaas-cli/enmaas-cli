@@ -1,0 +1,6 @@
+# Reviewers are requested automatically on every pull request.
+#
+# Note: branch protection and rulesets are not available for private
+# repositories on the Free plan, so this requests a review but cannot require
+# one. See CONTRIBUTING.md for what that means in practice.
+* @eparenti
