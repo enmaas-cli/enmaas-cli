@@ -5,6 +5,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.6.0] - 2026-11-07
+
 ### Changed
 
 - The gateway URL is a required setting. Set `base_url` in the config file or
@@ -101,8 +105,9 @@ plugin marketplace.
 - A usage ledger with `enmaas usage`.
 - A skill that tells Claude Code and Codex when to delegate.
 
-[Unreleased]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/enmaas-cli/enmaas-cli/releases/tag/v0.5.0
+[Unreleased]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.1.0...v0.2.0
