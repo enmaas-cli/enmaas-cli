@@ -31,17 +31,34 @@ class Key:
         return f"Key(source={self.source!r}, warning={self.warning!r})"
 
 
+def _unreadable(exc: OSError, path: Path) -> AuthError:
+    return AuthError(f"key file is not readable ({exc.strerror or exc}): {path}")
+
+
 def _read_key_file(path: Path) -> str:
-    if not path.exists():
-        raise AuthError(f"key file does not exist: {path}")
-    value = path.read_text(encoding="utf-8").strip()
+    # A directory, a file without read permission, or binary content would
+    # otherwise escape as a traceback, because callers only catch AuthError.
+    try:
+        if not path.exists():
+            raise AuthError(f"key file does not exist: {path}")
+        value = path.read_text(encoding="utf-8").strip()
+    except IsADirectoryError:
+        raise AuthError(f"key file is a directory: {path}") from None
+    except UnicodeDecodeError:
+        raise AuthError(f"key file is not UTF-8 text: {path}") from None
+    except OSError as exc:
+        raise _unreadable(exc, path) from None
     if not value:
         raise AuthError(f"key file is empty: {path}")
     return value
 
 
 def _permission_warning(path: Path) -> str | None:
-    mode = path.stat().st_mode
+    try:
+        mode = path.stat().st_mode
+    except OSError as exc:
+        # The file can vanish or lose permissions between the read and this call.
+        raise _unreadable(exc, path) from None
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
         return (
             f"{path} is mode {oct(mode & 0o777)[2:]}, readable beyond the owner; "
@@ -50,34 +67,55 @@ def _permission_warning(path: Path) -> str | None:
     return None
 
 
+def _from_file(path: Path) -> Key:
+    return Key(
+        value=_read_key_file(path),
+        source=str(path),
+        warning=_permission_warning(path),
+    )
+
+
+def _expand_configured(value: str | Path) -> Path:
+    # A "~user" path for a user that does not exist raises RuntimeError.
+    # Expanding only here keeps that failure from blocking --key-file or
+    # $ENMAAS_KEY, which win over the config.
+    try:
+        return Path(value).expanduser()
+    except RuntimeError:
+        raise AuthError(f"key_file in config cannot be expanded: {value}") from None
+
+
 def resolve_key(
     *,
     key_file: Path | None,
     env: Mapping[str, str],
     home: Path,
+    config_key_file: str | Path | None = None,
 ) -> Key:
-    """Resolve a key from --key-file, then $ENMAAS_KEY, then ~/.secrets/enmaas."""
+    """Resolve a key from the first source that is set.
+
+    The order is --key-file, then $ENMAAS_KEY, then key_file from the
+    config file, then ~/.secrets/enmaas. A configured file that is missing
+    or cannot be read is an error. Falling through to the default path
+    would quietly use a different key from the one the config names. The
+    configured path has "~" expanded only when that source is the one used.
+    """
     if key_file is not None:
-        return Key(
-            value=_read_key_file(key_file),
-            source=str(key_file),
-            warning=_permission_warning(key_file),
-        )
+        return _from_file(key_file)
 
     from_env = env.get(ENV_VAR, "").strip()
     if from_env:
         return Key(value=from_env, source=ENV_VAR, warning=None)
+
+    if config_key_file is not None:
+        return _from_file(_expand_configured(config_key_file))
 
     default = home / DEFAULT_RELATIVE_PATH
     if not default.exists():
         raise AuthError(
             f"no EnMaaS key found: pass --key-file, set ${ENV_VAR}, or create {default}"
         )
-    return Key(
-        value=_read_key_file(default),
-        source=str(default),
-        warning=_permission_warning(default),
-    )
+    return _from_file(default)
 
 
 def redact(text: str, key: str) -> str:

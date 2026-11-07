@@ -263,6 +263,7 @@ def test_an_over_budget_ask_exits_three_without_calling_the_gateway(
     )
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     monkeypatch.setenv("ENMAAS_KEY", "k")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://g.test")
     monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
 
     config = tmp_path / "config.toml"
@@ -320,6 +321,7 @@ def test_an_over_budget_json_run_still_emits_json(
     )
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     monkeypatch.setenv("ENMAAS_KEY", "k")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://g.test")
     monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
 
     config = tmp_path / "config.toml"

@@ -2,12 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from enmaas_cli.config import DEFAULTS, ConfigError, load_config
+from enmaas_cli.config import ConfigError, load_config
 
 
 def test_missing_file_returns_defaults(tmp_path: Path) -> None:
     cfg = load_config(tmp_path / "nope.toml")
-    assert cfg.base_url == DEFAULTS.base_url
+    assert cfg.base_url is None
+    assert cfg.key_file is None
     assert cfg.default_model == "rits/zai-org/glm-5-3"
     assert cfg.concurrency == 4
     assert cfg.timeout == 280
@@ -21,6 +22,22 @@ def test_values_override_defaults(tmp_path: Path) -> None:
     assert cfg.base_url == "https://other.test"
     assert cfg.concurrency == 8
     assert cfg.timeout == 280
+
+
+def test_key_file_is_read_as_a_string(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('key_file = "/keys/enmaas"\n', encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.key_file == "/keys/enmaas"
+    assert cfg.warnings == []
+
+
+def test_key_file_of_the_wrong_type_warns(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("key_file = 3\n", encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.key_file is None
+    assert any("key_file must be str" in w for w in cfg.warnings)
 
 
 def test_unknown_keys_warn_but_do_not_fail(tmp_path: Path) -> None:

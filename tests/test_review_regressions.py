@@ -1,6 +1,7 @@
 """User-reported read denials and output leaks."""
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,7 @@ def test_recursive_glob_includes_root_file(answers: Path) -> None:
     )
 
 
+@pytest.mark.skipif(shutil.which("rg") is None, reason="the guard asks ripgrep for its scope")
 def test_rg_uses_ignored_search_scope(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     (tmp_path / ".gitignore").write_text("node_modules/\n.venv/\n")

@@ -43,6 +43,7 @@ def test_schema_failure_reports_saved_path_without_response_body(
     )
     output = tmp_path / "answer.json"
     monkeypatch.setenv("ENMAAS_KEY", "local-fixture-key")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://g.test")
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
     async def fake_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
