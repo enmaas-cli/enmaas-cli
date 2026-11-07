@@ -10,9 +10,10 @@ You need:
 - Python 3.11 or newer on your `PATH` as `python3`. Check with `python3 --version`.
 - `git`.
 - `uv` or `pipx` to install the CLI. If you have neither, `python3 -m pip install --user uv` is the quickest way to get `uv`. Make sure `~/.local/bin` is on your `PATH` afterwards.
-- An EnMaaS key. Request one on the
-  [EnMaaS page on Source](https://GATEWAY-PORTAL/enmaas).
-  Steps 1, 2 and 5 work without it. Steps 4 and 6 need it.
+- The gateway URL and an API key. Your organization gives you both. The gateway
+  is an endpoint that serves the OpenAI or Anthropic API shape under `/v1`, such
+  as EnMaaS. Steps 1, 2 and 5 work
+  without the key. Steps 4 and 6 need it.
 - Access to this repository. If `git clone` is refused, ask the repository owner (eparenti) to add you.
 
 Claude Code or Codex are optional. The CLI works on its own. The installer sets up
@@ -30,20 +31,28 @@ cd enmaas-cli
 ## 2. Run the installer
 
 ```bash
-./install.sh
+./install.sh --gateway https://GATEWAY-HOST --key-file ~/.secrets/enmaas
 ```
 
-It does four things and prints each one:
+Replace `GATEWAY-HOST` with the host your organization gave you. If you leave
+`--gateway` out, the installer asks for the URL once. `--key-file` names the file
+that will hold your key; the default is `~/.secrets/enmaas`, so you can leave it
+out too.
+
+It does five things and prints each one:
 
 1. Installs the `enmaas` command with `uv tool install` (or `pipx`).
-2. Copies the agent skill into `~/.claude/skills/enmaas/` and `~/.codex/skills/enmaas/`, for each host directory that exists. The skill is what teaches the assistant when to delegate and how to handle the results.
-3. Installs the output guard, a small `PreToolUse` hook, and registers it in `~/.claude/settings.json` and `~/.codex/config.toml`. The guard stops an assistant from reading a full answer file into its context. Step 6 shows what that looks like.
-4. Tells you whether a key file exists at `~/.secrets/enmaas`. It does not check the key itself; step 4 does.
+2. Writes the gateway URL as `base_url` in `~/.config/enmaas/config.toml`, keeping anything else already in that file.
+3. Copies the agent skill into `~/.claude/skills/enmaas/` and `~/.codex/skills/enmaas/`, for each host directory that exists. The skill is what teaches the assistant when to delegate and how to handle the results.
+4. Installs the output guard, a small `PreToolUse` hook, and registers it in `~/.claude/settings.json` and `~/.codex/config.toml`. The guard stops an assistant from reading a full answer file into its context. Step 6 shows what that looks like.
+5. Checks the key file. If it is missing, the installer still finishes and tells you how to create it. It does not test the key itself; step 4 does.
 
 Options:
 
 | Flag | Effect |
 |---|---|
+| `--gateway URL` | The gateway URL. Written to the config file. Asked for once if omitted and not already configured. |
+| `--key-file PATH` | Where your key is. Default `~/.secrets/enmaas`. A different path is recorded in the config file. |
 | `--cli-only` | Install the command only. No skill, no guard. |
 | `--skill-only` | Copy the skill and install the guard. No command. Add `--no-hook` for the skill alone. |
 | `--no-hook` | Install the command and skill but skip the output guard. |
@@ -59,10 +68,13 @@ The installer honours `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and an absolute
 
 ## 3. Add your key
 
-If you already have `~/.secrets/enmaas` from another tool, skip this step.
+If you already have the key file (`~/.secrets/enmaas`, or the path you gave
+`--key-file`), skip this step.
 
 Create the key file with owner-only permissions, then paste the key into it with
-your editor. One line, no quotes, no trailing space.
+your editor. One line, no quotes, no trailing space. If you passed `--key-file
+PATH` in step 2, use that path in place of `~/.secrets/enmaas` below; the CLI
+reads the path from the config file and does not fall back to the default.
 
 ```bash
 mkdir -p -m 700 ~/.secrets
@@ -70,10 +82,11 @@ mkdir -p -m 700 ~/.secrets
 vi ~/.secrets/enmaas        # or any editor
 ```
 
-The CLI also accepts `ENMAAS_KEY` in the environment, or `--key-file PATH` placed
-before the subcommand, as in `enmaas --key-file PATH models`. The file is the
-recommended place because every tool and every assistant session then finds it
-without any setup.
+The CLI looks for the key in this order: `--key-file PATH` placed before the
+subcommand (as in `enmaas --key-file PATH models`), then `ENMAAS_KEY` in the
+environment, then a `key_file` set in the config file, then `~/.secrets/enmaas`.
+The default file is the recommended place because every tool and every assistant
+session then finds it without any setup.
 
 ## 4. Check that it works
 
@@ -102,6 +115,8 @@ enmaas ask ok
 
 The default model is free. The answer went to the file on the `output` line. That
 is how every call works: the file holds the answer, the receipt tells you where.
+Run directories under `~/.local/state/enmaas/runs/` are removed after 30 days.
+Pass `-o PATH` to keep an answer somewhere permanent.
 
 ## 5. Finish the host setup
 
@@ -160,8 +175,8 @@ version. If the run stops partway, fix what it reports and run it again.
 ```
 
 This removes the command, both skill copies, the guard and its two registrations.
-An empty `"PreToolUse": []` list is left in `settings.json` so nothing else in
-the file moves. Your key file, your config file and your past answers stay where
+The `PreToolUse` list in `settings.json` keeps any other hooks you had. If the
+guard was the only one, an empty list is left so nothing else in the file moves. Your key file, your config file and your past answers stay where
 they are. Delete
 `~/.secrets/enmaas`, `~/.config/enmaas/` and `~/.local/state/enmaas/` (or
 `$XDG_STATE_HOME/enmaas/`) yourself if you want them gone.
@@ -174,7 +189,14 @@ they are. Delete
 | `neither uv nor pipx found` | Nothing can install the command. | `python3 -m pip install --user uv`, then rerun. |
 | `Claude Code: not installed here, skipping` or the same for Codex | That host's configuration directory does not exist yet. | Start the host once, then run `./install.sh` again. |
 | `enmaas: command not found` | `~/.local/bin` is not on your `PATH`. | Add it to your shell profile, or run `uv tool update-shell` and open a new shell. |
-| `no EnMaaS key found` | Step 3 is missing. | Create `~/.secrets/enmaas` as shown above. |
+| `no EnMaaS key found` or `key file does not exist` | Step 3 is missing. | Create the key file at the path the message names, as shown in step 3. |
+| `no gateway URL configured` | The config file has no `base_url` and `ENMAAS_BASE_URL` is unset. | Run `./install.sh --gateway https://GATEWAY-HOST`, or add `base_url = "https://GATEWAY-HOST"` to `~/.config/enmaas/config.toml`. |
+| `gateway URL is not valid (...)` from `enmaas` | The configured URL or `ENMAAS_BASE_URL` is not a plain `http://` or `https://` address with a host. The reason is in the brackets. | Fix `base_url` in `~/.config/enmaas/config.toml`, or rerun `./install.sh --gateway https://GATEWAY-HOST`. |
+| `Gateway URL has no host name`, `must not have a query (?) or a fragment (#)`, or another `Gateway URL ...` line from the installer | The URL you passed cannot be used. The message says why. | Pass the gateway root, such as `https://GATEWAY-HOST`, with no query, fragment or user name. |
+| `the enmaas guard block was edited by hand` or `the enmaas guard is registered in config.toml without the enmaas markers` | `~/.codex/config.toml` holds a guard registration the installer did not write as is. | Delete that `[[hooks.PreToolUse]]` table by hand, keep any other hook in its own table outside the markers, then run the installer again. |
+| `Could not confirm that enmaas-cli is removed` | `--uninstall` could not list installed tools with `uv` or `pipx`. | Read the tool's error above the line, fix it, and run `./install.sh --uninstall` again. |
+| `Could not put the previous copy back at ...` | A skill or guard swap failed and the rollback failed too. The message names where the backup is. | Move the backup to the named path by hand, then run the installer again. |
+| `No gateway URL. Run this again with --gateway URL, or set base_url in ~/.config/enmaas/config.toml.` | The installer ran without a terminal to ask on, and no URL was configured. | Pass `--gateway https://GATEWAY-HOST`. |
 | HTTP 401 or 403 from `enmaas models` | The key is wrong, expired or pasted with extra characters. | Open the file, make sure it holds one line and nothing else. Request a new key if it still fails. |
 | `/hooks` in Claude Code shows no enmaas entry | Settings were not reloaded, or the file was not written. | Restart Claude Code. If still missing, run `./install.sh` again and read its output. It refuses to write a `settings.json` that is not valid JSON and tells you so. |
 | Codex never asked to trust the hook | Config was not reloaded. | Restart Codex. Check `~/.codex/config.toml` for the guard block. |
@@ -184,7 +206,7 @@ they are. Delete
 | `is a symbolic link to ..., which does not exist`, `is read-only`, or `Cannot write to ..., which is needed for ...` | A settings path points nowhere, or the installer cannot write where it needs to. | Fix the link or the permission, then run the installer again. |
 | `holds NaN or Infinity` or `is not valid JSON (duplicate key ...)` | `settings.json` contains a value or a repeated key that a rewrite would silently change. | Fix the file by hand, then run the installer again. |
 | `--uninstall` exits 1 and shows a `uv` or `pipx` error | The CLI is installed but the tool could not remove it. | Read the tool's error above the line, fix it, and run `./install.sh --uninstall` again. |
-| `exhausted max_tokens during reasoning` | The model spent its output budget thinking. | Add `--thinking off`, or shorten the prompt. On the hosted free models, raising `--max-tokens` was measured to make no difference. |
+| `exhausted max_tokens (... output tokens, stop=...) during reasoning` | The model spent its output budget thinking. | Add `--thinking off`, or shorten the prompt. On the hosted free models, raising `--max-tokens` was measured to make no difference. |
 
 If none of these match, open an issue in this repository with the full command and
 the full output. Do not include your key.

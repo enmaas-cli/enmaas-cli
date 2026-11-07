@@ -23,8 +23,10 @@ assistant, hand it work that is independent per item and needs no tool calls:
 classify a few hundred findings, read a long document once, get a second opinion
 from a different model family. It sends the work to EnMaaS, which hosts Claude,
 GPT, Gemini and two free open-weight models behind one key, writes every answer
-to a file, and prints a short receipt. The answer never lands in the conversation
-that asked for it.
+to a file, and prints a short receipt with a preview of at most 160 characters.
+The full answer stays out of the conversation that asked for it. The gateway is
+any endpoint that serves the OpenAI or Anthropic API shape under `/v1`; your
+organization gives you its URL and your key.
 
 ## Why teams use it
 
@@ -43,12 +45,12 @@ own work, and run `enmaas usage` to see what yours costs.
 ```bash
 git clone https://github.com/enmaas-cli/enmaas-cli.git
 cd enmaas-cli
-./install.sh
+./install.sh --gateway https://GATEWAY-HOST --key-file ~/.secrets/enmaas
 ```
 
-The installer sets up the command, the skill and the guard for whichever of
-Claude Code and Codex it finds. Put your key in `~/.secrets/enmaas`, run
-`enmaas models`, and you are done. The **[install guide](INSTALL.md)** has every
+The installer sets up the command, the gateway URL, the skill and the guard for
+whichever of Claude Code and Codex it finds. Put your key in `~/.secrets/enmaas`,
+run `enmaas models`, and you are done. The **[install guide](INSTALL.md)** has every
 step, the host setup, and a troubleshooting table.
 
 ## Use
@@ -125,7 +127,7 @@ loops, dependent steps and decisions in the session. Read it in
 uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 make check            # ruff, format, mypy strict, pytest
 make check-install    # installs into a throwaway HOME and checks every step
-make live             # free hosted models against the real gateway, needs a key
+make live             # free hosted models; export ENMAAS_BASE_URL and a key (ENMAAS_KEY or ~/.secrets/enmaas)
 ```
 
 ## License

@@ -1016,6 +1016,7 @@ def test_map_json_names_model_and_batch(
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://g.test")
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -1083,6 +1084,7 @@ def test_map_json_reports_the_marker_batch_default(
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://g.test")
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
