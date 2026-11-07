@@ -160,6 +160,9 @@ def test_pipe_marker_is_protected_without_waiting(tmp_path: Path) -> None:
         text=True,
         timeout=2,
         check=True,
+        # -S skips site, so an editable install's .pth file is not read.
+        # Point the child at the source tree directly.
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
     )
     assert result.stdout == "True\n"
 
