@@ -1,5 +1,1 @@
 blank_issues_enabled: true
-contact_links:
-  - name: Request an EnMaaS key
-    url: https://source.redhat.com/departments/products_and_global_engineering/workload_management/enmaas
-    about: Keys come from the EnMaaS team on Source. This repository cannot issue them.

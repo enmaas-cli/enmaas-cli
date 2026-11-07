@@ -11,7 +11,7 @@ Every command, flag and configuration key. For installation read
 enmaas models
 ```
 
-Lists the merged catalog from both the anthropic and openai dialect endpoints. `--dialect {anthropic,openai,both}` narrows it; `both` is the default. `--json` prints it as JSON.
+Lists the merged catalog from both the anthropic and openai dialect endpoints. `--dialect {anthropic,openai,both}` narrows it; `both` is the default. `--json` prints it as JSON. `--timeout SECONDS` bounds each catalog request. A gateway that serves only one dialect rejects the other probe, so pass `--dialect openai` or `--dialect anthropic` there.
 
 ### Ask a single question
 
@@ -30,14 +30,14 @@ enmaas ask ok
   preview   Paris
 ```
 
-The full response is written to the file shown in the `output` line. The receipt includes a short preview.
+The full response is written to the file shown in the `output` line. The receipt includes a preview of at most 160 characters. Run directories under `$XDG_STATE_HOME/enmaas/runs/` (default `~/.local/state/enmaas/runs/`) are removed once they are 30 days old, at the start of the next `ask`. Pass `-o PATH` for an answer that must persist.
 
 On an ordinary request failure the receipt goes to stderr and the exit code is 1, so a shell script can branch on it. With `--json` the error object goes to stdout. A refusal under a rolling `[budget]` exits 3.
 
 ### Map over multiple items
 
 ```bash
-enmaas map -m rits/zai-org/glm-5-3 --items items.jsonl --template template.txt --outdir out --concurrency 4
+enmaas map --items items.jsonl --template template.txt --outdir out --concurrency 4
 ```
 
 Output:
@@ -56,7 +56,9 @@ enmaas map ok
 `(default)` marks a choice the CLI made for you. `index` is the per-item record
 that `--resume` reads.
 
-Each item in `items.jsonl` must have an `id` field. The `id` value must be a safe filename (no path separators or other filesystem-sensitive characters). The template can reference any other fields using `{field_name}` syntax. Output files are written to `outdir/<id>.md`.
+Each item in `items.jsonl` must have an `id` field. Ids must be unique, safe as filenames (no path separators or other filesystem-sensitive characters), and free of whitespace, because a batched reply names each answer by its id. The template can reference any other fields using `{field_name}` syntax. Output files are written to `outdir/<id>.md`.
+
+When the template contains the `===PER ITEM===` marker, requests are batched. The text above the marker is sent once, exactly as written; only the text below it is filled in per item, so every `{field_name}` placeholder must sit below the marker.
 
 The `--resume` flag skips items that both have an output file in the outdir and an `ok` row in `results.jsonl`, allowing you to continue an interrupted bulk run without re-processing completed items.
 
@@ -91,15 +93,15 @@ coverage and troubleshooting.
 
 These go before the subcommand: `enmaas --key-file PATH models`.
 
-- `--key-file PATH`: Read the gateway key from this file instead of `$ENMAAS_KEY` or `~/.secrets/enmaas`.
+- `--key-file PATH`: Read the gateway key from this file. Without it the CLI tries `$ENMAAS_KEY`, then the `key_file` set in the config file, then `~/.secrets/enmaas`.
 - `--config PATH`: Use this config file instead of `~/.config/enmaas/config.toml`.
 - `--version`: Print `enmaas <version>` and exit 0.
 
 ### Common flags (`ask` and `map`)
 
 - `-m, --model MODEL`: The model to use. Optional; without it the configured `default_model` applies and the receipt says `(default)`.
-- `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. See [Structured output](#structured-output).
-- `--schema-name NAME`: The name sent with the schema. Defaults to a name derived from the file.
+- `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
+- `--schema-name NAME`: The name sent with the schema. Defaults to `StructuredOutput`. `ask` and unbatched `map` send the schema and its name with the request; batched `map` keeps the schema local and validates each answer after the reply is split.
 - `--json`: Emit machine-readable JSON instead of plain-text receipts. For `ask`, prints an object with `status`, `model`, `dialect`, `path`, `tokens`, `elapsed`, and `error`. For `map`, prints an object with `status`, `total`, `ok`, `failed`, `skipped`, `attempted`, `outdir`, `index`, `tokens`, `elapsed`, and `failures`.
 - `--dialect {anthropic,openai}`: Override dialect selection. By default, the dialect is inferred from the model name.
 - `--max-tokens N`: Maximum output tokens. Must be positive.
@@ -221,7 +223,7 @@ those up before spending anything. So `--resume` on its own re-trips immediately
 To carry on, raise the ceiling deliberately:
 
 ```bash
-enmaas map ... --token-budget 2000000 --resume
+enmaas map --items items.jsonl --template template.txt --outdir out --token-budget 2000000 --resume
 ```
 
 That is the intended friction. A budget that reset on every invocation could be
@@ -233,10 +235,11 @@ failed in transport are invisible here. That spend cannot be known from this sid
 
 ## Configuration
 
-Optional config file at `~/.config/enmaas/config.toml`:
+Config file at `~/.config/enmaas/config.toml`. `base_url` is required; everything else is optional. `install.sh --gateway URL` writes `base_url` for you.
 
 ```toml
-base_url = "https://api.enmaas.devshift.net"
+base_url = "https://GATEWAY-HOST"   # required; your organization gives you this
+key_file = "/home/you/.secrets/enmaas"   # optional; only when the key is not at ~/.secrets/enmaas
 default_model = "rits/zai-org/glm-5-3"
 concurrency = 4
 timeout = 280
@@ -245,7 +248,7 @@ timeout = 280
 "rits/zai-org/glm-5-3" = "anthropic"
 ```
 
-All fields shown are the defaults except `dialect_overrides`.
+`base_url` has no default: it must be set here or in `ENMAAS_BASE_URL`, which wins when both are set. `models`, `ask` and `map` exit 1 with a message naming the fix when neither is set; the local commands do not need it. `key_file` may name the key file when it is somewhere other than `~/.secrets/enmaas`. The other fields shown are the defaults except `dialect_overrides`.
 
 The `dialect_overrides` table maps model names to dialect strings (`"anthropic"` or `"openai"`). An explicit `--dialect` flag on the command line takes precedence. Invalid dialect values are ignored with a warning.
 
@@ -265,8 +268,9 @@ Rates are USD per million tokens. A key is an exact model id or a prefix coverin
 a family; an exact id wins. Both `input` and `output` are required and must be
 non-negative numbers. A malformed entry is reported as a warning and skipped, so a
 model never looks free by accident. `rits/*` models are known to be free without
-an entry. The gateway publishes no prices, so these can only come from whoever
-knows what the account is charged.
+an entry, and that built-in rate also beats a prefix entry: to price a `rits/*`
+model, name its exact id. The gateway publishes no prices, so these can only come
+from whoever knows what the account is charged.
 
 ### Rolling token budget
 
@@ -280,9 +284,11 @@ With this set, `ask` and `map` refuse to start once the usage ledger shows at
 least `tokens` metered tokens inside the last `window_days` days, exiting 3. A map
 run that crosses the ceiling partway through stops there rather than waiting to be
 caught next time. The window matches `enmaas usage --since DAYS`. Enforcement adds up the
-`charge` recorded per request, which includes requests whose answer later failed
-validation; the `usage` token totals come from successful calls, so the two can
-differ by that failed work.
+`charge` recorded per request, which covers every request the gateway metered,
+including one that returned no text and one whose answer later failed
+validation. The `usage` token totals come from the token counters, which skip an
+unbatched `map` item whose answer failed validation, so the two can differ by
+that work.
 
 This lives in configuration on purpose: a standing policy you have to
 remember to type on every command is no guard at all. For a one-off run against different settings, the
@@ -340,9 +346,10 @@ The summary shows totals and breakdowns by model and by command. Models with a
 anything else is reported as unpriced.
 
 Set `ENMAAS_NO_USAGE_LOG=1` to turn recording off. A ledger that cannot be
-written is reported with a warning and your command still completes. With a
-`[budget]` configured, the command refuses to start when the ledger cannot be
-read or recording is disabled, because it cannot know what has been spent.
+written never stops your command. With a `[budget]` configured you also get a
+warning that the run will not count against the ceiling, and the command refuses
+to start when the ledger cannot be read or recording is disabled, because it
+cannot know what has been spent.
 
 ### Counting work this CLI did not do
 
@@ -355,8 +362,9 @@ enmaas record --model rits/zai-org/glm-5-3 --command bug-hunt \
 ```
 
 `--command` names whatever did the work. Add `--cached` and `--reasoning` when
-you have them, and `--status error --error-kind GatewayError` for a run that
-failed.
+you have them, `--dialect anthropic` when the call used that API shape (the
+default is `openai`), and `--status error --error-kind GatewayError` for a run
+that failed.
 
 ## Output protection
 

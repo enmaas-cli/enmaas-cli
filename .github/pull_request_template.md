@@ -18,7 +18,7 @@ make check
 ## Checklist
 
 - [ ] `make check` passes locally
-- [ ] CI is green on 3.11, 3.12 and 3.13
+- [ ] CI is green on 3.11 through 3.14
 - [ ] New behaviour has a test that fails without the change
 - [ ] No credential, prompt or response content added to logs or the ledger
 - [ ] No em dashes in prose
