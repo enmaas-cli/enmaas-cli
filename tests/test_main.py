@@ -1,3 +1,4 @@
+import importlib.metadata
 from pathlib import Path
 
 import pytest
@@ -51,3 +52,26 @@ def test_batch_default_is_unset_until_the_template_is_read() -> None:
         ["map", "--items", "i.jsonl", "--template", "t.txt", "--outdir", "out"]
     )
     assert args.batch is None
+
+
+def test_version_prints_package_version_and_exits_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["--version"])
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out == f"enmaas {importlib.metadata.version('enmaas-cli')}\n"
+
+
+def test_version_falls_back_when_package_metadata_is_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def missing(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    # cli.package_version looks up importlib.metadata.version at call time.
+    monkeypatch.setattr(importlib.metadata, "version", missing)
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["--version"])
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out == "enmaas 0+unknown\n"
