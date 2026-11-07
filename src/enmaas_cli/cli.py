@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import enum
+import importlib.metadata
 import json
 import os
 import sys
@@ -169,8 +170,16 @@ def _resolve_dialect_override(model: str, flag: Dialect | None, config: Config) 
     return None
 
 
+def package_version() -> str:
+    try:
+        return importlib.metadata.version("enmaas-cli")
+    except importlib.metadata.PackageNotFoundError:
+        return "0+unknown"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = Parser(prog="enmaas")
+    parser.add_argument("--version", action="version", version=f"enmaas {package_version()}")
     parser.add_argument("--key-file", type=Path)
     parser.add_argument("--config", type=Path)
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
