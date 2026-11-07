@@ -12,12 +12,13 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-PLUGIN = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PLUGIN / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from enmaas_cli.outputs import allow_read, is_protected, protect  # noqa: E402
 
@@ -25,6 +26,10 @@ HEAD = "ENMAAS_PREVIEW_HEAD_41857"
 TAIL = "ENMAAS_PROTECTED_TAIL_41857"
 PUBLIC = "ENMAAS_PUBLIC_SOURCE_41857"
 DENIAL = "enmaas containment:"
+HOOK_ERROR = "could not check tool input"
+HOOKS_FILE = ROOT / "hooks" / "hooks.json"
+GUARD = ROOT / "hooks" / "pre-tool-use.py"
+HOOK_TEMPLATE = 'python3 -S "${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use.py"'
 CASES = (
     "read",
     "shell-read",
@@ -76,12 +81,12 @@ def tool_output(body: dict[str, Any], host: str) -> list[str]:
 
 def anthropic_events(body: dict[str, Any], tool: str, args: dict[str, Any]) -> list[dict[str, Any]]:
     done = bool(tool_output(body, "claude"))
-    block = (
+    block: dict[str, Any] = (
         {"type": "text", "text": "Fixture complete."}
         if done
         else {"type": "tool_use", "id": "toolu_fixture", "name": tool, "input": args}
     )
-    message = {
+    message: dict[str, Any] = {
         "id": "msg_fixture",
         "type": "message",
         "role": "assistant",
@@ -91,7 +96,8 @@ def anthropic_events(body: dict[str, Any], tool: str, args: dict[str, Any]) -> l
         "stop_sequence": None,
         "usage": {"input_tokens": 1, "output_tokens": 0},
     }
-    start = dict(block, **({"text": ""} if done else {"input": {}}))
+    empty: dict[str, Any] = {"text": ""} if done else {"input": {}}
+    start = {**block, **empty}
     delta = (
         {"type": "text_delta", "text": block["text"]}
         if done
@@ -164,7 +170,121 @@ def responses_events(
     ]
 
 
-def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
+class HookConfigError(Exception):
+    """A supplied settings or config file does not hold usable PreToolUse hooks."""
+
+
+def repo_hook_groups() -> list[dict[str, Any]]:
+    """Return the repository's PreToolUse groups registered against this checkout.
+
+    The command is rebuilt with shell quoting so a checkout path holding shell
+    characters such as $, a double quote or a backtick reaches the guard as is.
+    """
+    config = json.loads(HOOKS_FILE.read_text(encoding="utf-8"))
+    groups: list[dict[str, Any]] = config["hooks"]["PreToolUse"]
+    command = "python3 -S " + shlex.quote(str(GUARD))
+    for group in groups:
+        for handler in group["hooks"]:
+            if handler["command"] != HOOK_TEMPLATE:
+                raise HookConfigError(
+                    f"{HOOKS_FILE}: unexpected hook command {handler['command']!r};"
+                    f" expected {HOOK_TEMPLATE!r}"
+                )
+            handler["command"] = command
+    return groups
+
+
+def installed_claude_groups(settings: Path) -> list[Any]:
+    """Return hooks.PreToolUse from a Claude Code settings file, and nothing else.
+
+    Only the hook list is used, so an env block or other hooks in the file
+    cannot point the run at a real service or run unrelated commands.
+    """
+    try:
+        config = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HookConfigError(f"{settings}: cannot read settings: {exc}") from exc
+    hooks = config.get("hooks") if isinstance(config, dict) else None
+    groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    if not isinstance(groups, list):
+        raise HookConfigError(f"{settings}: no hooks.PreToolUse list")
+    return groups
+
+
+def installed_codex_groups(config_path: Path) -> list[Any]:
+    """Return hooks.PreToolUse from a Codex config file.
+
+    A missing hooks table or PreToolUse key means no hooks, so a hook-free
+    config runs and its denial cases fail.
+    """
+    try:
+        with config_path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HookConfigError(f"{config_path}: cannot read config: {exc}") from exc
+    hooks = config.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise HookConfigError(f"{config_path}: hooks must be a table")
+    groups = hooks.get("PreToolUse", [])
+    if not isinstance(groups, list):
+        raise HookConfigError(f"{config_path}: hooks.PreToolUse must be an array of tables")
+    return groups
+
+
+def claude_settings_file(root: Path, groups: list[Any] | None) -> Path:
+    """Write the case-local settings file that holds only the PreToolUse hooks."""
+    generated = root / ".host-check-settings.json"
+    hooks = repo_hook_groups() if groups is None else groups
+    generated.write_text(
+        json.dumps({"hooks": {"PreToolUse": hooks}}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return generated
+
+
+def toml_string(value: str) -> str:
+    """Return value as a TOML basic string."""
+    # JSON string escapes are valid in TOML basic strings. ensure_ascii=False
+    # keeps characters above U+FFFF whole, since TOML rejects surrogate escapes.
+    # JSON leaves DEL unescaped and TOML does not allow it raw.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def toml_key(key: str) -> str:
+    """Return key as a bare TOML key when it can be one, otherwise quoted."""
+    if key and all(char.isascii() and (char.isalnum() or char in "-_") for char in key):
+        return key
+    return toml_string(key)
+
+
+def toml_value(value: Any) -> str:
+    """Return value as an inline TOML value, keeping its type."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return toml_string(value)
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{toml_key(k)} = {toml_value(v)}" for k, v in value.items()) + "}"
+    raise HookConfigError(f"cannot pass hook value of type {type(value).__name__} to Codex")
+
+
+def codex_hook_override(groups: list[Any]) -> str:
+    """Return a Codex -c value that sets hooks.PreToolUse to groups as given."""
+    return "hooks.PreToolUse=" + toml_value(groups)
+
+
+def run_case(
+    host: str,
+    case: str,
+    root: Path,
+    groups: list[Any] | None = None,
+    registration: str = "generated-from-hooks.json",
+) -> dict[str, Any]:
+    """Run one case. groups is the PreToolUse list to register; None means the repo's."""
     root.mkdir(parents=True, exist_ok=False)
     nested = root / "nested"
     nested.mkdir()
@@ -185,8 +305,8 @@ def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
     executable = root / "enmaas"
     executable.write_text(
         "#!/bin/sh\n"
-        + "PYTHONPATH="
-        + shlex.quote(str(PLUGIN / "src"))
+        + "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="
+        + shlex.quote(str(ROOT / "src"))
         + " exec "
         + shlex.quote(sys.executable)
         + " -c 'from enmaas_cli.cli import main; raise SystemExit(main())' \"$@\"\n",
@@ -330,9 +450,13 @@ def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
         ANTHROPIC_API_KEY="local-fixture-key",
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
         DISABLE_AUTOUPDATER="1",
+        # Keep Python children from writing bytecode caches into the source tree.
+        PYTHONDONTWRITEBYTECODE="1",
     )
     if host == "claude":
-        registration = "plugin-dir"
+        # --setting-sources "" turns off the user, project and local settings
+        # files, so only the file given to --settings registers hooks.
+        settings = claude_settings_file(root, groups)
         cmd = [
             "claude",
             "-p",
@@ -341,8 +465,8 @@ def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
             "claude-sonnet-4-5",
             "--setting-sources",
             "",
-            "--plugin-dir",
-            str(PLUGIN),
+            "--settings",
+            str(settings),
             "--strict-mcp-config",
             "--mcp-config",
             '{"mcpServers":{}}',
@@ -358,26 +482,13 @@ def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
             "--verbose",
         ]
     else:
-        # Load the bundled hooks as project configuration. This checks the host
-        # decision path; marketplace installation and its trust UI are separate.
-        registration = "bundled-hooks-config"
-        config = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-        groups = config["hooks"]["PreToolUse"]
-        entries = []
-        for group in groups:
-            handlers = []
-            for handler in group["hooks"]:
-                hook_command = handler["command"].replace("${CLAUDE_PLUGIN_ROOT}", str(PLUGIN))
-                handlers.append(
-                    '{type="command", command=' + json.dumps(hook_command) + ", timeout=5}"
-                )
-            entries.append(
-                "{matcher="
-                + json.dumps(group.get("matcher", "*"))
-                + ", hooks=["
-                + ",".join(handlers)
-                + "]}"
-            )
+        # Pass the hooks as a config override with the user config ignored.
+        # This checks the host decision path; hook trust prompts are separate.
+        hook_override = codex_hook_override(repo_hook_groups() if groups is None else groups)
+        # Keep Codex state for this case under the case root.
+        codex_home = root / "codex-home"
+        codex_home.mkdir()
+        env["CODEX_HOME"] = str(codex_home)
         cmd = [
             "codex",
             "--no-daemon",
@@ -405,7 +516,7 @@ def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
             "-c",
             "model_providers.fixture.requires_openai_auth=false",
             "-c",
-            "hooks.PreToolUse=[" + ",".join(entries) + "]",
+            hook_override,
             "Run the local file fixture.",
         ]
     started = time.monotonic()
@@ -436,7 +547,10 @@ def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
     (root / "stdout.log").write_text(stdout, encoding="utf-8")
     (root / "stderr.log").write_text(stderr, encoding="utf-8")
     text = "\n".join(outputs)
-    denied = DENIAL in text
+    # The guard's internal-error fallback also starts with the denial prefix.
+    # It counts as a hook error, so a case cannot pass on a broken guard.
+    hook_error = DENIAL in text and HOOK_ERROR in text
+    denied = DENIAL in text and not hook_error
     expected_denial = case not in {
         "ordinary-file",
         "metadata",
@@ -474,6 +588,7 @@ def run_case(host: str, case: str, root: Path) -> dict[str, Any]:
         "timed_out": timed_out,
         "requests": request_count,
         "denial_received": denied,
+        "hook_error": hook_error,
         "full_answer_received": TAIL in text,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
@@ -486,7 +601,40 @@ def main() -> int:
     parser.add_argument("--host", choices=["claude", "codex", "both"], default="both")
     parser.add_argument("--case", choices=CASES, action="append")
     parser.add_argument("--outdir", type=Path, required=True)
+    parser.add_argument(
+        "--claude-settings",
+        type=Path,
+        help="Claude Code settings.json to take hooks.PreToolUse from, such as install.sh wrote",
+    )
+    parser.add_argument(
+        "--codex-config",
+        type=Path,
+        help="Codex config.toml to take hooks.PreToolUse from, such as one install.sh wrote",
+    )
     args = parser.parse_args()
+    for option, path in (
+        ("--claude-settings", args.claude_settings),
+        ("--codex-config", args.codex_config),
+    ):
+        if path is not None and not path.is_file():
+            parser.error(f"{option}: no such file: {path}")
+    claude_settings = args.claude_settings.resolve() if args.claude_settings else None
+    codex_config = args.codex_config.resolve() if args.codex_config else None
+    try:
+        sources = {
+            "claude": (
+                (installed_claude_groups(claude_settings), f"claude-settings:{claude_settings}")
+                if claude_settings
+                else (repo_hook_groups(), "claude-settings:generated-from-hooks.json")
+            ),
+            "codex": (
+                (installed_codex_groups(codex_config), f"codex-config:{codex_config}")
+                if codex_config
+                else (repo_hook_groups(), "codex-config:generated-from-hooks.json")
+            ),
+        }
+    except HookConfigError as exc:
+        parser.error(str(exc))
     root = args.outdir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     results = []
@@ -494,7 +642,8 @@ def main() -> int:
         for case in args.case or CASES:
             if host == "claude" and case == "workdir-read":
                 continue
-            result = run_case(host, case, root / host / case)
+            groups, registration = sources[host]
+            result = run_case(host, case, root / host / case, groups, registration)
             results.append(result)
             print(json.dumps(result), flush=True)
     (root / "results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
