@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-labelledby="t d">
+  <title id="t">The output guard</title>
+  <desc id="d">An assistant that tries to read a protected answer file is denied. It can preview a bounded prefix with enmaas inspect, or a person can grant a full read with enmaas allow-read.</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker>
+    <marker id="ared" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b91c1c"/></marker>
+    <marker id="agreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/></marker>
+    <style>
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 14; }
+      .file { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; }
+      .t { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
+      .h { font-size: 22px; font-weight: 600; }
+      .s { font-size: 15px; fill: #475569; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }
+      .deny { stroke: #b91c1c; stroke-width: 2.5; fill: none; marker-end: url(#ared); }
+      .ok { stroke: #15803d; stroke-width: 2.5; fill: none; marker-end: url(#agreen); }
+      .neutral { stroke: #475569; stroke-width: 2; fill: none; marker-end: url(#a); }
+    </style>
+  </defs>
+  <rect width="1200" height="360" fill="#f8fafc"/>
+
+  <rect class="box" x="40" y="120" width="240" height="120"/>
+  <text class="t h" x="160" y="170" text-anchor="middle">Assistant</text>
+  <text class="t s" x="160" y="198" text-anchor="middle">Read, Grep, cat, sed, jq ...</text>
+
+  <rect class="box" x="470" y="40" width="260" height="90" style="stroke:#b91c1c"/>
+  <text class="t h" x="600" y="78" text-anchor="middle">PreToolUse guard</text>
+  <text class="t s" x="600" y="104" text-anchor="middle">python3 -S, stdlib only</text>
+
+  <rect class="file" x="920" y="120" width="240" height="120"/>
+  <text class="t h" x="1040" y="170" text-anchor="middle">Answer file</text>
+  <text class="t mono" x="1040" y="198" text-anchor="middle" fill="#334155">out/f001.md</text>
+
+  <!-- denied read -->
+  <path class="deny" d="M 280 150 C 360 150, 400 85, 468 85"/>
+  <text class="t mono" x="300" y="128" fill="#b91c1c">read the whole file</text>
+  <text class="t mono" x="745" y="72" fill="#b91c1c">denied</text>
+  <text class="t s" x="745" y="96">enmaas containment: ...</text>
+
+  <!-- inspect -->
+  <path class="ok" d="M 280 190 L 918 190"/>
+  <text class="t mono" x="600" y="180" text-anchor="middle" fill="#15803d">enmaas inspect PATH</text>
+  <text class="t s" x="600" y="214" text-anchor="middle">first 2,000 characters, always allowed</text>
+
+  <!-- allow-read by a person -->
+  <rect class="box" x="470" y="262" width="260" height="70"/>
+  <text class="t h" x="600" y="292" text-anchor="middle" style="font-size:18px">You, in your terminal</text>
+  <text class="t mono" x="600" y="318" text-anchor="middle">enmaas allow-read PATH</text>
+  <path class="neutral" d="M 730 297 C 820 297, 860 240, 918 240"/>
+  <text class="t s" x="840" y="282">grants one full read</text>
+  <path class="neutral" d="M 280 220 C 360 220, 400 297, 468 297"/>
+  <text class="t s" x="300" y="262">asks you</text>
+</svg>

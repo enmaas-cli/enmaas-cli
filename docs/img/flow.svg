@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="0 0 1200 420" width="1200" height="420" role="img" aria-labelledby="t d">
+  <title id="t">How enmaas works</title>
+  <desc id="d">An assistant or a person runs enmaas. enmaas sends the prompt to the EnMaaS gateway, writes the answer to a file, and returns only a short receipt.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 14; }
+      .accent { fill: #eff6ff; stroke: #2563eb; stroke-width: 2; }
+      .file { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; }
+      .t { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
+      .h { font-size: 22px; font-weight: 600; }
+      .s { font-size: 15px; fill: #475569; }
+      .l { font-size: 14px; fill: #334155; }
+      .arrow { stroke: #475569; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; fill: #0f172a; }
+    </style>
+  </defs>
+  <rect width="1200" height="420" fill="#f8fafc"/>
+
+  <!-- Caller -->
+  <rect class="box" x="40" y="130" width="250" height="150"/>
+  <text class="t h" x="165" y="178" text-anchor="middle">Assistant or you</text>
+  <text class="t s" x="165" y="206" text-anchor="middle">Claude Code, Codex,</text>
+  <text class="t s" x="165" y="228" text-anchor="middle">or a shell</text>
+
+  <!-- enmaas -->
+  <rect class="box accent" x="400" y="110" width="280" height="190"/>
+  <text class="t h" x="540" y="158" text-anchor="middle">enmaas</text>
+  <text class="t mono" x="540" y="190" text-anchor="middle">ask   one prompt, one file</text>
+  <text class="t mono" x="540" y="214" text-anchor="middle">map   N items, N files</text>
+  <text class="t s" x="540" y="248" text-anchor="middle">batches, retries, breaker,</text>
+  <text class="t s" x="540" y="270" text-anchor="middle">budgets, usage ledger</text>
+
+  <!-- Gateway -->
+  <rect class="box" x="900" y="40" width="260" height="130"/>
+  <text class="t h" x="1030" y="88" text-anchor="middle">EnMaaS gateway</text>
+  <text class="t s" x="1030" y="116" text-anchor="middle">Claude, GPT, Gemini,</text>
+  <text class="t s" x="1030" y="138" text-anchor="middle">free open-weight models</text>
+
+  <!-- File -->
+  <rect class="file" x="900" y="240" width="260" height="130"/>
+  <text class="t h" x="1030" y="288" text-anchor="middle">Answer file</text>
+  <text class="t s" x="1030" y="316" text-anchor="middle">protected on disk,</text>
+  <text class="t s" x="1030" y="338" text-anchor="middle">never pasted into context</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M 290 190 L 398 190"/>
+  <text class="t l" x="344" y="178" text-anchor="middle">prompt</text>
+
+  <path class="arrow" d="M 680 170 C 760 170, 800 105, 898 105"/>
+  <text class="t l" x="790" y="120" text-anchor="middle">request</text>
+
+  <path class="arrow" d="M 680 240 C 760 240, 800 305, 898 305"/>
+  <text class="t l" x="790" y="330" text-anchor="middle">writes the answer</text>
+
+  <path class="arrow" d="M 400 260 C 350 260, 330 230, 292 230"/>
+  <text class="t l" x="344" y="282" text-anchor="middle">receipt only</text>
+
+  <text class="t mono" x="60" y="340">enmaas ask ok   model rits/zai-org/glm-5-3 (default)   tokens in 14 out 2   preview OK</text>
+  <text class="t s" x="60" y="368">The receipt is the whole thing the session sees. The answer stays in the file.</text>
+</svg>
