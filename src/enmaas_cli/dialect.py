@@ -294,12 +294,32 @@ def _utf8_safe(text: str) -> tuple[str, int]:
     return text, 0
 
 
+def _count(value: object) -> int | None:
+    """Return a token count only when it is a non-negative integer.
+
+    The gateway's usage numbers flow into error messages, receipts, the
+    --json object and the usage ledger. A string there was copied through
+    unchanged, so a 9,000 character value grew every one of those, and
+    "abc" was recorded as an input count. A bool is an int subclass in
+    Python, so it is excluded by name.
+    """
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _object(value: object) -> dict[str, Any]:
+    # A usage block that is a string or a list would otherwise raise
+    # AttributeError on .get, outside every handler.
+    return value if isinstance(value, dict) else {}
+
+
 def _parse_openai(data: dict[str, Any]) -> Completion:
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
-    usage = data.get("usage") or {}
-    details = usage.get("completion_tokens_details") or {}
-    prompt_details = usage.get("prompt_tokens_details") or {}
+    usage = _object(data.get("usage"))
+    details = _object(usage.get("completion_tokens_details"))
+    prompt_details = _object(usage.get("prompt_tokens_details"))
     text, text_replaced = _utf8_safe(message.get("content") or "")
     reasoning, reasoning_replaced = _utf8_safe(
         message.get("reasoning_content") or message.get("reasoning") or ""
@@ -311,10 +331,10 @@ def _parse_openai(data: dict[str, Any]) -> Completion:
         stop=choice.get("finish_reason"),
         usage=Usage(
             # prompt_tokens already includes the cached portion.
-            input_tokens=usage.get("prompt_tokens"),
-            cached_tokens=prompt_details.get("cached_tokens"),
-            output_tokens=usage.get("completion_tokens"),
-            reasoning_tokens=details.get("reasoning_tokens"),
+            input_tokens=_count(usage.get("prompt_tokens")),
+            cached_tokens=_count(prompt_details.get("cached_tokens")),
+            output_tokens=_count(usage.get("completion_tokens")),
+            reasoning_tokens=_count(details.get("reasoning_tokens")),
         ),
     )
 
@@ -323,11 +343,11 @@ def _parse_anthropic(data: dict[str, Any]) -> Completion:
     import json as json_module
 
     blocks = data.get("content") or []
-    usage = data.get("usage") or {}
+    usage = _object(data.get("usage"))
 
-    base = usage.get("input_tokens")
-    cache_read = usage.get("cache_read_input_tokens")
-    cache_write = usage.get("cache_creation_input_tokens")
+    base = _count(usage.get("input_tokens"))
+    cache_read = _count(usage.get("cache_read_input_tokens"))
+    cache_write = _count(usage.get("cache_creation_input_tokens"))
     # input_tokens EXCLUDES cached tokens on this dialect, so sum what is present.
     total_input: int | None
     if base is None and cache_read is None and cache_write is None:
@@ -359,7 +379,7 @@ def _parse_anthropic(data: dict[str, Any]) -> Completion:
         usage=Usage(
             input_tokens=total_input,
             cached_tokens=cache_read,
-            output_tokens=usage.get("output_tokens"),
+            output_tokens=_count(usage.get("output_tokens")),
             reasoning_tokens=None,
         ),
     )

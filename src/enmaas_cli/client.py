@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -10,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from .auth import REDACTION, redact
 from .dialect import Request
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -18,6 +20,10 @@ GATEWAY_CEILING_NEAR = 270.0
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_FACTOR = 2.0
 JITTER_FRACTION = 0.5
+# A gateway or proxy that sends a huge Retry-After would otherwise stall the
+# run for as long as it asks.
+MAX_RETRY_AFTER_SECONDS = 60.0
+ERROR_BODY_CHARS = 500
 
 SleepFn = Callable[[float], Awaitable[None]]
 
@@ -50,9 +56,27 @@ def _retry_after(response: httpx.Response) -> float | None:
     if raw is None:
         return None
     try:
-        return float(raw)
+        wait = float(raw)
     except ValueError:
         return None
+    # NaN fails every comparison, so it would pass a plain min() unchanged.
+    if math.isnan(wait):
+        return None
+    return min(max(wait, 0.0), MAX_RETRY_AFTER_SECONDS)
+
+
+def _error_detail(body: str, secret: str) -> str:
+    """Redact the key from an error body, then cut it to a bounded length.
+
+    The cut never splits the placeholder, so a reader can still see that a
+    key was removed.
+    """
+    redacted = redact(body, secret)
+    cut = ERROR_BODY_CHARS
+    start = redacted.find(REDACTION, max(0, cut - len(REDACTION) + 1))
+    if 0 <= start < cut:
+        cut = start + len(REDACTION)
+    return redacted[:cut]
 
 
 def _backoff(attempt: int) -> float:
@@ -69,8 +93,14 @@ async def call(
     retries: int,
     sleep: SleepFn = asyncio.sleep,
     elapsed_fn: Callable[[], float] | None = None,
+    secret: str = "",
 ) -> dict[str, Any]:
-    """POST a built request, retrying service faults. Returns the parsed JSON."""
+    """POST a built request, retrying service faults. Returns the parsed JSON.
+
+    When `secret` is set, every copy of it in an error body is replaced
+    before the body is cut to length. Redacting after the cut missed a key
+    that straddled the cut, and the part before it survived.
+    """
     last_status: int | None = None
     last_detail = ""
     started = time.monotonic()
@@ -102,7 +132,7 @@ async def call(
             if response.status_code == 200:
                 return dict(response.json())
             last_status = response.status_code
-            last_detail = response.text[:500]
+            last_detail = _error_detail(response.text, secret)
             if not is_retryable(response.status_code, _elapsed()):
                 hint = ""
                 if response.status_code == 504:

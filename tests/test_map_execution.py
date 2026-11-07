@@ -194,16 +194,16 @@ async def test_resume_skips_completed_items(tmp_path: Path) -> None:
 
 
 async def test_write_failure_is_recorded_not_raised(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    from pathlib import Path as PathClass
+    from enmaas_cli import outputs
 
-    original_write = PathClass.write_text
+    original_write = outputs.write_output
 
-    def failing_write(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if self.name == "i1.md":
+    def failing_write(path: Path, text: str) -> None:
+        if path.name == "i1.md":
             raise OSError("disk full")
-        return original_write(self, *args, **kwargs)
+        original_write(path, text)
 
-    monkeypatch.setattr(PathClass, "write_text", failing_write)
+    monkeypatch.setattr("enmaas_cli.runner.write_output", failing_write)
     outcome = await _run(tmp_path, lambda r: httpx.Response(200, json=OK), count=3)
     assert outcome.failed == 1
     assert outcome.ok == 2

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from pathlib import Path
 REDACTION = "***REDACTED***"
 ENV_VAR = "ENMAAS_KEY"
 DEFAULT_RELATIVE_PATH = Path(".secrets") / "enmaas"
+MAX_KEY_FILE_BYTES = 4096
 
 
 class AuthError(Exception):
@@ -35,13 +37,38 @@ def _unreadable(exc: OSError, path: Path) -> AuthError:
     return AuthError(f"key file is not readable ({exc.strerror or exc}): {path}")
 
 
+def _read_bounded(descriptor: int) -> bytes:
+    data = b""
+    while len(data) <= MAX_KEY_FILE_BYTES:
+        chunk = os.read(descriptor, MAX_KEY_FILE_BYTES + 1 - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
 def _read_key_file(path: Path) -> str:
     # A directory, a file without read permission, or binary content would
     # otherwise escape as a traceback, because callers only catch AuthError.
+    # A named pipe or a device would block the read forever, and a large
+    # file would be read whole into memory, so only a small regular file
+    # is accepted. The nonblocking open returns at once even for a pipe.
     try:
         if not path.exists():
             raise AuthError(f"key file does not exist: {path}")
-        value = path.read_text(encoding="utf-8").strip()
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            mode = os.fstat(descriptor).st_mode
+            if stat.S_ISDIR(mode):
+                raise AuthError(f"key file is a directory: {path}")
+            if not stat.S_ISREG(mode):
+                raise AuthError(f"key file is not a regular file: {path}")
+            raw = _read_bounded(descriptor)
+        finally:
+            os.close(descriptor)
+        if len(raw) > MAX_KEY_FILE_BYTES:
+            raise AuthError(f"key file is too large to be a key: {path}")
+        value = raw.decode("utf-8").strip()
     except IsADirectoryError:
         raise AuthError(f"key file is a directory: {path}") from None
     except UnicodeDecodeError:

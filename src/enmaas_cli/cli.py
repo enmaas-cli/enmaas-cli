@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import enum
 import importlib.metadata
+import ipaddress
 import json
 import os
 import sys
@@ -34,7 +35,14 @@ from .dialect import (
     parse_response,
     resolve_dialect,
 )
-from .outputs import MAX_INSPECT_CHARS, allow_read, inspect_file, protect, state_root
+from .outputs import (
+    MAX_INSPECT_CHARS,
+    allow_read,
+    inspect_file,
+    protect,
+    state_root,
+    write_output,
+)
 from .receipts import ask_receipt, create_run_dir, map_receipt, prune_runs
 from .runner import run_map
 from .schema import ValidationError, load_schema, validate_against_schema
@@ -346,7 +354,7 @@ async def run_ask(
 
     started = time.monotonic()
     try:
-        data = await call(client, base_url, request, timeout=timeout, retries=retries)
+        data = await call(client, base_url, request, timeout=timeout, retries=retries, secret=key)
         completion = parse_response(data, resolved)
     except (GatewayError, EmptyResponseError) as exc:
         elapsed = time.monotonic() - started
@@ -374,7 +382,7 @@ async def run_ask(
             elapsed = time.monotonic() - started
             error_msg = str(exc)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(completion.text, encoding="utf-8")
+            write_output(path, completion.text)
             # The altered response is still written to disk above, so the
             # repair has to be reported even on the failure path. Without
             # this, a schema error would be the only thing mentioned while
@@ -404,9 +412,9 @@ async def run_ask(
 
     elapsed = time.monotonic() - started
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(completion.text, encoding="utf-8")
+    write_output(path, completion.text)
     if save_thinking and completion.reasoning:
-        (run_dir / "thinking.md").write_text(completion.reasoning, encoding="utf-8")
+        write_output(run_dir / "thinking.md", completion.reasoning)
 
     return AskResult(
         receipt=ask_receipt(
@@ -562,6 +570,18 @@ def resolve_base_url(configured: str | None, env: Mapping[str, str], config_path
     return _validate_gateway_url(url)
 
 
+def _is_loopback(host: str | None) -> bool:
+    if host is None:
+        # A missing host is reported by its own check below.
+        return True
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _validate_gateway_url(url: str) -> str:
     def invalid(reason: str) -> ValueError:
         return ValueError(f"gateway URL is not valid ({reason}): {url}")
@@ -575,6 +595,11 @@ def _validate_gateway_url(url: str) -> str:
         raise invalid("missing host") from None
     if parts.scheme.lower() not in {"http", "https"}:
         raise invalid("scheme must be http or https")
+    # The key travels in a header, so cleartext http would send it across
+    # the network readable to anyone on the path. A local gateway or
+    # tunnel is the only place where that is safe.
+    if parts.scheme.lower() == "http" and not _is_loopback(parts.hostname):
+        raise invalid("http is only allowed for localhost, use https")
     # Checked on the raw text: "https://h?" has an empty query, yet the
     # appended request path would still land after the "?".
     if "?" in url or "#" in url:
