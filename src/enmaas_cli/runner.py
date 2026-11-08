@@ -26,7 +26,7 @@ from .dialect import (
     resolve_dialect,
     thinking_off_payload,
 )
-from .outputs import protect
+from .outputs import protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
 
 # ValidationError moved to .schema; re-exported so existing importers keep working.
@@ -305,7 +305,12 @@ async def run_map(
     skips = resume_skips(outdir) if resume else set()
     pending = [i for i in items if str(i["id"]) not in skips]
     for item in pending:
-        protect(outdir / f"{item['id']}.md")
+        target = outdir / f"{item['id']}.md"
+        # A link here would stop the whole run before any request. Leave it
+        # unprotected; write_output refuses it later and only that item fails.
+        if target.is_symlink():
+            continue
+        protect(target)
 
     resolved = resolve_dialect(model, dialect)
     if not thinking:
@@ -382,7 +387,9 @@ async def run_map(
             # must include requests that cost money and then failed.
             charge = 0
             try:
-                data = await call(client, base_url, request, timeout=timeout, retries=retries)
+                data = await call(
+                    client, base_url, request, timeout=timeout, retries=retries, secret=key
+                )
                 completion = parse_response(data, resolved)
                 # Charge before validation and the file write. A large
                 # response a validator rejects still cost its tokens, and
@@ -391,7 +398,7 @@ async def run_map(
                 if schema is not None:
                     validate_against_schema(completion.text, schema)
                 path = outdir / f"{item_id}.md"
-                path.write_text(completion.text, encoding="utf-8")
+                write_output(path, completion.text)
                 counts["in"] += completion.usage.input_tokens or 0
                 counts["out"] += completion.usage.output_tokens or 0
                 counts["cached"] += completion.usage.cached_tokens or 0
@@ -481,7 +488,9 @@ async def run_map(
             rows: list[dict[str, Any]] = []
             charge = 0
             try:
-                data = await call(client, base_url, request, timeout=timeout, retries=retries)
+                data = await call(
+                    client, base_url, request, timeout=timeout, retries=retries, secret=key
+                )
                 completion = parse_response(data, resolved)
                 # Before split_batch_response, so a reply this group cannot
                 # be split out of is still charged.
@@ -535,7 +544,7 @@ async def run_map(
                     if schema is not None:
                         validate_against_schema(text, schema)
                     path = outdir / f"{item_id}.md"
-                    path.write_text(text, encoding="utf-8")
+                    write_output(path, text)
                 except (ValidationError, OSError) as exc:
                     message = redact(str(exc), key)
                     rows.append(

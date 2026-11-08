@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import secrets
 import shutil
 import time
@@ -20,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .runner import MapOutcome
 
 PREVIEW_LIMIT = 160
+_RUN_NAME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{4}")
 
 
 def create_run_dir(root: Path) -> Path:
@@ -37,11 +39,22 @@ def create_run_dir(root: Path) -> Path:
 
 
 def prune_runs(root: Path, *, max_age_days: int = 30) -> None:
-    """Delete old run directories. Never fatal: housekeeping must not block work."""
+    """Delete old run directories. Never fatal: housekeeping must not block work.
+
+    Only children named the way create_run_dir names them are removed.
+    Without that, a runs root that a link or a mistaken XDG_STATE_HOME
+    pointed at some other directory lost every subdirectory older than the
+    cutoff. A root reached through a link is skipped entirely for the same
+    reason.
+    """
     cutoff = time.time() - (max_age_days * 86400)
     with contextlib.suppress(OSError):
+        if root.is_symlink() or any(parent.is_symlink() for parent in root.parents):
+            return
         for child in root.iterdir():
-            if not child.is_dir():
+            if not _RUN_NAME.fullmatch(child.name):
+                continue
+            if child.is_symlink() or not child.is_dir():
                 continue
             with contextlib.suppress(OSError):
                 if child.stat().st_mtime < cutoff:

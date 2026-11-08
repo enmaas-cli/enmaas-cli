@@ -35,7 +35,7 @@ organization gives you its URL and your key.
 | **Free where free is enough** | On an 80-item rule-checking task scored against ground truth, the free default model matched in-session Opus (98.8% accuracy) for 95% less. The cheapest paid Claude model did worse and cost more. Price does not order capability, so the tool measures and you choose. |
 | **Context stays small** | A 150,000-token file is summarised without a token of it entering the session. Every later step is cheaper, because every tool call re-sends the whole conversation. |
 | **Bulk without the multiplier** | When an assistant loops over a list, each item carries the entire conversation. `enmaas map` sends items on their own, several at once, and batches shared instructions. |
-| **A guard, not a guideline** | A `PreToolUse` hook for Claude Code and Codex denies reading a delegated answer back. The assistant previews a bounded prefix; you decide when it may read the whole thing. |
+| **A guard with a default of deny** | A `PreToolUse` hook for Claude Code and Codex denies the assistant's ordinary reads of a delegated answer. The assistant previews a bounded prefix; you decide when it may read the whole thing. |
 
 One task class was measured. Treat the numbers as evidence to check against your
 own work, and run `enmaas usage` to see what yours costs.
@@ -95,11 +95,15 @@ enmaas usage --since 30          # what you have spent
 
 Delegating saves little if the assistant reads the answer straight back. The
 guard denies reads of protected answer files through the hosts' file tools and
-the common shell readers, including through pipelines and globs. Receipts and
-every other file stay readable. It runs with `python3 -S` from two
-standard-library-only modules, so it needs nothing installed. The skill tells the
-assistant to respect a denial and ask you instead. Coverage and limits are in
-[output protection](skills/enmaas/references/output-protection.md).
+the common shell readers, including through pipelines, globs, redirections and
+the file commands inside `sed` and `awk` programs. Receipts and every other file
+stay readable. It runs with `python3 -S` from two standard-library-only modules,
+answers inside a fixed time budget, and is registered so that a hook failure
+blocks the call on Claude Code. It guards against accidental reads by a
+well-behaved assistant. It is not a sandbox: an assistant that writes its own
+program to open the file, or copies the file first, is outside what it checks.
+The skill tells the assistant to respect a denial and ask you instead. Coverage
+and limits are in [output protection](skills/enmaas/references/output-protection.md).
 
 ## What the assistant is told
 

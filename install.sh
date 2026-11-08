@@ -146,6 +146,7 @@ edit_config() {
   python3 -I -B - "$@" <<'EOF'
 import contextlib
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -369,9 +370,20 @@ def claude(add):
 
     kept, first = strip_ours(groups)
     if add:
+        # Claude Code kills a hook at its timeout and, without onFailure, then
+        # runs the tool call anyway. "block" denies the call instead. Versions
+        # before 2.1.295 ignore the field. An older entry without it differs
+        # from this one, so it is rewritten in place.
         entry = {
             "matcher": matcher,
-            "hooks": [{"type": "command", "command": hook_command(), "timeout": 5}],
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": hook_command(),
+                    "timeout": 5,
+                    "onFailure": "block",
+                }
+            ],
         }
         # Keep the guard where it was if it is already registered.
         kept.insert(len(kept) if first is None else first, entry)
@@ -592,6 +604,16 @@ def trailing_comment(line):
     return ""
 
 
+def is_loopback(host):
+    """True for localhost, 127.0.0.0/8 and ::1. urlsplit has removed any brackets."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def check_url(label, url):
     """Return url with a lower-case scheme and no trailing slashes, or stop."""
     url = url.strip()
@@ -612,6 +634,10 @@ def check_url(label, url):
         fail(f"{label} must start with http:// or https://: {url}")
     if not host:
         fail(f"{label} has no host name: {url}")
+    # Over plain http, the key and every prompt and answer cross the network
+    # in clear text. That is only safe for a gateway on this machine.
+    if parts.scheme == "http" and not is_loopback(host):
+        fail(f"{label} must use https:// for a host other than localhost: {url}")
     # The key travels in a header. A user:password in the URL would be a
     # second secret that lands in logs, and the CLI refuses it too.
     if "@" in parts.netloc:

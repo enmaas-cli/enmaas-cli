@@ -24,6 +24,8 @@ from typing import Any
 
 import jsonschema
 
+_MAX_REASON_CHARS = 200
+
 
 class ValidationError(Exception):
     """A schema file could not be used, or a response did not conform to it.
@@ -43,7 +45,8 @@ def load_schema(path: Path) -> dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValidationError(f"schema file contains invalid JSON: {exc}") from exc
+        reason = _bounded(f"{exc.msg} at line {exc.lineno} column {exc.colno}")
+        raise ValidationError(f"schema file contains invalid JSON: {path} ({reason})") from exc
     if not isinstance(loaded, dict):
         raise ValidationError(
             f"schema file must contain a JSON object, found {type(loaded).__name__}: {path}"
@@ -52,8 +55,20 @@ def load_schema(path: Path) -> dict[str, Any]:
     try:
         jsonschema.Draft7Validator.check_schema(schema)
     except jsonschema.SchemaError as exc:
-        raise ValidationError(f"schema file is not a valid JSON Schema: {exc}") from exc
+        # The library message embeds the rejected schema value, so a schema
+        # with a huge string in it produced an error of the same size. Name
+        # the failed rule and where it sits instead.
+        parts = [str(part)[:32] for part in islice(exc.path, 4)]
+        rule = str(exc.validator or "schema")[:48]
+        reason = _bounded(f"{rule} constraint failed at {json.dumps(parts, ensure_ascii=True)}")
+        raise ValidationError(f"schema file is not a valid JSON Schema: {path} ({reason})") from exc
     return schema
+
+
+def _bounded(reason: str) -> str:
+    if len(reason) <= _MAX_REASON_CHARS:
+        return reason
+    return reason[: _MAX_REASON_CHARS - 3] + "..."
 
 
 def validate_against_schema(text: str, schema: dict[str, Any]) -> None:

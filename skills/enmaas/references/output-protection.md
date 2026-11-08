@@ -29,9 +29,10 @@ answers as outputs too, even when the hook would permit reading them.
 
 The hook checks Claude `Read`, content-returning `Grep`, and common literal
 shell reads in Claude Code and Codex. Shell coverage includes `cat`, `head`,
-`tail`, `sed`, `awk`, `grep`, `rg`, `jq`, and `diff`. It handles quoted paths,
-globs, home paths, brace alternatives, simple directory changes, pipelines,
-heredocs, and input redirection. Common shell keywords and execution wrappers
+`tail`, `sed`, `awk`, `grep`, `rg`, `jq`, and `diff`, and the file commands
+inside `sed` (`r`, `R`, `w`, `W`) and `awk` (`getline <`) programs. It handles
+quoted paths, globs, home paths, brace alternatives, simple directory changes,
+pipelines, heredocs, and input redirection. Common shell keywords and execution wrappers
 are checked, along with command substitutions.
 Filename-only searches and counts are allowed as metadata.
 
@@ -53,8 +54,9 @@ Unsupported readers and disabled hooks do not grant permission to read answers.
 
 For `rg`, the guard enumerates filenames using the same traversal and ignore
 options. It does not read search results. Other directory checks use a
-conservative filesystem scan. Checks stop at 250,000 entries with no wall-clock
-cutoff. Narrow a rejected search instead of switching readers or disabling
+conservative filesystem scan. Checks stop at 250,000 entries or three seconds, whichever comes first, and a
+check that stops early is a denial. On Claude Code the hook is registered with
+`onFailure: "block"`, so a hook that fails or is killed blocks the call. Narrow a rejected search instead of switching readers or disabling
 protection. Piped searches without file operands inspect their upstream command;
 they do not scan the working directory. Native Grep defaults to filename output.
 

@@ -1,16 +1,24 @@
 """Guard common literal reads against accidental answer context growth.
 
 This module does not execute shell input or provide a filesystem sandbox.
+
+Every check must finish inside a time budget. A host kills a hook that runs past
+its own timeout, and some hosts then run the tool call anyway, so a slow check
+would let the read through. When the budget runs out, the call is denied. The
+environment variable ENMAAS_GUARD_BUDGET_SECONDS can shorten the budget (tests
+use it); it cannot make the budget longer than the default.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import glob
+import math
 import os
 import re
 import shlex
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -23,6 +31,13 @@ def _words(value: str) -> set[str]:
 
 
 _MAX_SCAN_ENTRIES = 250_000
+# Hosts register the hook with a 5 second timeout. Python startup and output
+# need part of that, so the checks themselves get 3 seconds.
+_TIME_BUDGET_SECONDS = 3.0
+_BUDGET_VARIABLE = "ENMAAS_GUARD_BUDGET_SECONDS"
+# check_tool sets this from the start of each check. Nested shell substitutions
+# share it, so many small scans cannot add up to more than one budget.
+_deadline = math.inf
 _MAX_SHELL_DIRS = 32
 _SHELL_TOOLS = {"Bash", "exec_command", "shell_command", "shell"}
 _READERS = _words(
@@ -84,8 +99,8 @@ _VALUE_OPTIONS = {
     "head": {"-n", "-c", "--lines", "--bytes"},
     "tail": {"-n", "-c", "--lines", "--bytes", "--sleep-interval"},
     "sed": {"-e", "-f", "--expression", "--file"},
-    "awk": {"-F", "-v", "-f", "-e"},
-    "gawk": {"-F", "-v", "-f", "-e"},
+    "awk": {"-F", "-v", "-f", "-e", "--file", "--source"},
+    "gawk": {"-F", "-v", "-f", "-e", "--file", "--source"},
     "cut": {"-b", "-c", "-f", "-d", "--bytes", "--characters", "--fields", "--delimiter"},
     "sort": {"-k", "-t", "-S", "-o", "--key", "--field-separator", "--output"},
     "jq": {
@@ -109,6 +124,22 @@ _LITERAL_PUNCTUATION = str.maketrans(
 )
 
 
+# A sed r, R, w or W command takes the rest of its line as a file name. The
+# command letter follows the start of a line, a separator, an address, or the
+# flags of an s command, so text inside an s pattern is rarely mistaken for it.
+# The lookahead tries every position, so an early false match such as the "pr"
+# in /print/r FILE cannot hide the real command after it.
+_SED_STARTS = rf"\s;{{}}!$0-9/,{re.escape(_QUOTED_TILDE)}"
+_SED_FILE_COMMAND = re.compile(
+    rf"(?:^|(?<=[{_SED_STARTS}]))(?=[gpiImMe0-9]*[rRwW][ \t]*([^\n]+))", re.MULTILINE
+)
+# awk opens a quoted literal file with getline < "path" and runs one with
+# "path" | getline. Names held in variables are not followed.
+_AWK_GETLINE_FILE = re.compile(r'getline\b[^<"\n;]*<\s*"([^"\n]*)"')
+_AWK_PIPE_GETLINE = re.compile(r'"([^"\n]*)"\s*\|&?\s*getline\b')
+_PROGRAM_READERS = {"sed", "awk", "gawk"}
+
+
 def _shell_value(value: str) -> str:
     return value.translate(_LITERAL_PUNCTUATION)
 
@@ -121,9 +152,24 @@ def _denial(path: Path) -> str:
     )
 
 
+def _time_budget() -> float:
+    """Return the budget in seconds. The environment may only shorten it."""
+    try:
+        value = float(os.environ.get(_BUDGET_VARIABLE, ""))
+    except ValueError:
+        return _TIME_BUDGET_SECONDS
+    if not 0 <= value < _TIME_BUDGET_SECONDS:
+        return _TIME_BUDGET_SECONDS
+    return value
+
+
+def _remaining() -> float:
+    return _deadline - time.monotonic()
+
+
 def _narrow() -> str:
     return (
-        f"{_PREFIX}directory check exceeded its safe scan limit. "
+        f"{_PREFIX}directory check exceeded its safe scan limit or time budget. "
         "Use a narrow file path or smaller directory before searching content."
     )
 
@@ -150,6 +196,8 @@ def _check_path(path: Path, pattern: str | None = None) -> str | None:
     count = 0
     legacy_root = state_root().resolve()
     while pending:
+        if _remaining() <= 0:
+            return _narrow()
         directory, ancestors = pending.pop()
         canonical = directory.resolve()
         if canonical in ancestors:
@@ -164,7 +212,7 @@ def _check_path(path: Path, pattern: str | None = None) -> str | None:
         with os.scandir(directory) as entries:
             for entry in entries:
                 count += 1
-                if count > _MAX_SCAN_ENTRIES:
+                if count > _MAX_SCAN_ENTRIES or _remaining() <= 0:
                     return _narrow()
                 child = Path(entry.path)
                 if entry.is_dir():
@@ -314,8 +362,25 @@ def _reader_arguments(name: str, args: list[str]) -> Iterator[tuple[str | None, 
         index += 1
 
 
-def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None, bool]:
+def _program_paths(name: str, programs: list[str]) -> list[str]:
+    """Return the literal file names that sed or awk program text opens."""
+    paths: list[str] = []
+    for program in programs:
+        if name == "sed":
+            for match in _SED_FILE_COMMAND.finditer(program):
+                value = match[1].strip()
+                unquoted = value.strip("'\"")
+                paths.extend({value, unquoted} - {"", "-", "/dev/stdin"})
+        else:
+            for pattern in (_AWK_GETLINE_FILE, _AWK_PIPE_GETLINE):
+                paths.extend(match[1] for match in pattern.finditer(program) if match[1])
+    return paths
+
+
+def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None, bool, list[str]]:
+    """Return file operands, a search glob, metadata-only output, and program file names."""
     operands: list[str] = []
+    programs: list[str] = []
     pattern: str | None = None
     expression_given = False
     metadata = False
@@ -345,19 +410,30 @@ def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None,
                     operands.extend(values[1:])
                 elif option in {"--args", "--jsonargs"}:
                     data_arguments = True
-            elif expression_reader and option in {"-e", "--regexp", "--expression", "-f", "--file"}:
+            elif expression_reader and option in {
+                "-e",
+                "--regexp",
+                "--expression",
+                "--source",
+                "-f",
+                "--file",
+            }:
                 expression_given = True
                 if option in {"-f", "--file"}:
                     operands.extend(values)
+                elif name in _PROGRAM_READERS:
+                    programs.extend(values)
             if option in {"-g", "--glob", "--include"} and not value.startswith("!"):
                 pattern = value if pattern is None else "*"
             if name in _SEARCHERS and option in metadata_options:
                 metadata = True
         elif expression_reader and not expression_given:
             expression_given = True
+            if name in _PROGRAM_READERS:
+                programs.append(value)
         elif not data_arguments:
             operands.append(value)
-    return operands, pattern, metadata and not uncertain
+    return operands, pattern, metadata and not uncertain, _program_paths(name, programs)
 
 
 def _glob_matches(value: str, pattern: str) -> bool:
@@ -411,13 +487,25 @@ def _rg_scope(args: list[str], operands: list[str], cwd: Path) -> str | None:
             path = _path(candidate, cwd)
             if path.exists() or not glob.has_magic(str(path)):
                 expanded.append(str(path))
-            else:
-                expanded.extend(glob.glob(str(path), recursive=True))
+                continue
+            # A recursive pattern over a large tree can take as long as a scan.
+            for match in glob.iglob(str(path), recursive=True):
+                if _remaining() <= 0:
+                    return _narrow()
+                expanded.append(match)
     if not expanded:
         return None
     command.extend(["--", *expanded])
+    remaining = _remaining()
+    if remaining <= 0:
+        return _narrow()
     try:
-        result = subprocess.run(command, cwd=cwd, capture_output=True, check=False)
+        # Listing a large tree can take a minute. Stop it at the deadline.
+        result = subprocess.run(
+            command, cwd=cwd, capture_output=True, check=False, timeout=remaining
+        )
+    except subprocess.TimeoutExpired:
+        return _narrow()
     except FileNotFoundError:
         for operand in operands:
             reason = _literal_operand(operand, cwd)
@@ -427,7 +515,7 @@ def _rg_scope(args: list[str], operands: list[str], cwd: Path) -> str | None:
     if result.returncode not in {0, 1}:
         return f"{_PREFIX}could not list the search scope. Use explicit file paths."
     for index, raw in enumerate(result.stdout.split(b"\0")):
-        if index > _MAX_SCAN_ENTRIES:
+        if index > _MAX_SCAN_ENTRIES or _remaining() <= 0:
             return _narrow()
         if raw:
             path = _path(os.fsdecode(raw), cwd)
@@ -660,7 +748,12 @@ def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | N
         return _enmaas(args), cwd
     if name not in _READERS:
         return None, cwd
-    operands, pattern, metadata = _reader_operands(name, args)
+    operands, pattern, metadata, program_paths = _reader_operands(name, args)
+    for value in program_paths:
+        # sed and awk open these names as files. A directory yields nothing.
+        path = _path(value, cwd)
+        if not path.is_dir() and is_protected(path):
+            return _denial(path), cwd
     if metadata:
         return None, cwd
     if name in _SEARCHERS and not operands:
@@ -737,6 +830,8 @@ def _shell(command: str, cwd: Path) -> str | None:
     for token in [*lexer, ";"]:
         if token and all(c in ";&|()\n" for c in token):
             for candidate in list(directories):
+                if _remaining() <= 0:
+                    return _narrow()
                 reason, next_cwd = _segment(segment, candidate, stdin)
                 if reason:
                     return reason
@@ -752,6 +847,8 @@ def _shell(command: str, cwd: Path) -> str | None:
             segment.append(token)
     for nested in embedded + substitutions:
         for candidate in directories:
+            if _remaining() <= 0:
+                return _narrow()
             reason = _shell(nested, candidate)
             if reason:
                 return reason
@@ -760,6 +857,15 @@ def _shell(command: str, cwd: Path) -> str | None:
 
 def check_tool(event: dict[str, object]) -> str | None:
     """Return a denial reason, or leave the host's normal decision unchanged."""
+    global _deadline
+    _deadline = time.monotonic() + _time_budget()
+    try:
+        return _check_tool(event)
+    finally:
+        _deadline = math.inf
+
+
+def _check_tool(event: dict[str, object]) -> str | None:
     name = event.get("tool_name")
     if not isinstance(name, str) or name not in {"Read", "Grep"} | _SHELL_TOOLS:
         return None

@@ -29,7 +29,12 @@ def test_marker_tracks_only_one_canonical_output(
     alias = tmp_path / "alias.md"
     alias.symlink_to(answer)
     monkeypatch.chdir(tmp_path)
-    protect(Path("alias.md"))
+    # Protecting through the link is refused, so the marker can never name
+    # a target the caller did not write.
+    with pytest.raises(OSError, match="refusing to write through a symbolic link"):
+        protect(Path("alias.md"))
+    assert not (tmp_path / MARKER_DIR).exists()
+    protect(Path("answer.md"))
     marker = tmp_path / MARKER_DIR / (hashlib.sha256(b"answer.md").hexdigest() + ".json")
     assert marker_path(alias) == marker
     assert json.loads(marker.read_text()) == {

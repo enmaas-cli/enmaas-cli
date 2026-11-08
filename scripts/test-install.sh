@@ -262,7 +262,7 @@ need(pre[0] == {"matcher": "Write", "hooks": [{"type": "command", "command": "ec
 ' "$CLAUDE/settings.json"
 check "settings.json has exactly one enmaas guard entry" \
   test "$(guard_entries "$CLAUDE/settings.json")" = 1
-check "settings.json guard entry uses the bundled matcher, timeout 5" py '
+check "settings.json guard entry uses the bundled matcher, timeout 5, and blocks on failure" py '
 import json, shlex
 s = json.load(open(sys.argv[1], encoding="utf-8"))
 matcher = json.load(open(sys.argv[2], encoding="utf-8"))["hooks"]["PreToolUse"][0]["matcher"]
@@ -271,6 +271,8 @@ need(entry["matcher"] == matcher)
 need(len(entry["hooks"]) == 1)
 hook = entry["hooks"][0]
 need(hook["type"] == "command" and hook["timeout"] == 5)
+need(hook["onFailure"] == "block", hook)
+need(set(hook) == {"type", "command", "timeout", "onFailure"}, hook)
 need(hook["command"] == "python3 -S " + shlex.quote(sys.argv[3]), hook["command"])
 ' "$CLAUDE/settings.json" "$REPO/hooks/hooks.json" "$GUARD/hooks/pre-tool-use.py"
 
@@ -290,7 +292,10 @@ config = tomllib.load(open(sys.argv[1], "rb"))
 settings = json.load(open(sys.argv[2], encoding="utf-8"))
 need(config["model"] == "gpt-5" and config["tui"] == {"notifications": True})
 other = {"matcher": "Bash", "hooks": [{"type": "command", "command": "other-tool check", "timeout": 10}]}
-need(config["hooks"]["PreToolUse"] == [other, settings["hooks"]["PreToolUse"][-1]])
+# Codex has no onFailure setting, so its entry is the Claude Code entry without it.
+ours = settings["hooks"]["PreToolUse"][-1]
+ours = dict(ours, hooks=[{k: v for k, v in h.items() if k != "onFailure"} for h in ours["hooks"]])
+need(config["hooks"]["PreToolUse"] == [other, ours])
 ' "$CODEX/config.toml" "$CLAUDE/settings.json"
 
 check "--gateway creates the enmaas config.toml without the trailing slash" \
@@ -480,6 +485,36 @@ check "shared group: settings.json unchanged by a second install" \
 fx_run shared-group 0 --skill-only --uninstall
 check "shared group: uninstall leaves only the audit handler" \
   same_json "$fx/claude/settings.json" "{\"hooks\":{\"PreToolUse\":[$AUDIT_GROUP]}}"
+
+# A guard entry written before onFailure existed is out of date. The installer
+# rewrites it in place, between the same neighbors, and a second run then
+# changes nothing.
+fx="$FIXTURES/no-on-failure"
+mkdir -p "$fx/claude"
+py '
+import json, shlex
+matcher = json.load(open(sys.argv[2], encoding="utf-8"))["hooks"]["PreToolUse"][0]["matcher"]
+command = "python3 -S " + shlex.quote(sys.argv[3])
+old = {"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": 5}]}
+new = {"matcher": matcher, "hooks": [dict(old["hooks"][0], onFailure="block")]}
+first = {"matcher": "Write", "hooks": [{"type": "command", "command": "echo before"}]}
+last = {"matcher": "Read", "hooks": [{"type": "command", "command": "echo after"}]}
+with open(sys.argv[1] + "/settings.json", "w", encoding="utf-8") as handle:
+    json.dump({"hooks": {"PreToolUse": [first, old, last]}}, handle, indent=2)
+with open(sys.argv[1] + "/expected.json", "w", encoding="utf-8") as handle:
+    json.dump({"hooks": {"PreToolUse": [first, new, last]}}, handle)
+' "$fx/claude" "$REPO/hooks/hooks.json" "$fx/data/enmaas/guard/hooks/pre-tool-use.py"
+fx_run no-on-failure 0 --skill-only
+check "no onFailure: the install says it registered the guard" \
+  log_says "$fx/claude/settings.json: registered the enmaas guard"
+check "no onFailure: the entry gains onFailure in place and nothing else changes" \
+  same_json "$fx/claude/settings.json" "$(cat "$fx/claude/expected.json")"
+cp "$fx/claude/settings.json" "$TMP/no-on-failure.after-first"
+fx_run no-on-failure 0 --skill-only
+check "no onFailure: a second run says already up to date" \
+  log_says "$fx/claude/settings.json: already up to date"
+check "no onFailure: a second run leaves settings.json byte-identical" \
+  cmp -s "$fx/claude/settings.json" "$TMP/no-on-failure.after-first"
 
 # An empty hooks object comes back with an empty PreToolUse list. The
 # installer never deletes the hooks object or the list, so this is the
@@ -854,11 +889,15 @@ fx="$FIXTURES/gateway-invalid"
 mkdir -p "$fx/home"
 snapshot "$fx" >"$TMP/gateway-invalid.before"
 BAD_URLS=("https://" "https://g.test:bad" "https://g.test:" "https://g.test/?x=1" \
-  "https://g.test/#top" "ftp://g.test" "https://[::1" "https://user:pw@g.test")
+  "https://g.test/#top" "ftp://g.test" "https://[::1" "https://user:pw@g.test" \
+  "http://gateway.example.test" "http://127.0.0.1.example.test" "http://localhost.example.test")
 BAD_REASONS=("has no host name" "has a port that is not a number from 0 to 65535" \
   "has no port number after the colon" "must not have a query (?) or a fragment (#)" \
   "must not have a query (?) or a fragment (#)" "must start with http:// or https://" \
-  "is not a valid URL (Invalid IPv6 URL)" "must not contain credentials (user@host)")
+  "is not a valid URL (Invalid IPv6 URL)" "must not contain credentials (user@host)" \
+  "must use https:// for a host other than localhost" \
+  "must use https:// for a host other than localhost" \
+  "must use https:// for a host other than localhost")
 for index in "${!BAD_URLS[@]}"; do
   FX_HOME="$fx/home" FX_PATH="$NOOP_UV" fx_run gateway-invalid 1 --cli-only \
     --gateway "${BAD_URLS[$index]}"
@@ -881,6 +920,16 @@ FX_HOME="$fx/home" FX_PATH="$NOOP_UV" fx_run gateway-normal 0 --cli-only \
   --gateway 'https://host/v1//'
 check "gateway normal: https://host/v1// is saved as https://host/v1" \
   holds_exactly "$fx/home/.config/enmaas/config.toml" 'base_url = "https://host/v1"'
+
+# Plain http is accepted only for a gateway on this machine.
+for url in 'http://localhost:8080/' 'HTTP://LOCALHOST:8080' 'http://127.0.0.1:8080/' \
+  'http://127.8.9.10/v1' 'http://[::1]:8080/'; do
+  FX_HOME="$fx/home" FX_PATH="$NOOP_UV" fx_run gateway-normal 0 --cli-only --gateway "$url"
+  saved="http://${url#*://}"
+  saved="${saved%/}"
+  check "gateway normal: $url is saved as $saved" \
+    holds_exactly "$fx/home/.config/enmaas/config.toml" "base_url = \"$saved\""
+done
 
 # A comment at the end of the base_url line stays when the value is replaced.
 # The old value holds a # of its own, which is part of the string.

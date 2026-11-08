@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -86,8 +87,36 @@ def _write_record(path: Path, state: str) -> None:
             Path(temporary).unlink(missing_ok=True)
 
 
+def _link_refusal(path: Path) -> OSError:
+    return OSError(f"refusing to write through a symbolic link: {path}")
+
+
+def write_output(path: Path, text: str) -> None:
+    """Write an answer without following a symbolic link at the final path.
+
+    A plain write follows a link, so a pre-existing output name that points
+    at another writable file truncated that file. The mode applies only when
+    the file is created; an existing file keeps the mode its owner chose.
+    """
+    if path.is_symlink():
+        raise _link_refusal(path)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        # The link can appear between the check above and the open.
+        if exc.errno == errno.ELOOP:
+            raise _link_refusal(path) from None
+        raise
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(text.encode("utf-8"))
+
+
 def protect(path: Path) -> None:
     """Atomically mark one resolved output path as protected."""
+    # Resolving a link would write the marker for its target, which then
+    # names a file this tool never wrote.
+    if path.is_symlink():
+        raise _link_refusal(path)
     resolved = path.resolve()
     try:
         _write_record(resolved, "protected")
