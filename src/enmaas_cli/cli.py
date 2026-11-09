@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from . import openruns
 from .auth import AuthError, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
 from .client import call
@@ -543,7 +544,11 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
             ),
         )
 
+    # Runs still in progress have not written their ledger event yet. Their
+    # spend so far counts, so two runs side by side cannot each see the
+    # whole allowance.
     spent = rolling_spend(events, window_days=config.budget_window_days)
+    spent += openruns.live_charge(ledger.parent)
     if spent >= config.budget_tokens:
         return RollingCheck(
             spent,
