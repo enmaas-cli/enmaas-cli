@@ -207,6 +207,7 @@ can be counted without importing this package.
 | 1 | config, auth, or validation error | read the message, it names the fix |
 | 2 | partial failure | check `results.jsonl` in the outdir |
 | 3 | circuit breaker or token budget stopped the run | read the receipt; raise a spent budget before using `--resume` |
+| 130 or 143 | stopped by SIGINT or SIGTERM; a `map` recorded its spend and printed its receipt first | re-run the `map` with `--resume` to finish; re-run an `ask` |
 
 The breaker aborts a bulk run on 6 consecutive failures, or more than 50% of a
 full 20-item window. `--resume` skips items already recorded `ok` with an

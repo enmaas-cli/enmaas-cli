@@ -187,8 +187,15 @@ costs a request, which `--token-budget` can bound.
 | 1 | Error (includes usage errors like invalid flags) |
 | 2 | Partial failure (some items failed in a map run) |
 | 3 | Run stopped early: circuit breaker tripped, or token budget spent |
+| 130 | Stopped by SIGINT (Ctrl-C), as a shell reports it |
+| 143 | Stopped by SIGTERM, as a shell reports it |
 
 Usage errors (invalid flags, missing required arguments) exit 1, so exit code 2 unambiguously means partial failure.
+
+An interrupted `ask` or `map` ends by the signal that stopped it, after it has
+printed its receipt, so the caller sees how it stopped. A shell shows 128 plus
+the signal number; a program that starts enmaas sees the signal itself. See
+[Runs that stop early](#runs-that-stop-early).
 
 On exit code 3 from `map`, re-run with `--resume` to skip completed items. If the stop was a per-run `--token-budget`, raise it on the resumed command. If it was the rolling `[budget]` in the config, which can also stop `ask`, raise the ceiling in the config or wait for the window to move; `--resume` alone will stop again immediately.
 
@@ -319,13 +326,15 @@ If a run finishes but its usage cannot be written back, and a budget is
 configured, it prints a warning. That spend will not count against the ceiling, so
 the ceiling has quietly stopped tracking.
 
-**Single process only.** Each run reads the ledger at startup and writes its event
-at the end. Two runs started together against 9,000,000 spent of a 10,000,000
-ceiling will each believe 1,000,000 remains, and together spend 2,000,000. A run
-killed partway writes no event, so its spend goes unrecorded. This is a guard
-against your own drift over time. It is no enforcement boundary against concurrent
-use. Enforcing that properly needs a server-side budget, which a client cannot
-provide.
+**Not an enforcement boundary for runs side by side.** Each run reads the ledger
+at startup and writes its event at the end. The check also adds what `map` runs
+still in progress have charged so far, read from their open-run records (see
+[Runs that stop early](#runs-that-stop-early)). That narrows the gap but does not
+close it. Two runs started together against 9,000,000 spent of a 10,000,000
+ceiling each see the other at zero, each believe 1,000,000 remains, and together
+can spend 2,000,000. This is a guard against your own drift over time.
+Enforcing a ceiling across concurrent use needs a server-side budget, which a
+client cannot provide.
 
 ## Usage ledger
 
@@ -352,6 +361,53 @@ written never stops your command. With a `[budget]` configured you also get a
 warning that the run will not count against the ceiling, and the command refuses
 to start when the ledger cannot be read or recording is disabled, because it
 cannot know what has been spent.
+
+### Runs that stop early
+
+A `map` run writes its ledger event when it ends. So that a run which never
+reaches its end is still counted, it also keeps an open-run record.
+
+**The open-run record.** When `map` starts, it adds one line to
+`open-runs.jsonl` in the same directory as `usage.jsonl`. The line holds a random
+run id, the absolute path of the output directory, the size in bytes of its
+`results.jsonl` at the start, the start time, the process id, the model and the
+dialect. It holds no prompt, answer or key. The file is created with mode 0600,
+and every change to it holds a lock on `open-runs.lock` beside it. The line is
+removed after the run's ledger event is written, and the file is removed when no
+line is left. The record is kept apart from the ledger because it must be
+removed once the run ends, and the ledger only grows. `ENMAAS_NO_USAGE_LOG`
+turns the records off with the ledger. If the record cannot be written, `map`
+warns that a kill would leave its spend uncounted, and runs anyway.
+
+**Killed.** A run that is killed (for example by SIGKILL, a crash or a lost
+machine) leaves its record behind. So does a run that stops on an error before
+it writes its event. The next `ask` or `map` checks each record. When its process
+is gone, or the record is more than 48 hours old, it adds up the charge rows that
+run wrote to `results.jsonl` after its starting size, writes one ledger event
+with `error_kind` `Killed` and that charge, and removes the record. The token
+counts of that event are empty, because only the charge rows survive. Rows from
+before the start belong to earlier runs on the same directory, such as the run a
+`--resume` continues, so they are not counted twice. The age limit exists because
+a process id can be reused, which would keep a record alive forever.
+
+**Interrupted.** SIGINT (Ctrl-C) or SIGTERM stops a `map` run at once. Rows
+already written are complete, and the run writes its ledger event with
+`error_kind` `Interrupted` and the charge of those rows. It removes its record
+and prints its receipt, headed `enmaas map interrupted`, or with `--json` an
+object with `status` `aborted` and `abort_reason` `interrupted`. Then it ends by
+the same signal: 130 or 143 in a shell. Re-run with `--resume` to finish. Requests
+in flight at the interrupt are dropped and not recorded: no reply arrived, so
+their cost is not known, though the gateway may still bill them. Only the first
+signal acts; a second one is ignored so the ledger event is always written.
+
+An interrupted `ask` records nothing. Its one request had not returned, so there
+is no usage to record. It prints `error: interrupted`, or with `--json` an object
+with `status` `error` and `error` `interrupted`, and ends by the signal.
+
+**Counted twice, in one case.** The ledger event is written before the record is
+removed. A kill that lands between the two leaves the record, so the next run
+charges that run a second time. The other order could lose the spend instead,
+and counting too much is the safe side for a budget.
 
 ### Counting work this CLI did not do
 

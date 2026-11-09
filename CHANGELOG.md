@@ -30,6 +30,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - The usage ledger now records the class of the error that failed an `ask`. It
   used to guess from the message, so a gateway error that mentioned
   "validation" was filed as `ValidationError` and a schema failure as `Error`.
+- A `map` run that is killed no longer loses its spend. Each run keeps an
+  open-run record in `open-runs.jsonl` beside the ledger, and the next `ask` or
+  `map` charges a dead run's rows to the ledger as `Killed`. Only rows written
+  after the run started count, so a resumed directory is not charged twice.
+- SIGINT and SIGTERM no longer end a `map` run before it records anything. The
+  run writes its ledger event as `Interrupted`, prints its receipt, and then
+  ends by the same signal. A second signal is ignored. An interrupted `ask`
+  prints `error: interrupted` in place of a traceback and records nothing.
+- A reader that closes stdout before the receipt is printed no longer makes a
+  finished `ask` or `map` exit 120 with a `BrokenPipeError`.
 
 ### Changed
 
@@ -37,6 +47,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `internal` line when it is above zero. Those items are already counted in
   `failed`. Please report them.
 - The usage ledger can record `BadReplyError` as the `error_kind` of an `ask`.
+- The rolling budget check now adds what `map` runs still in progress have
+  charged so far.
+- `map` has a new `abort_reason`, `interrupted`, with the receipt header
+  `enmaas map interrupted`. The ledger can record `Killed` and `Interrupted` as
+  the `error_kind` of a `map`.
 
 ## [0.7.1] - 2026-11-09
 
