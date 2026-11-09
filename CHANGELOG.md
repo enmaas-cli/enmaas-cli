@@ -7,6 +7,28 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 Nothing yet.
 
+## [0.7.1] - 2026-11-09
+
+### Added
+
+- `.claude-plugin/plugin.json` and `.codex-plugin/plugin.json`, so a plugin
+  marketplace can list this repository directly with a `github` source. The
+  skill, `hooks/hooks.json` and the guard's files already sat where a plugin
+  expects them, and `hooks.json` already resolved the guard through
+  `CLAUDE_PLUGIN_ROOT`, so the manifests were the only missing piece.
+- A test holding the package version and both manifest versions together, and
+  pinning the manifest name a marketplace entry installs by.
+
+### Changed
+
+- The skill's setup reference and the README split the two install routes. A
+  marketplace supplies the skill and the guard, so installing from a plugin
+  means `install.sh --cli-only`. The full installer on top of a plugin
+  registers a second guard and copies a second skill.
+- `INSTALL.md` no longer tells readers to request access to a repository that
+  is public. `CONTRIBUTING.md` describes the ruleset that now protects `main`
+  and release tags, in place of the note saying protection was unavailable.
+
 ## [0.7.0] - 2026-11-08
 
 ### Changed
@@ -125,7 +147,8 @@ plugin marketplace.
 - A usage ledger with `enmaas usage`.
 - A skill that tells Claude Code and Codex when to delegate.
 
-[Unreleased]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.4.0...v0.5.0
