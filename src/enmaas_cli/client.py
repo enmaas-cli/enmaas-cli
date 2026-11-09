@@ -14,6 +14,9 @@ import httpx
 from .auth import REDACTION, redact
 from .dialect import Request
 
+# Re-exported so existing importers of this name from this module keep working.
+from .errors import GatewayError as GatewayError
+
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 # 90% of the measured ~300s gateway ceiling.
 GATEWAY_CEILING_NEAR = 270.0
@@ -26,15 +29,6 @@ MAX_RETRY_AFTER_SECONDS = 60.0
 ERROR_BODY_CHARS = 500
 
 SleepFn = Callable[[float], Awaitable[None]]
-
-
-class GatewayError(Exception):
-    """A request failed after exhausting its retry budget, or failed terminally."""
-
-    def __init__(self, message: str, *, status: int | None, attempts: int) -> None:
-        super().__init__(message)
-        self.status = status
-        self.attempts = attempts
 
 
 def is_retryable(status: int, elapsed: float = 0.0) -> bool:

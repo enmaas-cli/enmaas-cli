@@ -6,6 +6,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+# Re-exported so existing importers of these names from this module keep working.
+from .errors import EmptyResponseError as EmptyResponseError
+from .tokens import Usage as Usage
+
 Dialect = Literal["anthropic", "openai"]
 
 ANTHROPIC_VERSION = "2023-06-01"
@@ -197,43 +201,6 @@ def build_request(
 
 
 _TRUNCATED_STOPS = frozenset({"length", "max_tokens"})
-
-
-@dataclass(frozen=True)
-class Usage:
-    """Token counts normalised across dialects. None means 'not reported'.
-
-    `input_tokens` is the inclusive total on both dialects and
-    `cached_tokens` the subset of it that was a cache read.
-
-    `output_tokens` is likewise complete: on OpenAI it is
-    `completion_tokens`, which already contains reasoning, and
-    `reasoning_tokens` is a breakdown of it rather than an addition. On
-    Anthropic `reasoning_tokens` is always None because thinking is inside
-    `output_tokens`. Never sum the two.
-    """
-
-    input_tokens: int | None = None
-    cached_tokens: int | None = None
-    output_tokens: int | None = None
-    reasoning_tokens: int | None = None
-
-
-class EmptyResponseError(Exception):
-    """HTTP 200 but no usable text. Treated as a failure, never a success.
-
-    Carries the usage, because these tokens were charged. The gateway bills
-    a run that reasoned itself to death just as it bills a useful one, so a
-    budget that could not see this would be blind to the most expensive
-    failure the README documents.
-
-    Defined below Usage so the annotation resolves without a forward
-    reference.
-    """
-
-    def __init__(self, message: str, usage: Usage | None = None) -> None:
-        super().__init__(message)
-        self.usage = usage if usage is not None else Usage()
 
 
 @dataclass(frozen=True)
