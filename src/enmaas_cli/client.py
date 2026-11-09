@@ -13,6 +13,7 @@ import httpx
 
 from .auth import REDACTION, redact
 from .dialect import Request
+from .errors import BadReplyError
 
 # Re-exported so existing importers of this name from this module keep working.
 from .errors import GatewayError as GatewayError
@@ -27,6 +28,7 @@ JITTER_FRACTION = 0.5
 # run for as long as it asks.
 MAX_RETRY_AFTER_SECONDS = 60.0
 ERROR_BODY_CHARS = 500
+CONTENT_TYPE_CHARS = 80
 
 SleepFn = Callable[[float], Awaitable[None]]
 
@@ -71,6 +73,27 @@ def _error_detail(body: str, secret: str) -> str:
     if 0 <= start < cut:
         cut = start + len(REDACTION)
     return redacted[:cut]
+
+
+def _reply_object(response: httpx.Response) -> dict[str, Any]:
+    """Decode a 200 body that must be a JSON object, or raise BadReplyError.
+
+    The message names only the content type and the body length. It never
+    quotes the body, because a 200 body can be model output. The request was
+    served and may have been billed, so the caller must not retry it.
+    """
+    try:
+        data = response.json()
+    except ValueError:
+        kind = "not JSON"
+    else:
+        if isinstance(data, dict):
+            return data
+        kind = "JSON that is not an object"
+    content_type = response.headers.get("content-type", "none")[:CONTENT_TYPE_CHARS]
+    raise BadReplyError(
+        f"gateway reply is {kind} (content type {content_type}, {len(response.content)} bytes)"
+    )
 
 
 def _backoff(attempt: int) -> float:
@@ -122,9 +145,17 @@ async def call(
                     status=None,
                     attempts=attempt,
                 ) from None
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # A decoding error can follow a request the gateway served and
+            # billed, so any other client error is terminal and never retried.
+            raise GatewayError(
+                redact(f"{type(exc).__name__}: {exc}", secret),
+                status=None,
+                attempts=attempt,
+            ) from None
         else:
             if response.status_code == 200:
-                return dict(response.json())
+                return _reply_object(response)
             last_status = response.status_code
             last_detail = _error_detail(response.text, secret)
             if not is_retryable(response.status_code, _elapsed()):
