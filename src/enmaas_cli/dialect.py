@@ -264,16 +264,23 @@ def _utf8_safe(text: str) -> tuple[str, int]:
     return text, 0
 
 
+# The largest token count read as reported. Python refuses to print an
+# integer of more than 4,300 digits, so a count near that size, once summed,
+# could not be written to the index or the ledger.
+MAX_TOKEN_COUNT = 10**12
+
+
 def _count(value: object) -> int | None:
-    """Return a token count only when it is a non-negative integer.
+    """Return a token count only when it is an integer from 0 to MAX_TOKEN_COUNT.
 
     The gateway's usage numbers flow into error messages, receipts, the
     --json object and the usage ledger. A string there was copied through
     unchanged, so a 9,000 character value grew every one of those, and
     "abc" was recorded as an input count. A bool is an int subclass in
-    Python, so it is excluded by name.
+    Python, so it is excluded by name. A value above the cap reads as not
+    reported, the same as a negative one.
     """
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_TOKEN_COUNT:
         return value
     return None
 
