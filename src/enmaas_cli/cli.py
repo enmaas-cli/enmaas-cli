@@ -303,6 +303,9 @@ class AskResult:
     # Kept apart from completion: an empty answer has no completion, yet
     # its tokens were billed and must count against the budget.
     usage: Usage | None = None
+    # The failure's class name, for the ledger. Taken from the exception
+    # itself, because a message can mention any word.
+    error_kind: str | None = None
 
 
 async def run_ask(
@@ -374,6 +377,7 @@ async def run_ask(
             error=error_msg,
             # Usage() means the reply reported nothing, which is not a charge.
             usage=exc.usage if exc.usage != Usage() else None,
+            error_kind=type(exc).__name__,
         )
 
     if schema is not None:
@@ -409,6 +413,7 @@ async def run_ask(
                 elapsed=elapsed,
                 error=error_msg,
                 usage=completion.usage,
+                error_kind="ValidationError",
             )
 
     elapsed = time.monotonic() - started
@@ -827,19 +832,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 model_defaulted=model_defaulted,
             )
 
-            # Log usage
             usage_obj = result.usage
-            error_kind = None
-            if result.error:
-                # Extract error kind from error message
-                if "GatewayError" in result.error or "gateway" in result.error.lower():
-                    error_kind = "GatewayError"
-                elif "EmptyResponseError" in result.error or "exhausted max_tokens" in result.error:
-                    error_kind = "EmptyResponseError"
-                elif "ValidationError" in result.error or "validation" in result.error.lower():
-                    error_kind = "ValidationError"
-                else:
-                    error_kind = "Error"
             recorded = append_event(
                 state_root() / "usage.jsonl",
                 UsageEvent(
@@ -854,7 +847,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                     elapsed=result.elapsed,
                     status="ok" if result.exit_code == ExitCode.OK else "error",
                     schema_used=args.schema is not None,
-                    error_kind=error_kind,
+                    error_kind=result.error_kind,
                     items_total=None,
                     items_ok=None,
                     items_failed=None,
