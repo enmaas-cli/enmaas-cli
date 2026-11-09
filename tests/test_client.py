@@ -329,3 +329,17 @@ async def test_bad_reply_content_type_is_printable() -> None:
     message = str(exc.value)
     assert all(ch.isprintable() for ch in message)
     assert "text/plain?31m" in message
+
+
+async def test_reply_nested_too_deeply_is_a_bad_reply_and_never_retried() -> None:
+    from enmaas_cli.errors import BadReplyError
+
+    body = b"[" * 200_000 + b"]" * 200_000
+    transport, calls = _counting(
+        httpx.Response(200, content=body, headers={"content-type": "application/json"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    assert len(calls) == 1
+    assert "JSON nested too deeply" in str(exc.value)

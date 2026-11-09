@@ -335,3 +335,18 @@ def test_main_reports_the_internal_count(
         assert payload["failed"] == 1
     else:
         assert "  internal  1 failed on an error inside enmaas; please report it" in captured.out
+
+
+def _nested_too_deeply(ids: list[str], batched: bool) -> httpx.Response:
+    return httpx.Response(200, content=b"[" * 200_000 + b"]" * 200_000)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_reply_nested_too_deeply_fails_as_a_bad_reply(tmp_path: Path, mode: str) -> None:
+    outcome = await _run(tmp_path, mode, _nested_too_deeply)
+    rows = _item_rows(tmp_path)
+    (bad,) = SECOND[mode]
+    assert rows[bad]["status"] == "error"
+    assert "JSON nested too deeply" in rows[bad]["error"]
+    assert outcome.internal_errors == 0
+    assert (outcome.ok, outcome.failed) == (2, 1)

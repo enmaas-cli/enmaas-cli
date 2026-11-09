@@ -21,6 +21,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   The `--json` output and `results.jsonl` keep the message as sent.
 - A reply that reports a token count above 10**12 no longer ends the run. Such
   a count reads as not reported, the same as a negative one.
+- A reply nested too deeply to decode now fails as `BadReplyError`, and a
+  response nested too deeply for `--schema` fails the schema check. A `map`
+  item no longer reports either as an internal error.
 - A client error during a request, such as a reply that cannot be decoded, now
   fails that request at once with `GatewayError` in place of a traceback. It is
   not retried, for the same reason.

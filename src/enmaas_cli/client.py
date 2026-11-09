@@ -79,6 +79,10 @@ def _reply_object(response: httpx.Response, secret: str) -> dict[str, Any]:
     """
     try:
         data = response.json()
+    except RecursionError:
+        # The JSON decoder recurses once per nesting level, so a deep enough
+        # body raises here. It is a bad reply like any other.
+        kind = "JSON nested too deeply"
     except ValueError:
         kind = "not JSON"
     else:

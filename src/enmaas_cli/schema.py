@@ -72,13 +72,22 @@ def _bounded(reason: str) -> str:
 
 
 def validate_against_schema(text: str, schema: dict[str, Any]) -> None:
-    """Check model output against the schema. Raises ValidationError if it fails."""
+    """Check model output against the schema. Raises ValidationError if it fails.
+
+    Both the JSON decoder and the schema check recurse once per nesting
+    level, so a deeply nested response raises RecursionError. That is a
+    response the schema cannot accept, not a fault in this tool.
+    """
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValidationError(f"response is not valid JSON: {exc}") from exc
+    except RecursionError:
+        raise ValidationError("response is nested too deeply") from None
     try:
         jsonschema.validate(payload, schema)
+    except RecursionError:
+        raise ValidationError("response is nested too deeply") from None
     except jsonschema.ValidationError as exc:
         # jsonschema's message can contain the entire rejected response.
         # Report the rule and a bounded field path without printing its value.
