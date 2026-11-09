@@ -104,7 +104,7 @@ These go before the subcommand: `enmaas --key-file PATH models`.
 - `-m, --model MODEL`: The model to use. Optional; without it the configured `default_model` applies and the receipt says `(default)`.
 - `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
 - `--schema-name NAME`: The name sent with the schema. Defaults to `StructuredOutput`. `ask` and unbatched `map` send the schema and its name with the request; batched `map` keeps the schema local and validates each answer after the reply is split.
-- `--json`: Emit machine-readable JSON instead of plain-text receipts. For `ask`, prints an object with `status`, `model`, `dialect`, `path`, `tokens`, `elapsed`, and `error`. For `map`, prints an object with `status`, `total`, `ok`, `failed`, `skipped`, `attempted`, `outdir`, `index`, `tokens`, `elapsed`, and `failures`.
+- `--json`: Emit machine-readable JSON instead of plain-text receipts. For `ask`, prints an object with `status`, `model`, `dialect`, `path`, `tokens`, `elapsed`, and `error`. For `map`, prints an object with `status`, `total`, `ok`, `failed`, `internal_errors`, `skipped`, `attempted`, `outdir`, `index`, `tokens`, `elapsed`, and `failures`. `internal_errors` counts the failed items that hit an error inside enmaas; they are already in `failed`, and are worth reporting.
 - `--dialect {anthropic,openai}`: Override dialect selection. By default, the dialect is inferred from the model name.
 - `--max-tokens N`: Maximum output tokens. Must be positive.
 - `--timeout SECONDS`: Request timeout. Must be positive. Defaults to 280 seconds.

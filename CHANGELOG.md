@@ -5,7 +5,38 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- A gateway reply with status 200 whose body is not a JSON object, such as an
+  HTML page from a proxy or a JSON list, now fails that request with
+  `BadReplyError` in place of a traceback. It is not retried, because the
+  gateway may already have billed it. The error names the content type and the
+  body size and never quotes the body.
+- A client error during a request, such as a reply that cannot be decoded, now
+  fails that request at once with `GatewayError` in place of a traceback. It is
+  not retried, for the same reason.
+- A reply field of an unexpected type, such as a `choices` value that is not a
+  list of objects, now fails the request with `BadReplyError` in place of a
+  traceback. A missing or null field still reads as an empty answer. The error
+  keeps the token counts the reply reported, so `ask` and `map` charge them.
+- An OpenAI reply whose `content` is a list of parts is now read: its text
+  parts are joined in order. A list with no text part fails as `BadReplyError`.
+- One bad reply in a `map` run now fails only the items it covered. The other
+  items still run.
+- An error inside enmaas that no handler expected now fails only the `map` item
+  or group it hit, with a message such as
+  `internal error (TypeError at runner.py:123)`, in place of stopping the run.
+  The message never holds the error text, which could quote a reply.
+- The usage ledger now records the class of the error that failed an `ask`. It
+  used to guess from the message, so a gateway error that mentioned
+  "validation" was filed as `ValidationError` and a schema failure as `Error`.
+
+### Changed
+
+- `map --json` has a new `internal_errors` field, and the `map` receipt shows an
+  `internal` line when it is above zero. Those items are already counted in
+  `failed`. Please report them.
+- The usage ledger can record `BadReplyError` as the `error_kind` of an `ask`.
 
 ## [0.7.1] - 2026-11-09
 
