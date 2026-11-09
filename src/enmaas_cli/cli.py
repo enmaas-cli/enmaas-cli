@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import openruns
-from .auth import AuthError, redact, resolve_key
+from .auth import AuthError, printable, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
 from .client import call
 from .config import Config, ConfigError, default_config_path, load_config
@@ -369,7 +369,8 @@ async def run_ask(
             receipt=(
                 f"enmaas ask FAILED\n"
                 f"  model     {model}{model_mark}  ({resolved} dialect)\n"
-                f"  error     {error_msg}"
+                # Printable on one line: the message can hold gateway text.
+                f"  error     {printable(error_msg)}"
             ),
             path=path,
             exit_code=ExitCode.ERROR,
@@ -406,7 +407,7 @@ async def run_ask(
                     f"enmaas ask FAILED\n"
                     f"  model     {model}{model_mark}  ({resolved} dialect)\n"
                     f"  output    {path}\n"
-                    f"  error     {error_msg}{repaired}"
+                    f"  error     {printable(error_msg)}{repaired}"
                 ),
                 path=path,
                 exit_code=ExitCode.ERROR,

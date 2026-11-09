@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .auth import printable
 from .dialect import Completion, Dialect
 from .outputs import state_root as state_root
 
@@ -184,7 +185,9 @@ def map_receipt(
         lines.append(f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}")
     lines.append(f"  elapsed   {outcome.elapsed:.1f}s")
     for item_id, message in outcome.failures[:20]:
-        lines.append(f"  failure   {item_id}  {message}")
+        # Gateway text is not trusted. A newline in it would forge a receipt
+        # line, and an escape sequence would reach the terminal.
+        lines.append(f"  failure   {printable(item_id)}  {printable(message)}")
     if outcome.tripped_budget == "rolling":
         # Raising --token-budget would not help: the standing ceiling in
         # config.toml is what stopped this, and only it can release it.

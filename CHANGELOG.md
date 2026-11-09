@@ -15,6 +15,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - The content type named in that error now has the API key removed before it
   is cut to 80 characters, so no part of a key survives the cut. Characters
   that cannot be printed on one line are replaced.
+- A gateway error message that holds a newline or a terminal escape sequence
+  can no longer add a line to the `ask` or `map` receipt or act on the
+  terminal. The receipt prints it on one line with those characters replaced.
+  The `--json` output and `results.jsonl` keep the message as sent.
 - A client error during a request, such as a reply that cannot be decoded, now
   fails that request at once with `GatewayError` in place of a traceback. It is
   not retried, for the same reason.
