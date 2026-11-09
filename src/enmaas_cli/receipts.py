@@ -152,6 +152,11 @@ def map_receipt(
         f"  items     {outcome.total} total: {outcome.attempted} attempted, "
         f"{outcome.ok} ok, {outcome.failed} failed, {outcome.skipped} skipped",
     ]
+    if outcome.internal_errors > 0:
+        lines.append(
+            f"  internal  {outcome.internal_errors} failed on an error inside enmaas; "
+            f"please report it"
+        )
     if not_attempted > 0:
         lines.append(f"            {not_attempted} not attempted")
     lines.append(f"  outdir    {outcome.outdir}")

@@ -971,6 +971,9 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 "total": outcome.total,
                 "ok": outcome.ok,
                 "failed": outcome.failed,
+                # Already inside "failed". Items failed by an error that no
+                # handler expected, which is a fault to report.
+                "internal_errors": outcome.internal_errors,
                 "skipped": outcome.skipped,
                 "attempted": outcome.attempted,
                 "outdir": str(outcome.outdir),

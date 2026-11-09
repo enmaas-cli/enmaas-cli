@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,16 +17,16 @@ import httpx
 from .auth import redact
 from .batching import PER_ITEM_MARKER, build_batch_prompt, split_batch_response, split_template
 from .budget import TokenBudget, charge_from_rows, metered
-from .client import GatewayError, call
+from .client import call
 from .dialect import (
     Dialect,
-    EmptyResponseError,
     build_request,
     default_max_tokens,
     parse_response,
     resolve_dialect,
     thinking_off_payload,
 )
+from .errors import CallError
 from .outputs import protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
 
@@ -133,6 +134,19 @@ def validate_all(template: str, items: list[dict[str, Any]]) -> None:
     """Render every item before any request, so a bad template fails once."""
     for item in items:
         render(template, item)
+
+
+def _internal_message(exc: BaseException) -> str:
+    """Class name and the innermost frame. Never the exception text, which is unreviewed.
+
+    An error that no handler expected can carry any text, including part of
+    a reply or a prompt, so only where it happened is reported.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return f"internal error ({type(exc).__name__})"
+    last = frames[-1]
+    return f"internal error ({type(exc).__name__} at {Path(last.filename).name}:{last.lineno})"
 
 
 def _charge_row(charge: int, *, items: int) -> str:
@@ -255,6 +269,9 @@ class MapOutcome:
     # The group size the run used, after defaulting. Carried so the
     # receipt can say what was chosen when the caller did not choose.
     batch: int = 1
+    # Items failed by an error no handler expected. Already counted in
+    # `failed`; kept apart so the user can see it is a fault to report.
+    internal_errors: int = 0
 
     @property
     def exit_code(self) -> int:
@@ -361,6 +378,7 @@ async def run_map(
         "cached": 0,
         "reasoning": 0,
         "charge": 0,
+        "internal": 0,
     }
     failures: list[tuple[str, str]] = []
 
@@ -419,10 +437,11 @@ async def run_map(
                 }
                 counts["ok"] += 1
                 ok = True
-            except (GatewayError, EmptyResponseError, ValidationError, OSError) as exc:
-                if isinstance(exc, EmptyResponseError):
-                    # Reasoning ate the budget and returned nothing. The
-                    # gateway charged for it regardless.
+            except (CallError, ValidationError, OSError) as exc:
+                if isinstance(exc, CallError):
+                    # A failed request can still have been billed, for
+                    # example reasoning that ate the budget and returned
+                    # nothing. Charge what the reply reported.
                     charge = metered(exc.usage)
                 message = redact(str(exc), key)
                 row = {
@@ -434,6 +453,22 @@ async def run_map(
                 }
                 failures.append((item_id, message))
                 counts["failed"] += 1
+                ok = False
+            except Exception as exc:
+                # One unexpected error fails this item only, so the rest of
+                # the run and its charge rows survive. `charge` keeps what it
+                # held when the error was raised.
+                message = _internal_message(exc)
+                row = {
+                    "id": item_id,
+                    "status": "error",
+                    "path": None,
+                    "tokens": None,
+                    "error": message,
+                }
+                failures.append((item_id, message))
+                counts["failed"] += 1
+                counts["internal"] += 1
                 ok = False
 
             async with lock:
@@ -500,10 +535,10 @@ async def run_map(
                 counts["out"] += completion.usage.output_tokens or 0
                 counts["cached"] += completion.usage.cached_tokens or 0
                 counts["reasoning"] += completion.usage.reasoning_tokens or 0
-            except (GatewayError, EmptyResponseError, ValidationError, OSError) as exc:
+            except (CallError, ValidationError, OSError) as exc:
                 # The call failed, so every item in it failed. Attributing
                 # the error to each one keeps the breaker counting items.
-                if isinstance(exc, EmptyResponseError):
+                if isinstance(exc, CallError):
                     charge = metered(exc.usage)
                 message = redact(str(exc), key)
                 answers = {}
@@ -519,6 +554,24 @@ async def run_map(
                     )
                     failures.append((item_id, message))
                     counts["failed"] += 1
+            except Exception as exc:
+                # An unexpected error fails this group only. `charge` keeps
+                # what it held when the error was raised.
+                message = _internal_message(exc)
+                answers = {}
+                for item_id in ids:
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "status": "error",
+                            "path": None,
+                            "tokens": None,
+                            "error": message,
+                        }
+                    )
+                    failures.append((item_id, message))
+                    counts["failed"] += 1
+                    counts["internal"] += 1
 
             for item_id in ids:
                 if any(r["id"] == item_id for r in rows):
@@ -558,6 +611,21 @@ async def run_map(
                     )
                     failures.append((item_id, message))
                     counts["failed"] += 1
+                    continue
+                except Exception as exc:
+                    message = _internal_message(exc)
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "status": "error",
+                            "path": None,
+                            "tokens": None,
+                            "error": message,
+                        }
+                    )
+                    failures.append((item_id, message))
+                    counts["failed"] += 1
+                    counts["internal"] += 1
                     continue
                 rows.append(
                     {
@@ -641,4 +709,5 @@ async def run_map(
         outdir=outdir,
         failures=failures,
         batch=batch,
+        internal_errors=counts["internal"],
     )
