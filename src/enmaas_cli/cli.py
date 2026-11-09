@@ -29,6 +29,7 @@ from .client import call
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
+    Completion,
     Dialect,
     DialectError,
     Usage,
@@ -37,7 +38,7 @@ from .dialect import (
     parse_response,
     resolve_dialect,
 )
-from .errors import CallError
+from .errors import CallError, where
 from .outputs import (
     MAX_INSPECT_CHARS,
     allow_read,
@@ -311,6 +312,40 @@ class AskResult:
     error_kind: str | None = None
 
 
+def _failed_after_reply(
+    model: str,
+    model_mark: str,
+    resolved: Dialect,
+    path: Path,
+    started: float,
+    completion: Completion,
+    *,
+    error: str,
+    error_kind: str,
+) -> AskResult:
+    """The result of an ask that failed after the gateway replied.
+
+    It keeps the reply's usage, because the request was billed. The answer
+    may not have been saved, so the result carries no completion.
+    """
+    return AskResult(
+        receipt=(
+            f"enmaas ask FAILED\n"
+            f"  model     {model}{model_mark}  ({resolved} dialect)\n"
+            f"  error     {printable(error)}"
+        ),
+        path=path,
+        exit_code=ExitCode.ERROR,
+        model=model,
+        dialect=resolved,
+        completion=None,
+        elapsed=time.monotonic() - started,
+        error=error,
+        usage=completion.usage,
+        error_kind=error_kind,
+    )
+
+
 async def run_ask(
     *,
     client: httpx.AsyncClient,
@@ -384,47 +419,74 @@ async def run_ask(
             error_kind=type(exc).__name__,
         )
 
-    if schema is not None:
-        try:
-            validate_against_schema(completion.text, schema)
-        except ValidationError as exc:
-            elapsed = time.monotonic() - started
-            error_msg = str(exc)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            write_output(path, completion.text)
-            # The altered response is still written to disk above, so the
-            # repair has to be reported even on the failure path. Without
-            # this, a schema error would be the only thing mentioned while
-            # the saved file silently differs from what the model sent.
-            repaired = (
-                f"\n  warning   {completion.replaced} character(s) could not be "
-                f"encoded and became U+FFFD"
-                if completion.replaced
-                else ""
-            )
-            return AskResult(
-                receipt=(
-                    f"enmaas ask FAILED\n"
-                    f"  model     {model}{model_mark}  ({resolved} dialect)\n"
-                    f"  output    {path}\n"
-                    f"  error     {printable(error_msg)}{repaired}"
-                ),
-                path=path,
-                exit_code=ExitCode.ERROR,
-                model=model,
-                dialect=resolved,
-                completion=completion,
-                elapsed=elapsed,
-                error=error_msg,
-                usage=completion.usage,
-                error_kind="ValidationError",
-            )
+    # The gateway billed the request once the reply arrived. A failure from
+    # here on still returns a result that carries the usage, so the ledger
+    # event is written. CancelledError is not an Exception and passes through.
+    try:
+        if schema is not None:
+            try:
+                validate_against_schema(completion.text, schema)
+            except ValidationError as exc:
+                elapsed = time.monotonic() - started
+                error_msg = str(exc)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_output(path, completion.text)
+                # The altered response is still written to disk above, so the
+                # repair has to be reported even on the failure path. Without
+                # this, a schema error would be the only thing mentioned while
+                # the saved file silently differs from what the model sent.
+                repaired = (
+                    f"\n  warning   {completion.replaced} character(s) could not be "
+                    f"encoded and became U+FFFD"
+                    if completion.replaced
+                    else ""
+                )
+                return AskResult(
+                    receipt=(
+                        f"enmaas ask FAILED\n"
+                        f"  model     {model}{model_mark}  ({resolved} dialect)\n"
+                        f"  output    {path}\n"
+                        f"  error     {printable(error_msg)}{repaired}"
+                    ),
+                    path=path,
+                    exit_code=ExitCode.ERROR,
+                    model=model,
+                    dialect=resolved,
+                    completion=completion,
+                    elapsed=elapsed,
+                    error=error_msg,
+                    usage=completion.usage,
+                    error_kind="ValidationError",
+                )
 
-    elapsed = time.monotonic() - started
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_output(path, completion.text)
-    if save_thinking and completion.reasoning:
-        write_output(run_dir / "thinking.md", completion.reasoning)
+        elapsed = time.monotonic() - started
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_output(path, completion.text)
+        if save_thinking and completion.reasoning:
+            write_output(run_dir / "thinking.md", completion.reasoning)
+    except OSError as exc:
+        return _failed_after_reply(
+            model,
+            model_mark,
+            resolved,
+            path,
+            started,
+            completion,
+            error=redact(str(exc), key),
+            error_kind="OSError",
+        )
+    except Exception as exc:
+        # Never the exception text, which could quote the reply or the prompt.
+        return _failed_after_reply(
+            model,
+            model_mark,
+            resolved,
+            path,
+            started,
+            completion,
+            error=f"internal error ({where(exc)})",
+            error_kind=type(exc).__name__,
+        )
 
     return AskResult(
         receipt=ask_receipt(

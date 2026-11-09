@@ -24,6 +24,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A reply nested too deeply to decode now fails as `BadReplyError`, and a
   response nested too deeply for `--schema` fails the schema check. A `map`
   item no longer reports either as an internal error.
+- An `ask` that fails after the reply arrived, for example because the answer
+  file cannot be written, now exits 1 with a failure receipt and records the
+  charge in the usage ledger. An unexpected error there is reported as
+  `internal error (<class> at <file>:<line>)` and never shows its text.
 - A client error during a request, such as a reply that cannot be decoded, now
   fails that request at once with `GatewayError` in place of a traceback. It is
   not retried, for the same reason.
