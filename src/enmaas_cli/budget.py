@@ -90,7 +90,8 @@ class TokenBudget:
 
     The breaker answers "is this run broken". This answers "has this run
     spent what it was given". Both are consulted after each completed
-    request, inside the same lock, and either can stop the run.
+    request, and either can stop the run. Nothing awaits between a reply
+    arriving and its rows being written, so a cancel cannot separate them.
 
     Holds no I/O, so it is testable without a gateway.
 

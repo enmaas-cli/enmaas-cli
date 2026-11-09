@@ -341,7 +341,6 @@ async def run_map(
     breaker = CircuitBreaker()
     semaphore = asyncio.Semaphore(concurrency)
     index = outdir / "results.jsonl"
-    lock = asyncio.Lock()
     abort_reason: str | None = None
     # Seeded from the charge rows of earlier invocations, so the ceiling
     # belongs to the job rather than to one command. Resetting it per run
@@ -471,35 +470,37 @@ async def run_map(
                 counts["internal"] += 1
                 ok = False
 
-            async with lock:
-                with index.open("a", encoding="utf-8") as handle:
-                    # Charge first. If the process dies mid-write, the
-                    # asymmetry matters: an orphaned charge row over-counts,
-                    # which is safe, while an item row whose charge never
-                    # landed lets a resumed run spend that budget twice.
-                    handle.write(_charge_row(charge, items=1) + "\n")
-                    handle.write(json.dumps(row) + "\n")
-                counts["charge"] += charge
-                breaker.record(ok=ok)
-                if breaker.should_abort() and abort_reason is None:
-                    abort_reason = "breaker"
-                # Both budgets, one block, written identically in both
-                # execution paths so they cannot drift. Either is
-                # sufficient to stop the run, the way the breaker carries
-                # two independent signals.
-                #
-                # The `abort_reason is None` guard makes first cause win.
-                # Without it a run that tripped the breaker and then went
-                # over budget would report "budget", hiding the more
-                # actionable failure. This is not a data race: asyncio
-                # coroutines do not interleave between these statements,
-                # and the lock is already held. It is overwrite policy.
-                for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
-                    if limit is not None:
-                        limit.record(charge)
-                        if limit.should_abort() and abort_reason is None:
-                            abort_reason = "budget"
-                            tripped_budget = name
+            # Nothing awaits between the reply arriving and these rows being
+            # written, so a cancel cannot separate an answer file from its
+            # rows. An await added here would break that.
+            with index.open("a", encoding="utf-8") as handle:
+                # Charge first. If the process dies mid-write, the
+                # asymmetry matters: an orphaned charge row over-counts,
+                # which is safe, while an item row whose charge never
+                # landed lets a resumed run spend that budget twice.
+                handle.write(_charge_row(charge, items=1) + "\n")
+                handle.write(json.dumps(row) + "\n")
+            counts["charge"] += charge
+            breaker.record(ok=ok)
+            if breaker.should_abort() and abort_reason is None:
+                abort_reason = "breaker"
+            # Both budgets, one block, written identically in both
+            # execution paths so they cannot drift. Either is
+            # sufficient to stop the run, the way the breaker carries
+            # two independent signals.
+            #
+            # The `abort_reason is None` guard makes first cause win.
+            # Without it a run that tripped the breaker and then went
+            # over budget would report "budget", hiding the more
+            # actionable failure. This is not a data race: asyncio
+            # coroutines do not interleave between these statements,
+            # because nothing here awaits. It is overwrite policy.
+            for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
+                if limit is not None:
+                    limit.record(charge)
+                    if limit.should_abort() and abort_reason is None:
+                        abort_reason = "budget"
+                        tripped_budget = name
 
     async def process_batch(group: list[dict[str, Any]]) -> None:
         """One call covering several items, answers matched back by id."""
@@ -648,38 +649,40 @@ async def run_map(
                 )
                 counts["ok"] += 1
 
-            async with lock:
-                with index.open("a", encoding="utf-8") as handle:
-                    # One charge row per request, not per item: the group
-                    # was one call. Per-item rows carry "tokens": None here,
-                    # which is why the budget cannot be rebuilt from them.
-                    # Written first, so a crash over-counts rather than
-                    # letting a resumed run respend the group's budget.
-                    handle.write(_charge_row(charge, items=len(group)) + "\n")
-                    for row in rows:
-                        handle.write(json.dumps(row) + "\n")
-                counts["charge"] += charge
+            # Nothing awaits between the reply arriving and these rows being
+            # written, so a cancel cannot separate an answer file from its
+            # rows. An await added here would break that.
+            with index.open("a", encoding="utf-8") as handle:
+                # One charge row per request, not per item: the group
+                # was one call. Per-item rows carry "tokens": None here,
+                # which is why the budget cannot be rebuilt from them.
+                # Written first, so a crash over-counts rather than
+                # letting a resumed run respend the group's budget.
+                handle.write(_charge_row(charge, items=len(group)) + "\n")
                 for row in rows:
-                    breaker.record(ok=row["status"] == "ok")
-                if breaker.should_abort() and abort_reason is None:
-                    abort_reason = "breaker"
-                # Both budgets, one block, written identically in both
-                # execution paths so they cannot drift. Either is
-                # sufficient to stop the run, the way the breaker carries
-                # two independent signals.
-                #
-                # The `abort_reason is None` guard makes first cause win.
-                # Without it a run that tripped the breaker and then went
-                # over budget would report "budget", hiding the more
-                # actionable failure. This is not a data race: asyncio
-                # coroutines do not interleave between these statements,
-                # and the lock is already held. It is overwrite policy.
-                for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
-                    if limit is not None:
-                        limit.record(charge)
-                        if limit.should_abort() and abort_reason is None:
-                            abort_reason = "budget"
-                            tripped_budget = name
+                    handle.write(json.dumps(row) + "\n")
+            counts["charge"] += charge
+            for row in rows:
+                breaker.record(ok=row["status"] == "ok")
+            if breaker.should_abort() and abort_reason is None:
+                abort_reason = "breaker"
+            # Both budgets, one block, written identically in both
+            # execution paths so they cannot drift. Either is
+            # sufficient to stop the run, the way the breaker carries
+            # two independent signals.
+            #
+            # The `abort_reason is None` guard makes first cause win.
+            # Without it a run that tripped the breaker and then went
+            # over budget would report "budget", hiding the more
+            # actionable failure. This is not a data race: asyncio
+            # coroutines do not interleave between these statements,
+            # because nothing here awaits. It is overwrite policy.
+            for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
+                if limit is not None:
+                    limit.record(charge)
+                    if limit.should_abort() and abort_reason is None:
+                        abort_reason = "budget"
+                        tripped_budget = name
 
     if batch > 1:
         groups = [pending[n : n + batch] for n in range(0, len(pending), batch)]
