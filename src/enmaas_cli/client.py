@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from .auth import cut_redacted, redact
+from .auth import cut_redacted, printable, redact
 from .dialect import Request
 from .errors import BadReplyError
 
@@ -66,12 +66,16 @@ def _error_detail(body: str, secret: str) -> str:
     return cut_redacted(redact(body, secret), ERROR_BODY_CHARS)
 
 
-def _reply_object(response: httpx.Response) -> dict[str, Any]:
+def _reply_object(response: httpx.Response, secret: str) -> dict[str, Any]:
     """Decode a 200 body that must be a JSON object, or raise BadReplyError.
 
     The message names only the content type and the body length. It never
     quotes the body, because a 200 body can be model output. The request was
     served and may have been billed, so the caller must not retry it.
+
+    The content type is gateway text, so it is redacted, then made
+    printable, then cut. Redaction comes before any cut, or part of a key
+    can survive the cut.
     """
     try:
         data = response.json()
@@ -81,7 +85,10 @@ def _reply_object(response: httpx.Response) -> dict[str, Any]:
         if isinstance(data, dict):
             return data
         kind = "JSON that is not an object"
-    content_type = response.headers.get("content-type", "none")[:CONTENT_TYPE_CHARS]
+    content_type = cut_redacted(
+        printable(redact(response.headers.get("content-type", "none"), secret)),
+        CONTENT_TYPE_CHARS,
+    )
     raise BadReplyError(
         f"gateway reply is {kind} (content type {content_type}, {len(response.content)} bytes)"
     )
@@ -146,7 +153,7 @@ async def call(
             ) from None
         else:
             if response.status_code == 200:
-                return _reply_object(response)
+                return _reply_object(response, secret)
             last_status = response.status_code
             last_detail = _error_detail(response.text, secret)
             if not is_retryable(response.status_code, _elapsed()):

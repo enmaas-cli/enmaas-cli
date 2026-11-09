@@ -12,6 +12,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `BadReplyError` in place of a traceback. It is not retried, because the
   gateway may already have billed it. The error names the content type and the
   body size and never quotes the body.
+- The content type named in that error now has the API key removed before it
+  is cut to 80 characters, so no part of a key survives the cut. Characters
+  that cannot be printed on one line are replaced.
 - A client error during a request, such as a reply that cannot be decoded, now
   fails that request at once with `GatewayError` in place of a traceback. It is
   not retried, for the same reason.

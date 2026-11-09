@@ -289,3 +289,43 @@ async def test_http_error_message_is_redacted() -> None:
                 secret="sk-live-key-123",
             )
     assert "sk-live-key-123" not in str(exc.value)
+
+
+async def test_bad_reply_content_type_is_redacted_before_it_is_cut() -> None:
+    from enmaas_cli.auth import REDACTION
+    from enmaas_cli.errors import BadReplyError
+
+    secret = "sk-oai-ABCDEFGHIJKLMNOP"
+    prefix = "text/plain; " + "x" * 58
+    content_type = prefix + secret + "; charset=utf-8"
+    # The key starts at character 70 and ends past character 80.
+    assert len(prefix) < 80 < len(prefix) + len(secret)
+    transport, calls = _counting(
+        httpx.Response(200, content=b"not json", headers={"content-type": content_type})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep, secret=secret)
+    assert len(calls) == 1
+    message = str(exc.value)
+    for start in range(len(secret) - 3):
+        assert secret[start : start + 4] not in message
+    assert f"content type {prefix}{REDACTION}, " in message
+
+
+async def test_bad_reply_content_type_is_printable() -> None:
+    from enmaas_cli.errors import BadReplyError
+
+    transport, _ = _counting(
+        httpx.Response(
+            200,
+            content=b"not json",
+            headers=[(b"content-type", b"text/plain\xc2\x9b31m\x1b]0;t\x07")],
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    message = str(exc.value)
+    assert all(ch.isprintable() for ch in message)
+    assert "text/plain?31m" in message
