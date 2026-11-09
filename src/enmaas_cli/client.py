@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from .auth import REDACTION, redact
+from .auth import cut_redacted, redact
 from .dialect import Request
 from .errors import BadReplyError
 
@@ -62,17 +62,8 @@ def _retry_after(response: httpx.Response) -> float | None:
 
 
 def _error_detail(body: str, secret: str) -> str:
-    """Redact the key from an error body, then cut it to a bounded length.
-
-    The cut never splits the placeholder, so a reader can still see that a
-    key was removed.
-    """
-    redacted = redact(body, secret)
-    cut = ERROR_BODY_CHARS
-    start = redacted.find(REDACTION, max(0, cut - len(REDACTION) + 1))
-    if 0 <= start < cut:
-        cut = start + len(REDACTION)
-    return redacted[:cut]
+    """Redact the key from an error body, then cut it to a bounded length."""
+    return cut_redacted(redact(body, secret), ERROR_BODY_CHARS)
 
 
 def _reply_object(response: httpx.Response) -> dict[str, Any]:

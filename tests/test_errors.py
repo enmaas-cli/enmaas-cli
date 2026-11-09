@@ -39,3 +39,26 @@ def test_old_import_paths_give_the_same_classes() -> None:
     assert client.GatewayError is errors.GatewayError
     assert dialect.EmptyResponseError is errors.EmptyResponseError
     assert dialect.Usage is tokens.Usage
+
+
+def _raise_type_error() -> None:
+    raise TypeError("text that must never be reported")
+
+
+def test_where_names_the_class_and_the_innermost_frame() -> None:
+    import re
+
+    from enmaas_cli.errors import where
+
+    try:
+        _raise_type_error()
+    except TypeError as exc:
+        found = where(exc)
+    assert re.fullmatch(r"TypeError at test_errors\.py:\d+", found)
+    assert "never be reported" not in found
+
+
+def test_where_without_a_traceback_is_the_class_name() -> None:
+    from enmaas_cli.errors import where
+
+    assert where(ValueError("text that must never be reported")) == "ValueError"

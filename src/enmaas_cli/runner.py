@@ -6,7 +6,6 @@ import asyncio
 import json
 import sys
 import time
-import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +25,7 @@ from .dialect import (
     resolve_dialect,
     thinking_off_payload,
 )
-from .errors import CallError
+from .errors import CallError, where
 from .outputs import protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
 
@@ -137,16 +136,8 @@ def validate_all(template: str, items: list[dict[str, Any]]) -> None:
 
 
 def _internal_message(exc: BaseException) -> str:
-    """Class name and the innermost frame. Never the exception text, which is unreviewed.
-
-    An error that no handler expected can carry any text, including part of
-    a reply or a prompt, so only where it happened is reported.
-    """
-    frames = traceback.extract_tb(exc.__traceback__)
-    if not frames:
-        return f"internal error ({type(exc).__name__})"
-    last = frames[-1]
-    return f"internal error ({type(exc).__name__} at {Path(last.filename).name}:{last.lineno})"
+    """Where an unexpected error happened. Never its text, which is unreviewed."""
+    return f"internal error ({where(exc)})"
 
 
 def _charge_row(charge: int, *, items: int) -> str:

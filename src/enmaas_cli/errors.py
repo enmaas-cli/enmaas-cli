@@ -7,7 +7,24 @@ budget even when the request failed.
 
 from __future__ import annotations
 
+import traceback
+from pathlib import Path
+
 from .tokens import Usage
+
+
+def where(exc: BaseException) -> str:
+    """Class name and the innermost frame: `TypeError at runner.py:123`. Never the exception text.
+
+    An error that no handler expected can carry any text, including part of
+    a reply or a prompt, so only where it happened is reported. With no
+    traceback frames this is the class name alone.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return type(exc).__name__
+    last = frames[-1]
+    return f"{type(exc).__name__} at {Path(last.filename).name}:{last.lineno}"
 
 
 class CallError(Exception):

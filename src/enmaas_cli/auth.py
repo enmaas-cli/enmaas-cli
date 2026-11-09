@@ -150,3 +150,34 @@ def redact(text: str, key: str) -> str:
     if not key:
         return text
     return text.replace(key, REDACTION)
+
+
+def cut_redacted(text: str, limit: int) -> str:
+    """Cut already-redacted text to `limit` characters without splitting the placeholder.
+
+    A placeholder that straddles the limit is kept whole, so a reader can
+    still see that a key was removed. Redact before calling this: a cut made
+    first can leave part of a key that redaction no longer matches.
+    """
+    cut = limit
+    start = text.find(REDACTION, max(0, cut - len(REDACTION) + 1))
+    if 0 <= start < cut:
+        cut = start + len(REDACTION)
+    return text[:cut]
+
+
+_LINE_BREAKS = frozenset("\n\r\t")
+
+
+def printable(text: str) -> str:
+    """Make text safe to print on one terminal line.
+
+    Text from the gateway can hold a newline that forges a receipt line, or
+    an escape sequence that the terminal acts on. Every character that
+    `str.isprintable()` rejects is replaced: a newline, carriage return or
+    tab becomes a space, and any other becomes "?". Printable characters,
+    including non-ASCII letters, pass through unchanged.
+    """
+    if text.isprintable():
+        return text
+    return "".join(ch if ch.isprintable() else (" " if ch in _LINE_BREAKS else "?") for ch in text)
