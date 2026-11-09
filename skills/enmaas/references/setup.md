@@ -15,6 +15,29 @@ whose directory is absent.
 
 ## Install or update the CLI, skill and guard
 
+There are two routes. Decide which one applies before running anything, because
+they install different parts.
+
+### When enmaas came from a plugin marketplace
+
+If this skill was loaded from a plugin, the plugin already supplies the skill
+and the output guard. Install the command only:
+
+```bash
+git clone https://github.com/enmaas-cli/enmaas-cli.git
+cd enmaas-cli
+./install.sh --cli-only --gateway URL
+```
+
+Do not run the installer without `--cli-only` in this case. The full run adds a
+second skill directory and registers a second guard alongside the plugin's, and
+the duplicates then have to be removed by hand.
+
+To update, bump the plugin to a newer version for the skill and guard, and run
+`./install.sh --cli-only` again in a refreshed clone for the command.
+
+### When enmaas is installed on its own
+
 Everything installs from a clone of `https://github.com/enmaas-cli/enmaas-cli`:
 
 ```bash
@@ -23,14 +46,16 @@ cd enmaas-cli
 ./install.sh --gateway URL
 ```
 
-Ask the user for the gateway URL before running it. The installer writes the
-URL to the config file and cannot finish without one when it has no terminal to
-ask on.
-
 To update an existing install, `git pull` in that clone and run `./install.sh`
 again. A complete run leaves the command, the skill copy and the guard copy at
 the same version; if it stops partway, fix what it reports and run it again. An
 older CLI may lack `inspect`, `--version` or output markers.
+
+### Both routes
+
+Ask the user for the gateway URL before running the installer. It writes the
+URL to the config file and cannot finish without one when it has no terminal to
+ask on.
 
 After it finishes, check `enmaas --version`, `enmaas --help` and
 `enmaas inspect --help` on the assistant's `PATH` before proceeding.
