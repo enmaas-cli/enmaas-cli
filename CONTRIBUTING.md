@@ -1,21 +1,28 @@
 # Contributing
 
-## Branch protection is not enforced yet
+## Branch protection
 
-This repository is private on a Free plan, where GitHub offers neither classic
-branch protection nor rulesets. Pull requests and reviews are therefore
-convention here, not a gate. Direct pushes to `main` are technically possible
-and should not be used.
+This repository is public, so GitHub rulesets are available and `main` is
+protected by one. Direct pushes to `main` are refused. The rules in force:
 
-Protection becomes available if the repository is made public, or if the
-organisation moves to a paid plan. The intended settings, ready to apply:
-
-- require a pull request, with at least one approving review
+- require a pull request before merging
 - dismiss stale approvals when new commits are pushed
 - require the `check (3.11)`, `check (3.12)`, `check (3.13)`, `check (3.14)` and `install` status checks
 - block force pushes and branch deletion
-- allow repository admins to bypass, so a solo maintainer is not locked out of
-  merging their own work
+
+Approving reviews are not required, because a single maintainer would have to
+bypass the rule on every merge, and a gate that is bypassed by habit protects
+nothing. Review stays a convention. Raise the required approval count to one as
+soon as a second maintainer can review.
+
+The ruleset has no bypass actors. That is deliberate: the plugin this
+repository ships registers a `PreToolUse` hook, so whoever controls `main`
+controls code that runs in every consumer's agent session. The pull request and
+the status checks are the control that protects them, and an owner-shaped hole
+in it would protect them a good deal less.
+
+Release tags are protected too, so a published tag cannot be moved after the
+fact. Consumers that pin a tag and a commit SHA get the commit they pinned.
 
 ## Workflow
 

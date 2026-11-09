@@ -1,0 +1,19 @@
+{
+  "name": "enmaas",
+  "version": "0.7.0",
+  "description": "Delegate bulk or one-shot model work to an EnMaaS gateway, with responses written to files instead of your context",
+  "author": {
+    "name": "Ed Parenti",
+    "email": "eparenti@redhat.com"
+  },
+  "homepage": "https://github.com/enmaas-cli/enmaas-cli",
+  "repository": "https://github.com/enmaas-cli/enmaas-cli",
+  "license": "Apache-2.0",
+  "keywords": [
+    "ai",
+    "delegation",
+    "cost",
+    "batch",
+    "enmaas"
+  ]
+}

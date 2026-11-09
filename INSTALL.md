@@ -14,7 +14,8 @@ You need:
   is an endpoint that serves the OpenAI or Anthropic API shape under `/v1`, such
   as EnMaaS. Steps 1, 2 and 5 work
   without the key. Steps 4 and 6 need it.
-- Access to this repository. If `git clone` is refused, ask the repository owner (eparenti) to add you.
+- Network access to GitHub. The repository is public, so `git clone` needs no
+  account or credential.
 
 Claude Code or Codex are optional. The CLI works on its own. The installer sets up
 the agent pieces for each host whose configuration directory exists (`~/.claude`,

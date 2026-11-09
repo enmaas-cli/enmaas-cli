@@ -1,0 +1,7 @@
+{
+  "name": "enmaas",
+  "version": "0.7.0",
+  "description": "Delegate bulk or one-shot model work to an EnMaaS gateway, with responses written to files instead of your context",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

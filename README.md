@@ -53,6 +53,22 @@ whichever of Claude Code and Codex it finds. Put your key in `~/.secrets/enmaas`
 run `enmaas models`, and you are done. The **[install guide](INSTALL.md)** has every
 step, the host setup, and a troubleshooting table.
 
+### From a plugin marketplace
+
+This repository is also a Claude Code plugin. A marketplace that lists it
+installs the skill and the output guard in one step:
+
+```
+/plugin install enmaas --marketplace <owner>/<repo>
+```
+
+The plugin cannot install the `enmaas` command itself, so add it separately and
+skip the skill and guard, which the plugin already provides:
+
+```bash
+./install.sh --cli-only --gateway https://GATEWAY-HOST
+```
+
 ## Use
 
 **Ask** once, answer to a file:
