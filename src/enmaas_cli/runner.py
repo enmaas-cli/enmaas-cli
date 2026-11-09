@@ -234,7 +234,7 @@ class MapOutcome:
     total: int
     # Not a bool. A second way to abort arrived with token budgets, and a
     # receipt saying only "ABORTED" sends people hunting for failures that
-    # never happened. One of None, "breaker", "budget".
+    # never happened. One of None, "breaker", "budget", "interrupted".
     abort_reason: str | None
     input_tokens: int
     output_tokens: int
@@ -684,11 +684,20 @@ async def run_map(
                         abort_reason = "budget"
                         tripped_budget = name
 
-    if batch > 1:
-        groups = [pending[n : n + batch] for n in range(0, len(pending), batch)]
-        await asyncio.gather(*(process_batch(g) for g in groups))
-    else:
-        await asyncio.gather(*(process(item) for item in pending))
+    try:
+        if batch > 1:
+            groups = [pending[n : n + batch] for n in range(0, len(pending), batch)]
+            await asyncio.gather(*(process_batch(g) for g in groups))
+        else:
+            await asyncio.gather(*(process(item) for item in pending))
+    except asyncio.CancelledError:
+        # The stop arrived by signal. Rows already written are complete,
+        # because recording never awaits, so the counts are final here.
+        # Requests still in flight are dropped and not recorded. This
+        # reason replaces any earlier one, because the process is about
+        # to end by the signal.
+        abort_reason = "interrupted"
+        tripped_budget = None
 
     return MapOutcome(
         ok=counts["ok"],

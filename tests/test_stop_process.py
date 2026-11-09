@@ -281,3 +281,98 @@ def test_a_run_that_ends_normally_leaves_no_record(cli: Cli, gateway: Gateway) -
     assert not cli.open_runs().exists()
     (event,) = cli.events()
     assert event["charge"] == 3 * CHARGE
+
+
+def _stop_after(
+    cli: Cli, args: list[str], index: Path, charged: int, signum: int
+) -> subprocess.CompletedProcess[str]:
+    """Start a map, wait until `charged` charge rows exist and a request is held, signal it."""
+    child = cli.start(*args)
+    _wait_for(lambda: len(_charges(index)) >= charged, f"{charged} charge rows", child)
+    _wait_for(_held(cli.gateway, 1), "a held request", child)
+    child.send_signal(signum)
+    out, err = child.communicate(timeout=DEADLINE)
+    return subprocess.CompletedProcess(child.args, child.returncode, out, err)
+
+
+def test_sigterm_records_the_run_and_ends_by_the_signal(cli: Cli, gateway: Gateway) -> None:
+    gateway.answer_first = 2
+    index = cli.tmp / "job" / "results.jsonl"
+    done = _stop_after(cli, cli.map_args("job", 5), index, 2, signal.SIGTERM)
+    assert done.returncode == -signal.SIGTERM, done.stderr
+    (event,) = cli.events()
+    assert event["error_kind"] == "Interrupted"
+    assert event["status"] == "error"
+    assert event["charge"] == sum(_charges(index)) == 2 * CHARGE
+    assert "enmaas map interrupted" in done.stdout
+    assert "re-run with --resume" in done.stdout
+    assert not cli.open_runs().exists()
+    assert "Traceback" not in done.stderr
+
+
+def test_sigint_with_json_prints_one_object(cli: Cli, gateway: Gateway) -> None:
+    gateway.answer_first = 2
+    index = cli.tmp / "job" / "results.jsonl"
+    done = _stop_after(cli, cli.map_args("job", 5, "--json"), index, 2, signal.SIGINT)
+    assert done.returncode == -signal.SIGINT, done.stderr
+    obj = json.loads(done.stdout)
+    assert obj["status"] == "aborted"
+    assert obj["abort_reason"] == "interrupted"
+    assert obj["ok"] == 2
+    (event,) = cli.events()
+    assert event["error_kind"] == "Interrupted"
+    assert event["charge"] == 2 * CHARGE
+    assert not cli.open_runs().exists()
+    assert "Traceback" not in done.stderr
+
+
+def test_sigterm_on_a_resumed_run_counts_only_its_own_rows(cli: Cli, gateway: Gateway) -> None:
+    gateway.answer_first = 2
+    first = cli.run(*cli.map_args("job", 2))
+    assert first.returncode == 0, first.stderr
+    gateway.answer_first = 4
+    index = cli.tmp / "job" / "results.jsonl"
+    done = _stop_after(cli, cli.map_args("job", 6, "--resume"), index, 4, signal.SIGTERM)
+    assert done.returncode == -signal.SIGTERM, done.stderr
+    assert [(e["error_kind"], e["charge"]) for e in cli.events()] == [
+        (None, 2 * CHARGE),
+        ("Interrupted", 2 * CHARGE),
+    ]
+    assert not cli.open_runs().exists()
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["receipt", "json"])
+def test_sigterm_during_ask_ends_cleanly_and_records_nothing(
+    cli: Cli, gateway: Gateway, as_json: bool
+) -> None:
+    gateway.answer_first = 0
+    args = ["ask", "-m", MODEL, "--dialect", "openai", "-p", "hello", "--retries", "0"]
+    child = cli.start(*args, *(["--json"] if as_json else []))
+    _wait_for(_held(gateway, 1), "a held request", child)
+    child.send_signal(signal.SIGTERM)
+    out, err = child.communicate(timeout=DEADLINE)
+    assert child.returncode == -signal.SIGTERM, err
+    assert "Traceback" not in err
+    assert cli.events() == []
+    if as_json:
+        obj = json.loads(out)
+        assert obj["status"] == "error"
+        assert obj["error"] == "interrupted"
+    else:
+        assert "error: interrupted" in err
+
+
+def test_a_closed_stdout_does_not_fail_the_run(cli: Cli, gateway: Gateway) -> None:
+    gateway.answer_first = 0
+    child = cli.start(*cli.map_args("job", 2))
+    _wait_for(_held(gateway, 1), "a held request", child)
+    assert child.stdout is not None
+    child.stdout.close()
+    gateway.release.set()
+    _, err = child.communicate(timeout=DEADLINE)
+    assert child.returncode == 0, err
+    (event,) = cli.events()
+    assert event["status"] == "ok"
+    assert event["charge"] == 2 * CHARGE
+    assert "BrokenPipeError" not in err
+    assert "Traceback" not in err

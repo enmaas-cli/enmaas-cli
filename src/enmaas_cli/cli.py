@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import enum
 import importlib.metadata
 import ipaddress
 import json
 import os
+import signal
 import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn, TextIO, cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -645,6 +647,71 @@ def _setup_error(args: argparse.Namespace, message: str) -> int:
     return int(ExitCode.ERROR)
 
 
+def _emit(text: str, stream: TextIO | None = None) -> None:
+    """Print one block and flush it. A reader that went away is not an error.
+
+    The work is done and recorded before anything is printed, so a closed
+    pipe must not turn a finished run into a failure or a traceback. The
+    stream defaults to the current sys.stdout at call time, not at import.
+    """
+    target = sys.stdout if stream is None else stream
+    try:
+        print(text, file=target, flush=True)
+    except BrokenPipeError:
+        # Point the descriptor at /dev/null, so the flush at exit also
+        # succeeds and Python does not report the closed pipe.
+        with contextlib.suppress(OSError, ValueError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, target.fileno())
+            finally:
+                os.close(devnull)
+
+
+@dataclass
+class Interrupt:
+    """The first stop signal this process received, if any."""
+
+    signum: int | None = None
+
+
+async def _guarded(
+    args: argparse.Namespace,
+    config: Config,
+    base_url: str,
+    key: str,
+    interrupt: Interrupt,
+) -> int:
+    """Run the command with SIGINT and SIGTERM turned into a cancel.
+
+    The cancel lets an interrupted map write its ledger event and print its
+    receipt before the process ends by the same signal.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+
+    def on_signal(signum: int) -> None:
+        # Only the first signal acts. Later ones are ignored so the ledger
+        # line is always written.
+        if interrupt.signum is None and task is not None:
+            interrupt.signum = signum
+            task.cancel()
+
+    with contextlib.suppress(NotImplementedError, ValueError, RuntimeError):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(signum, on_signal, signum)
+    try:
+        return await _dispatch(args, config, base_url, key)
+    except asyncio.CancelledError:
+        return _setup_error(args, "interrupted")
+
+
+def _flush_quietly() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command in {"inspect", "allow-read"}:
@@ -692,11 +759,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"warning: {key.warning}", file=sys.stderr)
         key_value = key.value
 
+    interrupt = Interrupt()
     try:
-        return asyncio.run(_dispatch(args, config, base_url, key_value))
-    except (DialectError, ValidationError, ValueError, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return int(ExitCode.ERROR)
+        try:
+            code = asyncio.run(_guarded(args, config, base_url, key_value, interrupt))
+        except (DialectError, ValidationError, ValueError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            code = int(ExitCode.ERROR)
+        if interrupt.signum is not None:
+            _flush_quietly()
+    except KeyboardInterrupt:
+        # SIGINT outside the window where the loop handles it, either
+        # before the handler is installed or after it is removed.
+        if interrupt.signum is None:
+            interrupt.signum = signal.SIGINT
+        code = int(ExitCode.ERROR)
+    if interrupt.signum is not None:
+        # End by the same signal, so the parent sees how the process stopped
+        # (130 or 143 in a shell) rather than an ordinary exit code.
+        _flush_quietly()
+        signal.signal(interrupt.signum, signal.SIG_DFL)
+        os.kill(os.getpid(), interrupt.signum)
+        return 128 + interrupt.signum
+    return code
 
 
 async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key: str) -> int:
@@ -887,13 +972,13 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                     "replaced": (result.completion.replaced if result.completion else 0),
                     "error": result.error,
                 }
-                print(json.dumps(ask_obj, indent=2))
+                _emit(json.dumps(ask_obj, indent=2))
             elif args.stdout and result.exit_code == ExitCode.OK:
-                print(result.completion.text if result.completion else "")
-                print(result.receipt, file=sys.stderr)
+                _emit(result.completion.text if result.completion else "")
+                _emit(result.receipt, sys.stderr)
             else:
                 stream = sys.stdout if result.exit_code == ExitCode.OK else sys.stderr
-                print(result.receipt, file=stream)
+                _emit(result.receipt, stream)
             return result.exit_code
 
         model, model_defaulted = _resolve_model(args.model, config)
@@ -943,6 +1028,7 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
             error_kind = {
                 "breaker": "CircuitBreakerError",
                 "budget": "TokenBudgetExceeded",
+                "interrupted": "Interrupted",
             }.get(outcome.abort_reason or "", "PartialFailure")
         recorded = append_event(
             state_root() / "usage.jsonl",
@@ -1039,9 +1125,9 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                     {"id": item_id, "error": message} for item_id, message in outcome.failures
                 ],
             }
-            print(json.dumps(obj, indent=2))
+            _emit(json.dumps(obj, indent=2))
         else:
-            print(
+            _emit(
                 map_receipt(
                     outcome,
                     model=model,

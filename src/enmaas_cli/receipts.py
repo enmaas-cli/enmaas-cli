@@ -135,6 +135,8 @@ def map_receipt(
         header = "enmaas map stopped on budget"
     elif outcome.abort_reason == "breaker":
         header = "enmaas map ABORTED (too many failures)"
+    elif outcome.abort_reason == "interrupted":
+        header = "enmaas map interrupted"
     else:
         header = "enmaas map ok"
 
