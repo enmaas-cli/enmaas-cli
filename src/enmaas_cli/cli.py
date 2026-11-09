@@ -757,6 +757,11 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
 
         return int(ExitCode.OK)
 
+    if args.command in ("ask", "map"):
+        # Charge any map run that died without writing its ledger event,
+        # before the budget is checked, so the check sees that spend.
+        openruns.settle(state_root(), state_root() / "usage.jsonl")
+
     # Both spending commands pass through here. Checked before the client
     # is opened, so an over-budget invocation costs nothing at all.
     rolling = rolling_check(config, state_root() / "usage.jsonl")
@@ -894,6 +899,13 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
         model, model_defaulted = _resolve_model(args.model, config)
         dialect = _resolve_dialect_override(model, args.dialect, config)
         batch_defaulted = args.batch is None
+        # Resolved before the run, because the open-run record carries it.
+        resolved_dialect = resolve_dialect(model, dialect)
+        # When run_map raises, the record stays on purpose. The next ask or
+        # map settles it, so spend from a run that died on an error counts.
+        record = openruns.begin(
+            state_root(), outdir=args.outdir, model=model, dialect=resolved_dialect
+        )
 
         outcome = await run_map(
             client=client,
@@ -924,8 +936,6 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
             ),
         )
 
-        # Log usage (resolve dialect for logging)
-        resolved_dialect = resolve_dialect(model, dialect)
         error_kind = None
         if outcome.abort_reason is not None or outcome.failed > 0:
             # Was hardcoded to CircuitBreakerError for any abort, which
@@ -958,6 +968,10 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
             ),
         )
         _warn_if_untracked(recorded, config)
+        # Removed after the ledger event, never before. A kill between the two
+        # counts this run twice, which only over-counts. The other order
+        # could lose the spend.
+        openruns.end(state_root(), record)
 
         if args.json:
             status = (
