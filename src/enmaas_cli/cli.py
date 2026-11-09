@@ -22,19 +22,19 @@ import httpx
 
 from .auth import AuthError, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
-from .client import GatewayError, call
+from .client import call
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
     Dialect,
     DialectError,
-    EmptyResponseError,
     Usage,
     build_request,
     default_max_tokens,
     parse_response,
     resolve_dialect,
 )
+from .errors import CallError
 from .outputs import (
     MAX_INSPECT_CHARS,
     allow_read,
@@ -356,7 +356,7 @@ async def run_ask(
     try:
         data = await call(client, base_url, request, timeout=timeout, retries=retries, secret=key)
         completion = parse_response(data, resolved)
-    except (GatewayError, EmptyResponseError) as exc:
+    except CallError as exc:
         elapsed = time.monotonic() - started
         error_msg = redact(str(exc), key)
         return AskResult(
@@ -372,7 +372,8 @@ async def run_ask(
             completion=None,
             elapsed=elapsed,
             error=error_msg,
-            usage=exc.usage if isinstance(exc, EmptyResponseError) else None,
+            # Usage() means the reply reported nothing, which is not a charge.
+            usage=exc.usage if exc.usage != Usage() else None,
         )
 
     if schema is not None:
