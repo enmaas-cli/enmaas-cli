@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from collections.abc import Mapping
@@ -159,10 +160,19 @@ def resolve_key(
 
 
 def redact(text: str, key: str) -> str:
-    """Replace every occurrence of the key with a placeholder."""
+    """Replace every occurrence of the key with a placeholder.
+
+    The JSON-escaped form is replaced too. A gateway that echoes a key
+    holding a quote or a backslash in a JSON error body writes it escaped,
+    and the plain form would not match there.
+    """
     if not key:
         return text
-    return text.replace(key, REDACTION)
+    text = text.replace(key, REDACTION)
+    escaped = json.dumps(key)[1:-1]
+    if escaped != key:
+        text = text.replace(escaped, REDACTION)
+    return text
 
 
 def cut_redacted(text: str, limit: int) -> str:

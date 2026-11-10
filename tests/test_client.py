@@ -360,3 +360,22 @@ async def test_invalid_url_from_the_transport_is_terminal_gateway_error() -> Non
     assert exc.value.status is None
     assert exc.value.attempts == 1
     assert "InvalidURL" in str(exc.value)
+
+
+async def test_a_key_echoed_json_escaped_in_an_error_body_is_redacted() -> None:
+    import json
+
+    key = 'sk-a"b\\c-123'
+    echoed = json.dumps({"error": {"message": f"invalid key {key}"}})
+    assert key not in echoed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, content=echoed.encode(), headers={"content-type": "json"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GatewayError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=0, sleep=_no_sleep, secret=key)
+    message = str(exc.value)
+    assert json.dumps(key)[1:-1] not in message
+    assert key not in message
+    assert "REDACTED" in message
