@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import math
 import random
 import time
@@ -19,6 +18,7 @@ from .errors import BadReplyError
 
 # Re-exported so existing importers of this name from this module keep working.
 from .errors import GatewayError as GatewayError
+from .gateway import is_loopback
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 # 90% of the measured ~300s gateway ceiling.
@@ -189,19 +189,6 @@ async def call(
         status=last_status,
         attempts=retries + 1,
     )
-
-
-def is_loopback(host: str | None) -> bool:
-    """Whether a host names this machine: localhost or a loopback address."""
-    if host is None:
-        # A missing host is reported by the URL check itself.
-        return True
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 def make_client(base_url: str) -> httpx.AsyncClient:

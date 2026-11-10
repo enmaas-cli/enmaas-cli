@@ -19,14 +19,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn, TextIO, cast
-from urllib.parse import urlsplit
 
 import httpx
 
-from . import openruns
+from . import gateway, openruns
 from .auth import AuthError, cut_redacted, printable, printable_block, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
-from .client import _reply_object, call, is_loopback, make_client
+from .client import _reply_object, call, make_client
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
@@ -70,8 +69,6 @@ from .usage import (
     summarize_usage,
     write_event,
 )
-
-BASE_URL_ENV = "ENMAAS_BASE_URL"
 
 
 class ExitCode(enum.IntEnum):
@@ -686,63 +683,36 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
     return RollingCheck(spent, config.budget_tokens, message=None)
 
 
+# How each gateway URL problem is worded. The text after "not valid" is
+# part of the message a user or a script may match.
+GATEWAY_PROBLEMS = {
+    gateway.WHITESPACE: "whitespace inside the URL",
+    gateway.SCHEME: "scheme must be http or https",
+    gateway.CLEARTEXT: "http is only allowed for localhost, use https",
+    gateway.QUERY: "query and fragment are not allowed",
+    gateway.CREDENTIALS: "credentials in the URL are not allowed",
+    gateway.HOST: "missing host",
+    gateway.PORT: "invalid port",
+}
+
+
 def resolve_base_url(configured: str | None, env: Mapping[str, str], config_path: Path) -> str:
     """Pick the gateway URL: $ENMAAS_BASE_URL first, then base_url in the config.
 
     There is no built-in default. Each organization runs its own gateway,
     so a guessed address would send the key somewhere it was never meant
     to go. Raises ValueError with the message to show.
-
-    The URL is the gateway root. The CLI appends /v1/... to it, so a path
-    the user typed, such as /v1, is kept as typed. The scheme is lowered,
-    the host keeps its case, and trailing slashes are removed.
     """
-    url = env.get(BASE_URL_ENV, "").strip() or (configured or "").strip()
+    url = gateway.choose(configured, env)
     if not url:
         raise ValueError(
             f"no gateway URL configured: set base_url in {config_path}, "
-            f"set ${BASE_URL_ENV}, or run ./install.sh --gateway URL"
+            f"set ${gateway.BASE_URL_ENV}, or run ./install.sh --gateway URL"
         )
-    return _validate_gateway_url(url)
-
-
-def _validate_gateway_url(url: str) -> str:
-    def invalid(reason: str) -> ValueError:
-        return ValueError(f"gateway URL is not valid ({reason}): {url}")
-
-    if any(ch.isspace() for ch in url):
-        raise invalid("whitespace inside the URL")
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        # urlsplit only raises here for a malformed bracketed IPv6 host.
-        raise invalid("missing host") from None
-    if parts.scheme.lower() not in {"http", "https"}:
-        raise invalid("scheme must be http or https")
-    # The key travels in a header, so cleartext http would send it across
-    # the network readable to anyone on the path. A local gateway or
-    # tunnel is the only place where that is safe.
-    if parts.scheme.lower() == "http" and not is_loopback(parts.hostname):
-        raise invalid("http is only allowed for localhost, use https")
-    # Checked on the raw text: "https://h?" has an empty query, yet the
-    # appended request path would still land after the "?".
-    if "?" in url or "#" in url:
-        raise invalid("query and fragment are not allowed")
-    # The key travels in a header. Credentials in the URL would be a
-    # second secret that ends up in logs and error messages.
-    if "@" in parts.netloc:
-        raise invalid("credentials in the URL are not allowed")
-    # Without a host, "https://" plus "/v1/models" would send the key to a
-    # host named "v1".
-    if not parts.hostname:
-        raise invalid("missing host")
-    try:
-        _ = parts.port
-    except ValueError:
-        # httpx would raise InvalidURL later, outside any handler.
-        raise invalid("invalid port") from None
-    # Request paths start with a slash, so a trailing one here would double it.
-    return f"{parts.scheme.lower()}://{parts.netloc}{parts.path.rstrip('/')}"
+    checked = gateway.check(url)
+    if checked.problem is not None:
+        raise ValueError(f"gateway URL is not valid ({GATEWAY_PROBLEMS[checked.problem]}): {url}")
+    return checked.url
 
 
 def _setup_error(args: argparse.Namespace, message: str) -> int:
