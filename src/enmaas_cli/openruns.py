@@ -220,32 +220,65 @@ def _load(state_dir: Path) -> list[OpenRun]:
     return runs
 
 
-def _store(state_dir: Path, runs: list[OpenRun]) -> None:
-    """Replace the data file in one step, or remove it when no record is left.
+def _temporary(state_dir: Path) -> tuple[Path, int]:
+    path = state_dir / f".{OPEN_RUNS_FILE}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    return path, fd
+
+
+def _discard(temporary: Path | None) -> None:
+    if temporary is not None:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+
+
+def _prepare(state_dir: Path, runs: list[OpenRun]) -> Path | None:
+    """Write the next version of the data file beside it, without replacing it yet.
+
+    Returns the temporary file, or None when no record is left. Then it
+    proves the directory can be written by creating and removing an empty
+    temporary file, so the unlink in _commit is not the first write to fail.
 
     Refuses a list the loader would refuse, so a write can never turn a
     readable file into an ignored one.
     """
-    path = state_dir / OPEN_RUNS_FILE
     if not runs:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
-        return
+        path, fd = _temporary(state_dir)
+        os.close(fd)
+        os.unlink(path)
+        return None
     text = "".join(json.dumps(asdict(run)) + "\n" for run in runs)
     if len(runs) > MAX_RECORDS or len(text.encode("utf-8")) > MAX_FILE_BYTES:
         raise OSError("the open-run record file would be too large")
-    temporary = state_dir / f".{OPEN_RUNS_FILE}.{secrets.token_hex(8)}.tmp"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    temporary, fd = _temporary(state_dir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
+    except BaseException:
+        _discard(temporary)
+        raise
+    return temporary
+
+
+def _commit(state_dir: Path, temporary: Path | None) -> None:
+    """Put a prepared version in place in one step, or remove the data file."""
+    path = state_dir / OPEN_RUNS_FILE
+    if temporary is None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        return
+    try:
         os.replace(temporary, path)
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
+        _discard(temporary)
         raise
+
+
+def _store(state_dir: Path, runs: list[OpenRun]) -> None:
+    """Replace the data file in one step, or remove it when no record is left."""
+    _commit(state_dir, _prepare(state_dir, runs) if runs else None)
 
 
 def _require_owner(info: os.stat_result) -> None:
@@ -501,10 +534,23 @@ def settle(state_dir: Path, ledger: Path) -> None:
 
 
 def _settle(state_dir: Path, ledger: Path) -> None:
+    """Settle under the lock. The order makes a failed write never charge a run twice.
+
+    1. Decide which records are dead and what each owes. Nothing is written.
+    2. Prepare the record file as it will be once every event is taken. If
+       that fails, return before anything is appended.
+    3. Append the events.
+    4. All taken: commit the prepared file. Otherwise discard it and store
+       the list with the records whose event was not taken.
+
+    The window that remains: a stop between step 3 and the commit counts
+    those runs twice, once.
+    """
     with _locked(state_dir):
         runs = _load(state_dir)
         now = datetime.now(UTC)
         kept: list[OpenRun] = []
+        owed: list[tuple[OpenRun, int]] = []
         warned = False
         budget = MAX_READ_BYTES
         remaining = budget
@@ -529,13 +575,27 @@ def _settle(state_dir: Path, ledger: Path) -> None:
                 # A record that had the full budget and still did not finish
                 # is settled with what was read. Keeping it would block every
                 # later command on the same read.
-                charge = read.charge
-                if charge > 0 and not append_event(ledger, _killed_event(run, charge, now)):
-                    kept.append(run)
+                if read.charge > 0:
+                    owed.append((run, read.charge))
             except Exception as exc:
                 warned = _warn_dropped(exc, warned)
-        if len(kept) != len(runs):
-            _store(state_dir, kept)
+        if len(kept) == len(runs):
+            return
+        temporary = _prepare(state_dir, kept)
+        try:
+            refused = [
+                run
+                for run, charge in owed
+                if not append_event(ledger, _killed_event(run, charge, now))
+            ]
+        except BaseException:
+            _discard(temporary)
+            raise
+        if not refused:
+            _commit(state_dir, temporary)
+            return
+        _discard(temporary)
+        _store(state_dir, [run for run in runs if run in kept or run in refused])
 
 
 def _warn_dropped(exc: Exception, warned: bool) -> bool:

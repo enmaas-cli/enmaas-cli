@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from enmaas_cli import budget, openruns
+from enmaas_cli import usage as usage_module
 from enmaas_cli.cli import rolling_check
 from enmaas_cli.config import Config
 from enmaas_cli.openruns import OpenRun
@@ -164,7 +165,9 @@ def test_every_change_holds_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyP
     _write_records(state, [dead])
     openruns.settle(state, state / "usage.jsonl")
     lock = f"flock {fcntl.LOCK_EX | fcntl.LOCK_NB}"
-    assert events == [lock, "replace", lock, "unlink", lock, "unlink"]
+    # settle proves the directory is writable (an empty temporary file is
+    # made and removed) before it appends, then removes the data file.
+    assert events == [lock, "replace", lock, "unlink", lock, "unlink", "unlink"]
 
 
 def test_settle_writes_one_killed_event_and_removes_the_record(tmp_path: Path) -> None:
@@ -1190,3 +1193,87 @@ def test_a_run_whose_ledger_event_was_not_written_keeps_its_record(
         ("ask", None, 7),
     ]
     assert not (state / openruns.OPEN_RUNS_FILE).exists()
+
+
+def test_settle_appends_nothing_when_the_record_file_cannot_be_rewritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(5)])
+    path = _write_records(state, [_record(outdir=str(outdir))])
+    before = path.read_bytes()
+
+    def prepare(state_dir: Path, runs: list[OpenRun]) -> Path | None:
+        raise OSError("read-only directory")
+
+    monkeypatch.setattr(openruns, "_prepare", prepare)
+    for _ in range(4):
+        openruns.settle(state, state / "usage.jsonl")
+    assert _ledger_rows(state / "usage.jsonl") == []
+    assert path.read_bytes() == before
+
+
+def test_settle_appends_again_when_the_commit_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented window: the event is in the ledger, the record is not yet removed.
+
+    A failure between the append and the commit counts that run twice, once.
+    """
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(5, run="dead")])
+    _write_records(
+        state,
+        [
+            _record(outdir=str(outdir), run_id="dead"),
+            _record(outdir=str(outdir), run_id="live", pid=os.getppid()),
+        ],
+    )
+    real_replace = os.replace
+    failures = 1
+
+    def replace(src: Any, dst: Any) -> None:
+        nonlocal failures
+        if failures:
+            failures -= 1
+            raise OSError("disk full")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    openruns.settle(state, state / "usage.jsonl")
+    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
+    assert _run_ids(state) == ["dead", "live"]
+    assert [p.name for p in state.iterdir() if p.name.endswith(".tmp")] == []
+    openruns.settle(state, state / "usage.jsonl")
+    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5, 5]
+    assert _run_ids(state) == ["live"]
+
+
+def test_settle_keeps_only_the_records_whose_event_was_not_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    _index(tmp_path / "a", [_charge(3, run="a")])
+    _index(tmp_path / "b", [_charge(5, run="b")])
+    _write_records(
+        state,
+        [
+            _record(outdir=str(tmp_path / "a"), run_id="a"),
+            _record(outdir=str(tmp_path / "b"), run_id="b"),
+        ],
+    )
+    real_append = usage_module.append_event
+    calls = 0
+
+    def append_event(ledger: Path, event: Any) -> bool:
+        nonlocal calls
+        calls += 1
+        return False if calls == 1 else real_append(ledger, event)
+
+    monkeypatch.setattr(openruns, "append_event", append_event)
+    openruns.settle(state, state / "usage.jsonl")
+    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
+    assert _run_ids(state) == ["a"]
+    assert [p.name for p in state.iterdir() if p.name.endswith(".tmp")] == []
