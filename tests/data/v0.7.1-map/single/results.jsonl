@@ -1,0 +1,8 @@
+{"type": "request", "charge": 46, "items": 1}
+{"id": "a", "status": "ok", "path": "single/a.md", "tokens": {"in": 40, "out": 6}, "error": null}
+{"type": "request", "charge": 0, "items": 1}
+{"id": "b", "status": "error", "path": null, "tokens": null, "error": "500: the gateway is down"}
+{"type": "request", "charge": 35, "items": 1}
+{"id": "c", "status": "ok", "path": "single/c.md", "tokens": {"in": 30, "out": 5}, "replaced": 1, "error": null}
+{"type": "request", "charge": 46, "items": 1}
+{"id": "d", "status": "ok", "path": "single/d.md", "tokens": {"in": 40, "out": 6}, "error": null}
