@@ -189,6 +189,7 @@ def _load(state_dir: Path) -> list[OpenRun]:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return []
+        _require_owner(info)
         if info.st_size > MAX_FILE_BYTES:
             raise _TooLarge(OPEN_RUNS_FILE)
         raw = _read_bounded(fd, MAX_FILE_BYTES + 1)
@@ -234,12 +235,24 @@ def _store(state_dir: Path, runs: list[OpenRun]) -> None:
         raise
 
 
+def _require_owner(info: os.stat_result) -> None:
+    """Refuse a file another user owns. Checked on the open descriptor, never by path.
+
+    A file planted by someone else could hold records, or hold the lock, that
+    this user never wrote.
+    """
+    if info.st_uid != os.getuid():
+        raise OSError("an open-run file is owned by another user")
+
+
 @contextlib.contextmanager
 def _locked(state_dir: Path) -> Iterator[None]:
     """Hold the exclusive lock that every read-modify-write of the file takes."""
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # Private, because the files inside name the user's output directories.
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
     fd = os.open(state_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
+        _require_owner(os.fstat(fd))
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:

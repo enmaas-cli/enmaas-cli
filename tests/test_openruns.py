@@ -1014,3 +1014,56 @@ def test_begin_never_writes_more_records_than_the_loader_takes(
     assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
     assert capsys.readouterr().err == BEGIN_LINE
     assert path.read_bytes() == before
+
+
+def test_the_state_directory_is_private(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    old = os.umask(0)
+    try:
+        run = openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai")
+    finally:
+        os.umask(old)
+    assert run is not None
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700
+    for name in (openruns.OPEN_RUNS_FILE, openruns.LOCK_FILE):
+        assert stat.S_IMODE((state / name).stat().st_mode) == 0o600, name
+
+
+def _foreign_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every descriptor look owned by another user."""
+    real_fstat = os.fstat
+
+    def fstat(fd: int) -> os.stat_result:
+        fields = list(real_fstat(fd))
+        fields[stat.ST_UID] = os.getuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+
+
+def test_files_owned_by_another_user_are_not_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(5)])
+    path = _write_records(state, [_record(outdir=str(outdir))])
+    (state / openruns.LOCK_FILE).touch()
+    before = path.read_bytes()
+    _foreign_owner(monkeypatch)
+    assert openruns.begin(state, outdir=outdir, model="m", dialect="openai") is None
+    assert capsys.readouterr().err == BEGIN_LINE
+    openruns.settle(state, state / "usage.jsonl")
+    assert openruns.live_charge(state) == 0
+    assert path.read_bytes() == before
+    assert not (state / "usage.jsonl").exists()
+
+
+def test_a_record_file_owned_by_another_user_is_not_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    _write_records(state, [_record()])
+    _foreign_owner(monkeypatch)
+    with pytest.raises(OSError):
+        openruns._load(state)
