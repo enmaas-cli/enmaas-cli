@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, TypeGuard
 
 from .budget import charge_from_rows
+from .tokens import MAX_RECORDED
 from .usage import UsageEvent, _is_disabled, append_event
 
 OPEN_RUNS_FILE = "open-runs.jsonl"
@@ -450,6 +451,7 @@ def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
     never holds the rows. The index is opened without following a link and
     must be a regular file, so a forged record cannot point this at a device
     or a FIFO. Only the sum leaves this function, never the content of a row.
+    The sum is clamped to MAX_RECORDED, the limit of every recorded value.
     """
     limit = MAX_READ_BYTES if budget is None else budget
     try:
@@ -470,7 +472,7 @@ def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
         return IndexRead(0, progress.used, True)
     finally:
         os.close(fd)
-    return IndexRead(charge, progress.used, progress.at_end)
+    return IndexRead(min(charge, MAX_RECORDED), progress.used, progress.at_end)
 
 
 def _is_dead(run: OpenRun, now: datetime) -> bool:
@@ -511,7 +513,8 @@ def _killed_event(run: OpenRun, charge: int, now: datetime) -> UsageEvent:
         items_total=None,
         items_ok=None,
         items_failed=None,
-        charge=charge,
+        # A sum of many rows can pass the limit the ledger reader takes.
+        charge=min(charge, MAX_RECORDED),
     )
 
 
@@ -635,4 +638,4 @@ def live_charge(state_dir: Path) -> int:
                 total += read.charge
         except Exception as exc:
             warned = _warn_dropped(exc, warned)
-    return total
+    return min(total, MAX_RECORDED)

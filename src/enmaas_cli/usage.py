@@ -16,7 +16,7 @@ from enmaas_cli.pricing import (
     cost_for,
     opus_equivalent,
 )
-from enmaas_cli.tokens import MAX_TOKEN_COUNT
+from enmaas_cli.tokens import MAX_RECORDED
 
 
 @dataclass(frozen=True)
@@ -102,14 +102,12 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
     # Convert datetime to ISO string for JSON
     data = asdict(event)
     data["timestamp"] = event.timestamp.isoformat()
-    # Coerce counts on the way out. A gateway reporting 10.0 instead of
-    # 10 would otherwise be written verbatim, and the strict reader
-    # would then reject this tool's own ledger as corrupt on the next
-    # budgeted run.
+    # Every count is written as an integer from 0 to MAX_RECORDED, the
+    # range the strict reader accepts. Otherwise a float such as 10.0, or
+    # a sum above the reader's limit, would make the next budgeted run
+    # refuse this tool's own ledger as corrupt.
     for name in _COUNT_FIELDS:
-        value = data.get(name)
-        if isinstance(value, float):
-            data[name] = max(0, int(value))
+        data[name] = _recorded(data.get(name))
 
     # try/except around the whole `with`, not contextlib.suppress inside
     # it. A buffered write only reaches the disk on close, so the close
@@ -123,6 +121,20 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
     except OSError:
         return False
     return True
+
+
+def _recorded(value: object) -> int | None:
+    """A count as the ledger stores it: None, or an integer from 0 to MAX_RECORDED."""
+    if value is None:
+        return None
+    if isinstance(value, float):
+        # NaN compares false with everything, so it is caught first.
+        if value != value:
+            return 0
+        value = int(max(0.0, min(value, float(MAX_RECORDED))))
+    if not isinstance(value, int):
+        return None
+    return max(0, min(int(value), MAX_RECORDED))
 
 
 def _event_from_row(data: object) -> UsageEvent:
@@ -152,8 +164,8 @@ def _event_from_row(data: object) -> UsageEvent:
             raise ValueError(f"{name} must be a nonnegative integer, got {count!r}")
         # Bounded so that sums stay printable. The value is not repeated in
         # the message, because a huge one would make the message huge.
-        if count > MAX_TOKEN_COUNT:
-            raise ValueError(f"{name} is above {MAX_TOKEN_COUNT}")
+        if count > MAX_RECORDED:
+            raise ValueError(f"{name} is above {MAX_RECORDED}")
 
     return UsageEvent(timestamp=timestamp, **row)
 

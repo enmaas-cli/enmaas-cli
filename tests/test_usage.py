@@ -749,7 +749,7 @@ def test_a_count_above_the_cap_is_handled_like_a_negative_one(tmp_path: Path, na
     ledger = tmp_path / "usage.jsonl"
     good = _ok_row()
     ledger.write_text(
-        json.dumps(_ok_row(**{name: 10**12 + 1}))
+        json.dumps(_ok_row(**{name: 10**18 + 1}))
         + "\n"
         + json.dumps(_ok_row(**{name: HUGE}))
         + "\n"

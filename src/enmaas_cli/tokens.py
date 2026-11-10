@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# The largest token count read as reported. Python refuses to print an
-# integer of more than 4,300 digits, so a count near that size, once summed,
-# could not be written to the index or the ledger.
+# The largest single count taken from a reply or from a command-line
+# argument. A larger one from a reply reads as not reported; `record`
+# refuses one.
 MAX_TOKEN_COUNT = 10**12
+# The largest count or charge in an index row, a ledger row or an open-run
+# sum. Writers clamp to it and readers accept up to it, so a row enmaas
+# writes is always one it reads back. Sums of single counts reach far above
+# MAX_TOKEN_COUNT, and this stays far below the 4,300 digits Python can
+# print.
+MAX_RECORDED = 10**18
 
 
 @dataclass(frozen=True)

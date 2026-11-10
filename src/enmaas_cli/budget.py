@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from enmaas_cli.dialect import Usage
-from enmaas_cli.tokens import MAX_TOKEN_COUNT
+from enmaas_cli.tokens import MAX_RECORDED
 from enmaas_cli.usage import UsageEvent
 
 
@@ -75,19 +75,15 @@ def charge_from_rows(rows: Iterable[dict[str, Any]]) -> int:
 
     Hostile to malformed rows. A negative or non-integer charge is skipped
     rather than trusted, since a negative one would hand budget back. A
-    charge above MAX_TOKEN_COUNT is skipped too, so the sum stays small
-    enough to print and to write to the ledger.
+    charge above MAX_RECORDED is skipped too, because no writer of this
+    tool writes one, and it keeps each term small enough to print.
     """
     total = 0
     for row in rows:
         if row.get("type") != "request":
             continue
         charge = row.get("charge")
-        if (
-            isinstance(charge, int)
-            and not isinstance(charge, bool)
-            and 0 <= charge <= MAX_TOKEN_COUNT
-        ):
+        if isinstance(charge, int) and not isinstance(charge, bool) and 0 <= charge <= MAX_RECORDED:
             total += charge
     return total
 

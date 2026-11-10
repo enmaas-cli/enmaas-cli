@@ -30,6 +30,7 @@ from .dialect import (
 from .errors import CallError, where
 from .outputs import protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
+from .tokens import MAX_RECORDED
 
 # ValidationError moved to .schema; re-exported so existing importers keep working.
 __all__ = ["ValidationError", "load_schema", "run_map", "validate_against_schema"]
@@ -161,8 +162,15 @@ def _charge_row(charge: int, *, items: int, run: str | None = None) -> str:
     `run` names the invocation that wrote the row, when it has an open-run
     record. Two runs can share one output directory, and an offset alone
     cannot tell their rows apart.
+
+    The charge is clamped to the range from 0 to MAX_RECORDED, which every
+    reader of the index accepts.
     """
-    row: dict[str, Any] = {"type": "request", "charge": charge, "items": items}
+    row: dict[str, Any] = {
+        "type": "request",
+        "charge": max(0, min(charge, MAX_RECORDED)),
+        "items": items,
+    }
     if run is not None:
         row["run"] = run
     return json.dumps(row)

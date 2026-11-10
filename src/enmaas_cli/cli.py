@@ -106,7 +106,8 @@ def nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value} is not an integer") from None
     if number < 0:
         raise argparse.ArgumentTypeError(f"{value} is negative")
-    # Two counts at this cap still sum to a number the ledger can print.
+    # One count from the command line, held to the same limit as one count
+    # from a reply. Recorded sums are clamped to MAX_RECORDED when written.
     if number > MAX_TOKEN_COUNT:
         raise argparse.ArgumentTypeError(f"{value} is above {MAX_TOKEN_COUNT}")
     return number
