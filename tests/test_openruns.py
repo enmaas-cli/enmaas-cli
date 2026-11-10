@@ -1697,3 +1697,98 @@ def test_begin_records_a_printable_model_id(tmp_path: Path, model: str) -> None:
     run = openruns.begin(state, outdir=tmp_path / "out", model=model, dialect="anthropic")
     assert run is not None
     assert [r.model for r in openruns._load(state)] == [model]
+
+
+def test_every_charge_row_the_runner_writes_matches_the_scan_pattern() -> None:
+    from enmaas_cli.runner import _charge_row
+    from enmaas_cli.tokens import MAX_RECORDED
+
+    for charge in (-5, 0, 1, MAX_RECORDED, MAX_RECORDED * 10):
+        for items in (1, 10**6, 2**63):
+            for run in (None, "0" * 16, "f" * 64):
+                line = _charge_row(charge, items=items, run=run).encode("utf-8")
+                assert openruns.CHARGE_LINE.fullmatch(line), line
+                assert len(line) <= openruns.MAX_LINE_BYTES
+
+
+def _random_index(rng: Any, run_id: str) -> bytes:
+    from enmaas_cli.runner import _charge_row
+
+    pieces: list[bytes] = []
+    for _ in range(rng.randrange(0, 12)):
+        kind = rng.randrange(9)
+        if kind == 0:
+            pieces.append(_charge_row(rng.randrange(0, 50), items=1, run=run_id).encode())
+        elif kind == 1:
+            pieces.append(_charge_row(rng.randrange(0, 50), items=2, run="other").encode())
+        elif kind == 2:
+            pieces.append(_charge_row(rng.randrange(0, 50), items=1).encode())
+        elif kind == 3:
+            pieces.append(json.dumps(_item(f"i{rng.randrange(99)}")).encode())
+        elif kind == 4:
+            pad = "x" * rng.randrange(0, 160)
+            row = {"type": "request", "charge": 3, "items": 1, "run": run_id, "pad": pad}
+            pieces.append(json.dumps(row).encode())
+        elif kind == 5:
+            pieces.append(b'{"type": "request", "charge": ' + str(rng.randrange(9)).encode())
+        elif kind == 6:
+            row = {"charge": 4, "type": "request", "run": run_id}
+            pieces.append(json.dumps(row).encode())
+        elif kind == 7:
+            pieces.append(bytes(rng.randrange(256) for _ in range(rng.randrange(0, 40))))
+        else:
+            pieces.append(b"")
+    text = b"\n".join(pieces)
+    if rng.random() < 0.7:
+        text += b"\n"
+    return text
+
+
+def test_the_scan_agrees_with_the_reference_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import random
+
+    rng = random.Random(20261110)
+    index = tmp_path / "index.jsonl"
+    reference = openruns._reference_lines
+    scan = openruns._candidate_lines
+    for case in range(5000):
+        data = _random_index(rng, RUN_ID)
+        index.write_bytes(data)
+        monkeypatch.setattr(openruns, "READ_CHUNK_BYTES", rng.randrange(1, 80))
+        monkeypatch.setattr(openruns, "MAX_LINE_BYTES", rng.randrange(20, 200))
+        budget = rng.randrange(0, len(data) + 20)
+        results = []
+        for lines in (reference, scan):
+            monkeypatch.setattr(openruns, "_candidate_lines", lines)
+            fd = os.open(index, os.O_RDONLY)
+            try:
+                progress = openruns._Progress()
+                rows = list(openruns._charge_rows(fd, budget, progress, RUN_ID))
+            finally:
+                os.close(fd)
+            results.append((rows, progress.used, progress.at_end))
+        assert results[0] == results[1], (case, data, budget)
+
+
+@pytest.mark.parametrize("shape", ["bare newlines", "charge rows"])
+def test_a_16_mib_index_is_read_in_bounded_cpu_time(tmp_path: Path, shape: str) -> None:
+    import time
+
+    outdir = tmp_path / "out"
+    index = _index(outdir, [])
+    size = 16 << 20
+    if shape == "bare newlines":
+        index.write_bytes(b"\n" * size)
+        expected = 0
+    else:
+        line = (json.dumps(_charge(1)) + "\n").encode()
+        expected = size // len(line)
+        index.write_bytes(line * expected)
+    run = OpenRun(**_record(outdir=str(outdir)))
+    started = time.process_time()
+    read = openruns.charge_since(run)
+    assert time.process_time() - started < 5
+    assert read.charge == expected
+    assert read.complete
