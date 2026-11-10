@@ -774,7 +774,8 @@ def test_a_count_above_the_cap_is_handled_like_a_negative_one(tmp_path: Path, na
 def test_usage_and_the_rolling_check_survive_huge_ledger_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from enmaas_cli.cli import main, rolling_check
+    from enmaas_cli.budget import rolling_check
+    from enmaas_cli.cli import main
     from enmaas_cli.config import Config
 
     monkeypatch.setenv("HOME", str(tmp_path))

@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
+from enmaas_cli.budget import rolling_check
 from enmaas_cli.cli import (
     assemble_prompt,
     build_parser,
     resolve_thinking,
-    rolling_check,
 )
 from enmaas_cli.config import Config
 from enmaas_cli.errors import ExitCode

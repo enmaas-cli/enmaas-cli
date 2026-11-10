@@ -17,7 +17,7 @@ import pytest
 
 from enmaas_cli import openruns
 from enmaas_cli import usage as usage_module
-from enmaas_cli.cli import rolling_check
+from enmaas_cli.budget import rolling_check
 from enmaas_cli.config import Config
 from enmaas_cli.openruns import OpenRun
 
@@ -1354,7 +1354,7 @@ def test_settle_keeps_only_the_records_whose_event_was_not_taken(
 def test_a_run_that_ends_during_the_budget_check_is_counted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ends: str
 ) -> None:
-    from enmaas_cli import cli as cli_module
+    from enmaas_cli import budget as budget_module
 
     state = tmp_path / "state"
     outdir = tmp_path / "out"
@@ -1375,7 +1375,7 @@ def test_a_run_that_ends_during_the_budget_check_is_counted(
         finish_the_run()
         return result
 
-    monkeypatch.setattr(cli_module, "load_events_strict", load)
+    monkeypatch.setattr(budget_module, "load_events_strict", load)
     check = rolling_check(Config(budget_tokens=1000, budget_window_days=7), ledger)
     # Counted once or, for this one check, twice. Never zero.
     assert check.spent in (60, 120)

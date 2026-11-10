@@ -23,7 +23,7 @@ import httpx
 from . import gateway, openruns
 from .ask import run_ask
 from .auth import AuthError, cut_redacted, printable, printable_block, redact, resolve_key
-from .budget import TokenBudget, metered, rolling_spend
+from .budget import TokenBudget, metered, rolling_check
 from .client import _reply_object, make_client
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
@@ -55,7 +55,6 @@ from .usage import (
     format_summary,
     format_summary_json,
     load_events_counted,
-    load_events_strict,
     summarize_usage,
     write_event,
 )
@@ -359,96 +358,6 @@ def _warn_if_untracked(written: LedgerWrite, config: Config) -> None:
             "not recorded, so it will not count against the ceiling",
             file=sys.stderr,
         )
-
-
-MAX_PROBLEMS_SHOWN = 5
-
-
-@dataclass(frozen=True)
-class RollingCheck:
-    """Whether a standing budget permits this invocation, and where it stands."""
-
-    spent: int
-    ceiling: int | None
-    message: str | None  # set when the command must refuse
-
-
-def rolling_check(config: Config, ledger: Path) -> RollingCheck:
-    """Decide whether a configured rolling budget allows more work.
-
-    Returns the spend as well as the verdict, because a map run needs to
-    carry the remaining allowance into run_map rather than recompute it.
-
-    A function returning a message is testable without capturing stdout,
-    which is why the decision lives here rather than inline in main.
-    """
-    if config.budget_tokens is None or config.budget_window_days is None:
-        return RollingCheck(spent=0, ceiling=None, message=None)
-
-    if os.environ.get("ENMAAS_NO_USAGE_LOG"):
-        # Nothing is being recorded, so the ceiling could never bind and
-        # every run would see zero spent. Enforcement that cannot observe
-        # itself must say so rather than wave the work through.
-        return RollingCheck(
-            0,
-            config.budget_tokens,
-            message=(
-                "a token budget is configured but ENMAAS_NO_USAGE_LOG disables "
-                "the ledger, so spend cannot be tracked"
-            ),
-        )
-
-    # Runs with a record still present have not written their ledger event
-    # yet. Their spend so far counts, so two runs side by side cannot each
-    # see the whole allowance. Read before the ledger: a run that ends
-    # between the two reads is then counted twice for this one check, never
-    # zero times.
-    opened = openruns.open_charge(ledger.parent)
-    if not opened.complete:
-        # Some spend could not be read. Sending on a guess could pass the
-        # ceiling, so the command refuses.
-        return RollingCheck(
-            0,
-            config.budget_tokens,
-            message=(
-                f"open-run records in {ledger.parent / openruns.OPEN_RUNS_FILE} could not "
-                "all be read, so the token budget cannot be checked; run the command "
-                "again, or delete that file if you did not create it"
-            ),
-        )
-    live = opened.charge
-    events, problems = load_events_strict(ledger)
-    if problems:
-        # An unreadable ledger is indistinguishable from one showing zero
-        # spend. Without a budget configured this would only warn. A few
-        # problems are enough to find the file, and the count bounds the
-        # message.
-        shown = "; ".join(problems[:MAX_PROBLEMS_SHOWN])
-        if len(problems) > MAX_PROBLEMS_SHOWN:
-            shown += f"; and {len(problems) - MAX_PROBLEMS_SHOWN} more"
-        return RollingCheck(
-            0,
-            config.budget_tokens,
-            message=(
-                f"a token budget is configured but the usage ledger {printable(str(ledger))} "
-                f"could not be read: {shown}"
-            ),
-        )
-
-    spent = rolling_spend(events, window_days=config.budget_window_days) + live
-    if spent >= config.budget_tokens:
-        message = (
-            f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
-            f"{config.budget_window_days} days"
-        )
-        if live:
-            # The path lets the user find a record that should not be there.
-            message += (
-                f", including {live:,} in runs still open "
-                f"({ledger.parent / openruns.OPEN_RUNS_FILE})"
-            )
-        return RollingCheck(spent, config.budget_tokens, message=message)
-    return RollingCheck(spent, config.budget_tokens, message=None)
 
 
 # How each gateway URL problem is worded. The text after "not valid" is
