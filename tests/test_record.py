@@ -200,3 +200,25 @@ def test_zero_tokens_are_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         == 0
     )
     assert _rows(ledger)[0]["input_tokens"] == 0
+
+
+@pytest.mark.parametrize("flag", ["--input", "--output", "--cached", "--reasoning"])
+def test_record_rejects_a_count_above_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two such counts would sum past what the ledger write can print."""
+    ledger = _ledger(tmp_path, monkeypatch)
+    argv = ["record", "--model", "m", "--command", "c", "--input", "1", "--output", "2"]
+    argv += [flag, str(10**12 + 1)]
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+    assert excinfo.value.code == 1
+    assert "error:" in capsys.readouterr().err
+    assert not ledger.exists()
+
+
+def test_record_accepts_the_cap_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ledger = _ledger(tmp_path, monkeypatch)
+    argv = ["record", "--model", "m", "--command", "c", "--input", str(10**12), "--output", "0"]
+    assert main(argv) == 0
+    assert _rows(ledger)[0]["input_tokens"] == 10**12

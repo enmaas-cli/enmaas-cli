@@ -284,3 +284,15 @@ def test_legacy_rows_fall_back_to_the_reasoning_breakdown() -> None:
     )
     assert legacy.charge is None
     assert rolling_spend([legacy], window_days=30, now=now) == 100
+
+
+def test_charge_from_rows_skips_a_charge_above_the_cap() -> None:
+    from enmaas_cli.tokens import MAX_TOKEN_COUNT
+
+    rows = [
+        {"type": "request", "charge": MAX_TOKEN_COUNT + 1, "items": 1},
+        {"type": "request", "charge": int("9" * 4300), "items": 1},
+        {"type": "request", "charge": MAX_TOKEN_COUNT, "items": 1},
+        {"type": "request", "charge": 4, "items": 1},
+    ]
+    assert charge_from_rows(rows) == MAX_TOKEN_COUNT + 4

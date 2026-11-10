@@ -51,6 +51,11 @@ BEGIN_WARNING = (
     "warning: the open-run record could not be written; "
     "if this run is killed its spend is not counted"
 )
+# Names the exception class only. Its text could hold content read from a file.
+DROPPED_WARNING = (
+    "warning: an open-run record could not be read and was dropped; "
+    "its spend is not counted ({kind})"
+)
 
 
 @dataclass(frozen=True)
@@ -330,15 +335,28 @@ def settle(state_dir: Path, ledger: Path) -> None:
         runs = _load(state_dir)
         now = datetime.now(UTC)
         kept: list[OpenRun] = []
+        warned = False
         for run in runs:
-            if not _is_dead(run, now):
-                kept.append(run)
-                continue
-            charge = charge_since(run)
-            if charge > 0 and not append_event(ledger, _killed_event(run, charge, now)):
-                kept.append(run)
+            # One record that cannot be handled must not stop the command or
+            # come back on every later one, so it is dropped with a warning.
+            try:
+                if not _is_dead(run, now):
+                    kept.append(run)
+                    continue
+                charge = charge_since(run)
+                if charge > 0 and not append_event(ledger, _killed_event(run, charge, now)):
+                    kept.append(run)
+            except Exception as exc:
+                warned = _warn_dropped(exc, warned)
         if len(kept) != len(runs):
             _store(state_dir, kept)
+
+
+def _warn_dropped(exc: Exception, warned: bool) -> bool:
+    """Print the dropped-record warning once per call. Returns that it was printed."""
+    if not warned:
+        print(DROPPED_WARNING.format(kind=type(exc).__name__), file=sys.stderr)
+    return True
 
 
 def live_charge(state_dir: Path) -> int:
@@ -354,4 +372,12 @@ def live_charge(state_dir: Path) -> int:
     except OSError:
         return 0
     now = datetime.now(UTC)
-    return sum(charge_since(run) for run in runs if not _is_dead(run, now))
+    total = 0
+    warned = False
+    for run in runs:
+        try:
+            if not _is_dead(run, now):
+                total += charge_since(run)
+        except Exception as exc:
+            warned = _warn_dropped(exc, warned)
+    return total

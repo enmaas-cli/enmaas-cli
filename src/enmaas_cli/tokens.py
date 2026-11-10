@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# The largest token count read as reported. Python refuses to print an
+# integer of more than 4,300 digits, so a count near that size, once summed,
+# could not be written to the index or the ledger.
+MAX_TOKEN_COUNT = 10**12
+
 
 @dataclass(frozen=True)
 class Usage:

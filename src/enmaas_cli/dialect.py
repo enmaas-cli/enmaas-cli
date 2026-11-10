@@ -11,6 +11,7 @@ from .errors import BadReplyError, CallError, where
 
 # Re-exported so existing importers of these names from this module keep working.
 from .errors import EmptyResponseError as EmptyResponseError
+from .tokens import MAX_TOKEN_COUNT as MAX_TOKEN_COUNT
 from .tokens import Usage as Usage
 
 Dialect = Literal["anthropic", "openai"]
@@ -262,12 +263,6 @@ def _utf8_safe(text: str) -> tuple[str, int]:
     except UnicodeEncodeError:
         return _UNENCODABLE.subn(_REPLACEMENT, text)
     return text, 0
-
-
-# The largest token count read as reported. Python refuses to print an
-# integer of more than 4,300 digits, so a count near that size, once summed,
-# could not be written to the index or the ledger.
-MAX_TOKEN_COUNT = 10**12
 
 
 def _count(value: object) -> int | None:

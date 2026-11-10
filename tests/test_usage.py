@@ -737,3 +737,50 @@ def test_a_ledger_mixing_old_and_new_rows_totals_correctly(tmp_path: Path) -> No
     assert problems == []
     # Old row derives 10 + reasoning fallback 3 = 13; new row uses 100.
     assert rolling_spend(events, window_days=30, now=now) == 113
+
+
+HUGE = int("9" * 4300)
+
+
+@pytest.mark.parametrize(
+    "name", ["input_tokens", "cached_tokens", "output_tokens", "reasoning_tokens", "charge"]
+)
+def test_a_count_above_the_cap_is_handled_like_a_negative_one(tmp_path: Path, name: str) -> None:
+    ledger = tmp_path / "usage.jsonl"
+    good = _ok_row()
+    ledger.write_text(
+        json.dumps(_ok_row(**{name: 10**12 + 1}))
+        + "\n"
+        + json.dumps(_ok_row(**{name: HUGE}))
+        + "\n"
+        + json.dumps(good)
+        + "\n",
+        encoding="utf-8",
+    )
+    assert len(load_events(ledger)) == 1
+    events, problems = load_events_strict(ledger)
+    assert len(events) == 1
+    assert len(problems) == 2
+    # The value itself is not repeated, so a huge one cannot grow the message.
+    assert all(len(p) < 300 for p in problems)
+
+
+def test_usage_and_the_rolling_check_survive_huge_ledger_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.cli import main, rolling_check
+    from enmaas_cli.config import Config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+    ledger = tmp_path / "state" / "enmaas" / "runs" / "usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    row = _ok_row(input_tokens=HUGE, output_tokens=HUGE, charge=HUGE)
+    ledger.write_text((json.dumps(row) + "\n") * 2, encoding="utf-8")
+    assert main(["--config", str(tmp_path / "none.toml"), "usage"]) == 0
+    assert main(["--config", str(tmp_path / "none.toml"), "usage", "--json"]) == 0
+    capsys.readouterr()
+    check = rolling_check(Config(budget_tokens=100, budget_window_days=7), ledger)
+    assert check.message is not None
+    assert len(check.message) < 1000

@@ -50,6 +50,7 @@ from .outputs import (
 from .receipts import ask_receipt, create_run_dir, map_receipt, prune_runs
 from .runner import run_map
 from .schema import ValidationError, load_schema, validate_against_schema
+from .tokens import MAX_TOKEN_COUNT
 from .usage import (
     UsageEvent,
     append_event,
@@ -105,6 +106,9 @@ def nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value} is not an integer") from None
     if number < 0:
         raise argparse.ArgumentTypeError(f"{value} is negative")
+    # Two counts at this cap still sum to a number the ledger can print.
+    if number > MAX_TOKEN_COUNT:
+        raise argparse.ArgumentTypeError(f"{value} is above {MAX_TOKEN_COUNT}")
     return number
 
 

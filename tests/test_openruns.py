@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from enmaas_cli import openruns
+from enmaas_cli import budget, openruns
 from enmaas_cli.cli import rolling_check
 from enmaas_cli.config import Config
 from enmaas_cli.openruns import OpenRun
@@ -510,3 +510,151 @@ def test_rolling_check_counts_a_live_record(tmp_path: Path) -> None:
     check = rolling_check(config, state / "usage.jsonl")
     assert check.spent == 100
     assert check.message is not None
+
+
+HUGE = int("9" * 4300)
+SKIPPED_WARNING = (
+    "warning: an open-run record could not be read and was dropped; "
+    "its spend is not counted (RuntimeError)\n"
+)
+
+
+def test_a_charge_above_the_cap_is_skipped_when_settling(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(HUGE), _charge(HUGE), _charge(21)])
+    _write_records(state, [_record(outdir=str(outdir))])
+    openruns.settle(state, state / "usage.jsonl")
+    (event,) = _ledger_rows(state / "usage.jsonl")
+    assert event["error_kind"] == "Killed"
+    assert event["charge"] == 21
+    assert not (state / openruns.OPEN_RUNS_FILE).exists()
+
+
+def test_a_charge_above_the_cap_is_skipped_in_live_charge(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(HUGE), _charge(HUGE), _charge(21)])
+    _write_records(state, [_record(outdir=str(outdir), pid=os.getppid())])
+    assert openruns.live_charge(state) == 21
+
+
+def _main_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point main at a temporary state directory and a mock gateway. Returns the state dir."""
+    import httpx
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://gw.example.test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),
+    )
+    return tmp_path / "xdg" / "enmaas" / "runs"
+
+
+def _budget_config(tmp_path: Path, tokens: int = 100) -> Path:
+    config = tmp_path / "config.toml"
+    config.write_text(f"[budget]\nwindow_days = 7\ntokens = {tokens}\n", encoding="utf-8")
+    return config
+
+
+ASK = ["ask", "-m", "rits/zai-org/glm-5-3", "--dialect", "openai", "-p", "hi", "--retries", "0"]
+
+
+def test_ask_under_a_rolling_budget_survives_huge_charge_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.cli import main
+
+    state = _main_env(tmp_path, monkeypatch)
+    live_out = tmp_path / "live"
+    dead_out = tmp_path / "dead"
+    _index(live_out, [_charge(HUGE), _charge(HUGE), _charge(21)])
+    _index(dead_out, [_charge(HUGE), _charge(HUGE), _charge(21)])
+    _write_records(
+        state,
+        [
+            _record(outdir=str(live_out), pid=os.getppid(), run_id="live"),
+            _record(outdir=str(dead_out), run_id="dead"),
+        ],
+    )
+    assert main(["--config", str(_budget_config(tmp_path)), *ASK]) == 0
+    capsys.readouterr()
+    charges = [row["charge"] for row in _ledger_rows(state / "usage.jsonl")]
+    assert charges == [21, 7]
+
+
+def test_a_record_whose_handling_raises_is_dropped_and_the_rest_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state"
+    _index(tmp_path / "a", [_charge(3)])
+    _index(tmp_path / "b", [_charge(5)])
+    _write_records(
+        state,
+        [
+            _record(outdir=str(tmp_path / "a"), run_id="bad"),
+            _record(outdir=str(tmp_path / "b"), run_id="good"),
+        ],
+    )
+    real = budget.charge_from_rows
+    calls = 0
+
+    def charge_from_rows(rows: Any) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("secret text from a row")
+        return real(rows)
+
+    monkeypatch.setattr(openruns, "charge_from_rows", charge_from_rows)
+    openruns.settle(state, state / "usage.jsonl")
+    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
+    assert not (state / openruns.OPEN_RUNS_FILE).exists()
+    captured = capsys.readouterr()
+    assert captured.err == SKIPPED_WARNING
+    assert "secret" not in captured.err
+
+
+def test_a_live_record_whose_handling_raises_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state"
+    _index(tmp_path / "a", [_charge(3)])
+    _index(tmp_path / "b", [_charge(5)])
+    _write_records(
+        state,
+        [
+            _record(outdir=str(tmp_path / "a"), run_id="bad", pid=os.getppid()),
+            _record(outdir=str(tmp_path / "b"), run_id="good", pid=os.getppid()),
+        ],
+    )
+    real = budget.charge_from_rows
+    calls = 0
+
+    def charge_from_rows(rows: Any) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("secret text from a row")
+        return real(rows)
+
+    monkeypatch.setattr(openruns, "charge_from_rows", charge_from_rows)
+    assert openruns.live_charge(state) == 5
+    captured = capsys.readouterr()
+    assert captured.err == SKIPPED_WARNING
+    assert _run_ids(state) == ["bad", "good"]

@@ -15,6 +15,7 @@ from enmaas_cli.pricing import (
     cost_for,
     opus_equivalent,
 )
+from enmaas_cli.tokens import MAX_TOKEN_COUNT
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,10 @@ def _event_from_row(data: object) -> UsageEvent:
         # bool first: it subclasses int, so True would pass as 1.
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError(f"{name} must be a nonnegative integer, got {count!r}")
+        # Bounded so that sums stay printable. The value is not repeated in
+        # the message, because a huge one would make the message huge.
+        if count > MAX_TOKEN_COUNT:
+            raise ValueError(f"{name} is above {MAX_TOKEN_COUNT}")
 
     return UsageEvent(timestamp=timestamp, **row)
 
