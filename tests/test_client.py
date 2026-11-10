@@ -343,3 +343,20 @@ async def test_reply_nested_too_deeply_is_a_bad_reply_and_never_retried() -> Non
             await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
     assert len(calls) == 1
     assert "JSON nested too deeply" in str(exc.value)
+
+
+async def test_invalid_url_from_the_transport_is_terminal_gateway_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.InvalidURL("bad url")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GatewayError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    assert calls == 1
+    assert exc.value.status is None
+    assert exc.value.attempts == 1
+    assert "InvalidURL" in str(exc.value)

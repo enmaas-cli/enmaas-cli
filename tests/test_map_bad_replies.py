@@ -390,3 +390,114 @@ async def test_reply_nested_too_deeply_fails_as_a_bad_reply(tmp_path: Path, mode
     assert "JSON nested too deeply" in rows[bad]["error"]
     assert outcome.internal_errors == 0
     assert (outcome.ok, outcome.failed) == (2, 1)
+
+
+async def _run_many(
+    tmp_path: Path,
+    mode: str,
+    count: int,
+    *,
+    token_budget: int | None = None,
+    resume: bool = False,
+    ids: list[str] | None = None,
+) -> tuple[MapOutcome, int]:
+    """Run `count` items, or the given ids, against good replies. Returns the call count."""
+    names = ids if ids is not None else [f"i{n}" for n in range(count)]
+    items = tmp_path / "items.jsonl"
+    items.write_text(
+        "\n".join(json.dumps({"id": i, "x": i}) for i in names) + "\n", encoding="utf-8"
+    )
+    template = tmp_path / "t.txt"
+    template.write_text(
+        "shared\n===PER ITEM===\ndo {x}" if mode == BATCHED else "do {x}", encoding="utf-8"
+    )
+    calls = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _good(_ids_in(request), mode == BATCHED)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        outcome = await run_map(
+            client=client,
+            base_url="https://g.test",
+            key="sk-oai-x",
+            model="rits/zai-org/glm-5-3",
+            items_path=items,
+            template_path=template,
+            outdir=tmp_path / "out",
+            concurrency=1,
+            retries=0,
+            timeout=5,
+            thinking=False,
+            max_tokens=None,
+            dialect="openai",
+            resume=resume,
+            batch=2 if mode == BATCHED else 1,
+            token_budget=token_budget,
+        )
+    return outcome, calls
+
+
+def _every_item_breaks(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    def broken(*args: Any) -> Any:
+        raise TypeError("unreviewed")
+
+    target = "write_output" if mode == SINGLE else "split_batch_response"
+    monkeypatch.setattr(f"enmaas_cli.runner.{target}", broken)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_run_where_every_item_hits_an_internal_error_is_ended_by_the_breaker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    _every_item_breaks(monkeypatch, mode)
+    outcome, calls = await _run_many(tmp_path, mode, 20)
+    assert outcome.abort_reason == "breaker"
+    assert outcome.internal_errors == outcome.failed == outcome.attempted
+    assert outcome.attempted < 20
+    # Six consecutive failures end the run: six items, or three pairs.
+    assert calls == (6 if mode == SINGLE else 3)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_an_internal_error_after_the_charge_counts_against_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    _every_item_breaks(monkeypatch, mode)
+    # Each request costs 7, so the second one reaches a ceiling of 10.
+    outcome, calls = await _run_many(tmp_path, mode, 8, token_budget=10)
+    assert outcome.abort_reason == "budget"
+    assert outcome.tripped_budget == "per_run"
+    assert outcome.spent == 14
+    assert calls == 2
+    assert outcome.internal_errors == outcome.failed
+
+
+async def test_resume_retries_a_bad_reply_and_an_internal_error_and_keeps_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = outputs.write_output
+
+    def write(path: Path, text: str) -> None:
+        if path.name == "c.md":
+            raise TypeError("unreviewed")
+        real(path, text)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("enmaas_cli.runner.write_output", write)
+        first = await _run(tmp_path, SINGLE, _parts_without_text)
+    rows = _item_rows(tmp_path)
+    assert rows["b"]["status"] == rows["c"]["status"] == "error"
+    assert INTERNAL.match(rows["c"]["error"])
+    assert (first.ok, first.failed, first.internal_errors) == (1, 2, 1)
+    # a and c cost 7 each; the bad reply for b reported 34.
+    assert _charges(tmp_path) == [7, 34, 7]
+
+    second, calls = await _run_many(tmp_path, SINGLE, 0, ids=IDS, token_budget=1000, resume=True)
+    assert calls == 2
+    assert second.skipped == 1
+    assert (second.ok, second.failed) == (2, 0)
+    assert second.spent == 48 + 14
+    assert _item_rows(tmp_path)["c"]["status"] == "ok"

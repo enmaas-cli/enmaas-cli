@@ -106,3 +106,55 @@ def test_success_records_no_error_kind(
     assert _ask(tmp_path, monkeypatch, handler) == 0
     capsys.readouterr()
     assert _ledger_rows(tmp_path)[0]["error_kind"] is None
+
+
+def _reply(message: dict[str, Any], finish: str = "stop") -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [{"finish_reason": finish, "message": message}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+        },
+    )
+
+
+def test_exhausted_reply_is_recorded_as_empty_response_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _reply({"content": ""}, finish="length")
+
+    assert _ask(tmp_path, monkeypatch, handler) == 1
+    capsys.readouterr()
+    rows = _ledger_rows(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["error_kind"] == "EmptyResponseError"
+    assert rows[0]["charge"] == 7
+
+
+def test_transport_failure_is_recorded_as_gateway_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    assert _ask(tmp_path, monkeypatch, handler) == 1
+    capsys.readouterr()
+    rows = _ledger_rows(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["error_kind"] == "GatewayError"
+    assert rows[0]["charge"] == 0
+
+
+def test_bad_reply_with_usage_records_its_charge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _reply({"content": [{"type": "image_url", "image_url": {"url": "x"}}]})
+
+    assert _ask(tmp_path, monkeypatch, handler) == 1
+    capsys.readouterr()
+    rows = _ledger_rows(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["error_kind"] == "BadReplyError"
+    assert rows[0]["charge"] == 7
