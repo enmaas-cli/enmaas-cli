@@ -495,14 +495,33 @@ def test_a_child_that_ignores_sigint_finishes_its_map(cli: Cli, gateway: Gateway
     assert event["charge"] == 2 * CHARGE
 
 
+def _stalled_ledger_program(stall: Path) -> str:
+    """The console script with a ledger write that waits for a FIFO's other end.
+
+    It stands in for a ledger on a file system that stops answering. A FIFO
+    at the ledger path itself no longer blocks: the ledger is opened
+    nonblocking and only a regular file is written.
+    """
+    os.mkfifo(stall)
+    return (
+        "import os\n"
+        "from enmaas_cli import usage\n"
+        "real = usage._open_for_append\n"
+        "def stalled(ledger):\n"
+        f"    os.close(os.open({str(stall)!r}, os.O_WRONLY))\n"
+        "    return real(ledger)\n"
+        "usage._open_for_append = stalled\n"
+        "from enmaas_cli.cli import entry; entry()\n"
+    )
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
 def test_a_second_signal_ends_a_process_blocked_on_the_ledger(cli: Cli, gateway: Gateway) -> None:
     gateway.answer_first = 1
-    cli.state.mkdir(parents=True)
-    os.mkfifo(cli.ledger)
+    program = _stalled_ledger_program(cli.tmp / "stall")
     answer = cli.tmp / "answer.md"
     args = ["ask", "-m", MODEL, "--dialect", "openai", "-p", "hello", "--retries", "0"]
-    child = cli.start(*args, "-o", str(answer))
+    child = cli.start(*args, "-o", str(answer), program=program)
     # The answer is written before the ledger, and nothing awaits in between,
     # so once it exists the child is on its way to the blocking ledger open.
     _wait_for(answer.exists, "the answer file", child)
@@ -534,15 +553,14 @@ def test_two_quick_sigints_still_count_the_run(cli: Cli, gateway: Gateway) -> No
     if not Path(f"/proc/{os.getpid()}/wchan").exists():
         pytest.skip("needs /proc/<pid>/wchan to see where a process waits")
     gateway.answer_first = 2
-    cli.state.mkdir(parents=True)
-    os.mkfifo(cli.ledger)
+    program = _stalled_ledger_program(cli.tmp / "stall")
     index = cli.tmp / "job" / "results.jsonl"
-    child = cli.start(*cli.map_args("job", 5))
+    child = cli.start(*cli.map_args("job", 5), program=program)
     _wait_for(lambda: len(_charges(index)) >= 2, "2 charge rows", child)
     _wait_for(_held(gateway, 1), "a held request", child)
     child.send_signal(signal.SIGINT)
     # The first signal stops the run, which then opens the ledger to write
-    # its event. The ledger is a FIFO with no reader, so the open blocks.
+    # its event. The stalled ledger write blocks.
     _wait_for(_blocked_on_a_fifo(child), "the blocked ledger write", child)
     child.send_signal(signal.SIGINT)
     _, err = child.communicate(timeout=DEADLINE)
@@ -550,7 +568,7 @@ def test_two_quick_sigints_still_count_the_run(cli: Cli, gateway: Gateway) -> No
     assert "Traceback" not in err
     assert cli.open_runs().exists()
 
-    cli.ledger.unlink()
+    assert not cli.ledger.exists()
     gateway.release.set()
     done = cli.run("ask", "-m", MODEL, "--dialect", "openai", "-p", "hi", "--retries", "0")
     assert done.returncode == 0, done.stderr

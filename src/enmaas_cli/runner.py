@@ -193,13 +193,14 @@ def _require_own_regular(fd: int, index: Path) -> None:
 def _append_index(index: Path, text: str) -> None:
     """Append rows to the index, never through a symbolic link.
 
-    Mode 0o666 so the umask decides, as it did for a plain open. O_NOFOLLOW
-    makes a link swapped in during the run fail the write instead of sending
-    the rows to the link's target. O_NONBLOCK keeps a FIFO swapped in from
-    blocking the open, so the check after it can refuse it.
+    A new index is mode 0o600: it names every item and what each request
+    cost. An existing one keeps its mode. O_NOFOLLOW makes a link swapped in
+    during the run fail the write instead of sending the rows to the link's
+    target. O_NONBLOCK keeps a FIFO swapped in from blocking the open, so
+    the check after it can refuse it.
     """
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
-    fd = os.open(index, flags, 0o666)
+    fd = os.open(index, flags, 0o600)
     try:
         _require_own_regular(fd, index)
     except BaseException:

@@ -1,6 +1,7 @@
 """Tests for usage ledger. All offline, no live calls."""
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -684,7 +685,12 @@ def test_append_event_reports_a_failure_at_close_not_just_at_write(
         items_ok=None,
         items_failed=None,
     )
-    monkeypatch.setattr(Path, "open", lambda *a, **k: FailsOnClose())
+
+    def fails_on_close(fd: int, *args: object, **kwargs: object) -> FailsOnClose:
+        os.close(fd)
+        return FailsOnClose()
+
+    monkeypatch.setattr(os, "fdopen", fails_on_close)
 
     assert append_event(tmp_path / "usage.jsonl", event) is False
 

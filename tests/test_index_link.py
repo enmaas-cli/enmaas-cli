@@ -96,7 +96,7 @@ def test_append_index_does_not_follow_a_link(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "keep me\n"
 
 
-def test_append_index_creates_the_file_under_the_umask_and_appends(tmp_path: Path) -> None:
+def test_append_index_creates_a_private_file_and_appends(tmp_path: Path) -> None:
     index = tmp_path / "results.jsonl"
     old = os.umask(0o022)
     try:
@@ -105,7 +105,7 @@ def test_append_index_creates_the_file_under_the_umask_and_appends(tmp_path: Pat
     finally:
         os.umask(old)
     assert index.read_text(encoding="utf-8") == "one\ntwo\n"
-    assert stat.S_IMODE(index.stat().st_mode) == 0o644
+    assert stat.S_IMODE(index.stat().st_mode) == 0o600
 
 
 def test_map_through_main_refuses_a_linked_index(

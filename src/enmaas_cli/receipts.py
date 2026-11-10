@@ -34,12 +34,16 @@ def create_run_dir(root: Path) -> Path:
 
     The suffix is random rather than derived from the prompt: prompt text is
     arbitrary, and building filenames from it is a path traversal risk.
+
+    The root is the state directory. When this creates it, it is mode 0o700,
+    because it holds every answer and the usage ledger.
     """
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S")
     path = root / f"{stamp}-{secrets.token_hex(2)}"
     while path.exists():
         path = root / f"{stamp}-{secrets.token_hex(2)}"
-    path.mkdir(parents=True)
+    path.mkdir()
     return path
 
 

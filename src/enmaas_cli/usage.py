@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import contextlib
+import errno
 import json
 import math
 import os
+import stat
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from enmaas_cli.auth import printable
 from enmaas_cli.pricing import (
@@ -88,6 +90,34 @@ def _is_disabled() -> bool:
     return bool(os.environ.get("ENMAAS_NO_USAGE_LOG", ""))
 
 
+class NotRegularFile(OSError):
+    """The ledger path is a link, a FIFO or anything else that is not a regular file."""
+
+
+def _open_for_append(ledger: Path) -> int:
+    """Open the ledger to append one row, creating it and its directory if missing.
+
+    The state directory is created private, mode 0o700, and a new ledger
+    mode 0o600: both name the user's models and what they cost. An existing
+    file keeps its mode.
+
+    Defends against a planted file at the ledger path. O_NOFOLLOW refuses a
+    link, so a row cannot be sent to the link's target. O_NONBLOCK makes a
+    FIFO with no reader fail at once instead of blocking the command, and
+    the type check on the descriptor refuses a FIFO that has a reader.
+    """
+    ledger.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(ledger, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise NotRegularFile(f"{ledger} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def append_event(ledger: Path, event: UsageEvent) -> bool:
     """Write one event as a JSON line. Returns whether it was recorded.
 
@@ -97,14 +127,10 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
 
     But it does report. A ledger that silently refuses writes is
     indistinguishable from one showing no spend, so a caller enforcing a
-    budget needs to know the ceiling just stopped tracking.
+    budget needs to know the ceiling just stopped tracking. A link or a
+    FIFO at the ledger path is refused the same way.
     """
     if _is_disabled():
-        return False
-
-    try:
-        ledger.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
         return False
 
     # Convert datetime to ISO string for JSON
@@ -134,7 +160,7 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
     # to report success, which is the dropped spend this return value
     # exists to surface.
     try:
-        with ledger.open("a", encoding="utf-8") as handle:
+        with os.fdopen(_open_for_append(ledger), "w", encoding="utf-8") as handle:
             handle.write(json.dumps(data) + "\n")
     except OSError:
         return False
@@ -234,35 +260,92 @@ def _event_from_row(data: object) -> UsageEvent:
     return UsageEvent(timestamp=timestamp, **row)
 
 
+def _open_for_read(ledger: Path) -> int | None:
+    """Open the ledger to read it. None when it does not exist.
+
+    Raises NotRegularFile for a link, a FIFO or any other path that is not a
+    regular file. A FIFO would block the read until some other process
+    wrote to it, which hung every command that reads the ledger. The open
+    is nonblocking and the type is checked on the descriptor, so nothing
+    waits. A link is refused because the writer never writes through one.
+    """
+    try:
+        fd = os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise NotRegularFile(f"{ledger} is not a regular file") from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise NotRegularFile(f"{ledger} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_ledger(ledger: Path) -> bytes | None:
+    """The whole ledger, or None when it does not exist. Raises OSError."""
+    fd = _open_for_read(ledger)
+    if fd is None:
+        return None
+    chunks: list[bytes] = []
+    try:
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
 def load_events(ledger: Path) -> list[UsageEvent]:
     """Load all valid events, tolerating corrupt rows or a missing file.
 
     Deliberately forgiving: `enmaas usage` should report what it can
     rather than crash. Enforcement uses load_events_strict instead.
     """
-    return load_events_counted(ledger)[0]
+    return load_events_counted(ledger).events
 
 
-def load_events_counted(ledger: Path) -> tuple[list[UsageEvent], int]:
+class LedgerRead(NamedTuple):
+    """What the forgiving reader found."""
+
+    events: list[UsageEvent]
+    # Rows that could not be read.
+    skipped: int
+    # True when the ledger path is not a regular file, so nothing was read.
+    not_regular: bool
+
+
+def load_events_counted(ledger: Path) -> LedgerRead:
     """The valid events and how many rows were skipped. Never raises on ledger content."""
-    if not ledger.exists():
-        return [], 0
-
     events: list[UsageEvent] = []
     skipped = 0
-    with contextlib.suppress(OSError, UnicodeDecodeError):
-        content = ledger.read_text(encoding="utf-8")
-        for line in content.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                events.append(_event_from_row(json.loads(stripped)))
-            except (ValueError, RecursionError):
-                # RowError and JSONDecodeError are ValueErrors. A deeply
-                # nested row raises RecursionError in the decoder.
-                skipped += 1
-    return events, skipped
+    try:
+        raw = _read_ledger(ledger)
+    except NotRegularFile:
+        return LedgerRead([], 0, True)
+    except OSError:
+        return LedgerRead([], 0, False)
+    if raw is None:
+        return LedgerRead([], 0, False)
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return LedgerRead([], 0, False)
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            events.append(_event_from_row(json.loads(stripped)))
+        except (ValueError, RecursionError):
+            # RowError and JSONDecodeError are ValueErrors. A deeply
+            # nested row raises RecursionError in the decoder.
+            skipped += 1
+    return LedgerRead(events, skipped, False)
 
 
 def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
@@ -272,21 +355,25 @@ def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
     Reporting should degrade; enforcement must not. A budget that mistook
     an unreadable ledger for one showing zero spend would never bind.
 
-    A missing file is not a problem: a fresh install has spent nothing.
+    A missing file is not a problem: a fresh install has spent nothing. A
+    path that is not a regular file is one problem that names the path.
     """
-    if not ledger.exists():
+    try:
+        raw = _read_ledger(ledger)
+    except NotRegularFile:
+        return [], [f"{printable(str(ledger))} is not a regular file"]
+    except OSError as exc:
+        # The class name only. The message of a read error can quote bytes
+        # of the file.
+        return [], [f"cannot be opened ({type(exc).__name__})"]
+    if raw is None:
         return [], []
-
     try:
         # Bytes then decode, so invalid UTF-8 is reportable rather than
         # escaping as an exception that is not an OSError.
-        text = ledger.read_bytes().decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return [], ["not UTF-8 text"]
-    except OSError as exc:
-        # The class name only. The message of a decode or read error can
-        # quote bytes of the file.
-        return [], [f"cannot be opened ({type(exc).__name__})"]
 
     # Each problem is "line N: <reason>", with a reason from a fixed set, so
     # no value or key from a row reaches the message.

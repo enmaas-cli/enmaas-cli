@@ -1093,8 +1093,14 @@ async def _dispatch(
     # Handle usage command first (no timeout argument)
     if args.command == "usage":
         ledger = state_root() / "usage.jsonl"
-        events, skipped = load_events_counted(ledger)
+        events, skipped, not_regular = load_events_counted(ledger)
         final.code = int(ExitCode.OK)
+        if not_regular:
+            print(
+                f"warning: {printable(str(ledger))} is not a regular file, "
+                "so no usage was read from it",
+                file=sys.stderr,
+            )
         if skipped:
             print(
                 f"warning: {skipped} rows of {printable(str(ledger))} could not be read "
