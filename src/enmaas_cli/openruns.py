@@ -247,6 +247,12 @@ def _load(state_dir: Path) -> list[OpenRun]:
     return runs
 
 
+# The names _temporary gives, and how old a leftover one must be before
+# settle removes it.
+TEMPORARY_NAME = re.compile(re.escape(f".{OPEN_RUNS_FILE}.") + r"[0-9a-f]{16}\.tmp")
+LEFTOVER_AFTER = timedelta(hours=1)
+
+
 def _temporary(state_dir: Path) -> tuple[Path, int]:
     path = state_dir / f".{OPEN_RUNS_FILE}.{secrets.token_hex(8)}.tmp"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -664,21 +670,25 @@ def _settle(state_dir: Path, ledger: Path) -> None:
     counts those runs twice, once.
     """
     warned = False
-    with _locked(state_dir):
-        runs = _load(state_dir)
-    now = datetime.now(UTC)
     # Records to remove, each with what it owes. 0 means remove with no event.
     decided: list[tuple[OpenRun, int]] = []
     dead: list[OpenRun] = []
-    for run in runs:
-        # One record that cannot be handled must not stop the command or
-        # come back on every later one, so it is dropped with a warning.
-        try:
-            if _is_dead(run, now):
-                dead.append(run)
-        except Exception as exc:
-            warned = _warn_dropped(type(exc).__name__, warned)
-            decided.append((run, 0))
+    with _locked(state_dir):
+        runs = _load(state_dir)
+        now = datetime.now(UTC)
+        for run in runs:
+            # One record that cannot be handled must not stop the command or
+            # come back on every later one, so it is dropped with a warning.
+            try:
+                if _is_dead(run, now):
+                    dead.append(run)
+            except Exception as exc:
+                warned = _warn_dropped(type(exc).__name__, warned)
+                decided.append((run, 0))
+        if not dead and not decided:
+            # Nothing to settle, so this is the last step under the lock.
+            _remove_leftovers(state_dir)
+            return
     budget = MAX_READ_BYTES
     remaining = budget
     for run in _smallest_first(dead):
@@ -710,10 +720,27 @@ def _settle(state_dir: Path, ledger: Path) -> None:
         except Exception as exc:
             warned = _warn_dropped(type(exc).__name__, warned)
             decided.append((run, 0))
-    if not decided:
-        return
     with _locked(state_dir):
-        _apply(state_dir, ledger, decided, now)
+        if decided:
+            _apply(state_dir, ledger, decided, now)
+        _remove_leftovers(state_dir)
+
+
+def _remove_leftovers(state_dir: Path) -> None:
+    """Remove temporary record files older than LEFTOVER_AFTER. Holds the lock.
+
+    A process stopped between writing a temporary file and putting it in
+    place leaves it behind. A younger one may belong to a write in progress
+    in another process, so it is left alone.
+    """
+    cutoff = time.time() - LEFTOVER_AFTER.total_seconds()
+    with contextlib.suppress(OSError), os.scandir(state_dir) as entries:
+        for entry in entries:
+            if TEMPORARY_NAME.fullmatch(entry.name) is None:
+                continue
+            with contextlib.suppress(OSError):
+                if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                    os.unlink(entry.path)
 
 
 def _apply(

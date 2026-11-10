@@ -1792,3 +1792,41 @@ def test_a_16_mib_index_is_read_in_bounded_cpu_time(tmp_path: Path, shape: str) 
     assert time.process_time() - started < 5
     assert read.charge == expected
     assert read.complete
+
+
+def _plant_temporaries(state: Path) -> tuple[Path, Path, Path]:
+    """An old leftover, a fresh one, and an old file with another name."""
+    import time
+
+    state.mkdir(parents=True, exist_ok=True)
+    old = state / f".{openruns.OPEN_RUNS_FILE}.0123456789abcdef.tmp"
+    fresh = state / f".{openruns.OPEN_RUNS_FILE}.fedcba9876543210.tmp"
+    other = state / f".{openruns.OPEN_RUNS_FILE}.not-a-token.tmp"
+    for path in (old, fresh, other):
+        path.write_text("x", encoding="utf-8")
+    two_hours_ago = time.time() - 7200
+    for path in (old, other):
+        os.utime(path, (two_hours_ago, two_hours_ago))
+    return old, fresh, other
+
+
+@pytest.mark.parametrize("records", ["none", "a dead run"])
+def test_settle_removes_old_temporary_files(tmp_path: Path, records: str) -> None:
+    state = tmp_path / "state"
+    old, fresh, other = _plant_temporaries(state)
+    if records == "a dead run":
+        outdir = tmp_path / "out"
+        _index(outdir, [_charge(5)])
+        _write_records(state, [_record(outdir=str(outdir))])
+    openruns.settle(state, state / "usage.jsonl")
+    assert not old.exists()
+    assert fresh.exists()
+    assert other.exists()
+
+
+def test_the_leftover_pattern_matches_every_temporary_name(tmp_path: Path) -> None:
+    for _ in range(20):
+        path, fd = openruns._temporary(tmp_path)
+        os.close(fd)
+        assert openruns.TEMPORARY_NAME.fullmatch(path.name), path.name
+        path.unlink()
