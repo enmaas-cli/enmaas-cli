@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import random
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -187,3 +189,30 @@ async def call(
         status=last_status,
         attempts=retries + 1,
     )
+
+
+def is_loopback(host: str | None) -> bool:
+    """Whether a host names this machine: localhost or a loopback address."""
+    if host is None:
+        # A missing host is reported by the URL check itself.
+        return True
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def make_client(base_url: str) -> httpx.AsyncClient:
+    """The one place a client is built.
+
+    A gateway on this machine is reached directly. A proxy from the
+    environment would receive the key in a header, and cleartext http is
+    allowed only for a loopback host. An explicit transport makes httpx skip
+    the proxy variables. TLS variables such as SSL_CERT_FILE still apply,
+    because the transport reads them itself.
+    """
+    if is_loopback(urlsplit(base_url).hostname):
+        return httpx.AsyncClient(transport=httpx.AsyncHTTPTransport())
+    return httpx.AsyncClient()

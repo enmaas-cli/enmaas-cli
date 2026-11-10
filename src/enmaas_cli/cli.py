@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import enum
 import importlib.metadata
-import ipaddress
 import json
 import math
 import os
@@ -26,7 +25,7 @@ import httpx
 from . import openruns
 from .auth import AuthError, printable, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
-from .client import call
+from .client import call, is_loopback, make_client
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
@@ -681,18 +680,6 @@ def resolve_base_url(configured: str | None, env: Mapping[str, str], config_path
     return _validate_gateway_url(url)
 
 
-def _is_loopback(host: str | None) -> bool:
-    if host is None:
-        # A missing host is reported by its own check below.
-        return True
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def _validate_gateway_url(url: str) -> str:
     def invalid(reason: str) -> ValueError:
         return ValueError(f"gateway URL is not valid ({reason}): {url}")
@@ -709,7 +696,7 @@ def _validate_gateway_url(url: str) -> str:
     # The key travels in a header, so cleartext http would send it across
     # the network readable to anyone on the path. A local gateway or
     # tunnel is the only place where that is safe.
-    if parts.scheme.lower() == "http" and not _is_loopback(parts.hostname):
+    if parts.scheme.lower() == "http" and not is_loopback(parts.hostname):
         raise invalid("http is only allowed for localhost, use https")
     # Checked on the raw text: "https://h?" has an empty query, yet the
     # appended request path would still land after the "?".
@@ -1114,7 +1101,7 @@ async def _dispatch(
         return int(ExitCode.ABORTED)
 
     timeout = args.timeout if args.timeout is not None else config.timeout
-    async with httpx.AsyncClient() as client:
+    async with make_client(base_url) as client:
         if args.command == "models":
             try:
                 rows = await run_models(
