@@ -116,7 +116,6 @@ def test_openai_content_parts_join_text_parts_in_order() -> None:
 @pytest.mark.parametrize(
     "content",
     [
-        [],
         [1, 2],
         [{"type": "image_url", "image_url": {"url": MARK}}],
         [{"type": "text", "text": 5}],
@@ -130,6 +129,22 @@ def test_openai_content_without_a_text_part_or_of_another_type_is_bad_reply(
     content: Any,
 ) -> None:
     _bad(_openai_message({"content": content}), "openai")
+
+
+def test_openai_content_empty_list_reads_as_empty() -> None:
+    c = parse_response(_openai_message({"content": []}), "openai")
+    assert c.text == ""
+    assert c.usage == EXPECTED
+
+
+def test_openai_content_empty_list_at_the_token_limit_is_an_empty_response() -> None:
+    from enmaas_cli.errors import EmptyResponseError
+
+    data = _openai(choices=[{"finish_reason": "length", "message": {"content": []}}])
+    with pytest.raises(EmptyResponseError) as exc:
+        parse_response(data, "openai")
+    assert exc.value.usage == EXPECTED
+    assert "raise --max-tokens" in str(exc.value)
 
 
 # OpenAI: reasoning

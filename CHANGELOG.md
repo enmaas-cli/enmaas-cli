@@ -36,7 +36,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   traceback. A missing or null field still reads as an empty answer. The error
   keeps the token counts the reply reported, so `ask` and `map` charge them.
 - An OpenAI reply whose `content` is a list of parts is now read: its text
-  parts are joined in order. A list with no text part fails as `BadReplyError`.
+  parts are joined in order. An empty list reads as an empty answer, the same
+  as a missing `content`. A non-empty list with no text part fails as
+  `BadReplyError`.
 - One bad reply in a `map` run now fails only the items it covered. The other
   items still run.
 - An error inside enmaas that no handler expected now fails only the `map` item

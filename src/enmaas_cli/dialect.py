@@ -317,12 +317,17 @@ def _openai_usage(data: dict[str, Any]) -> Usage:
 def _openai_content(content: object, usage: Usage) -> str:
     """Return the answer text from a message `content` field.
 
-    Missing or null is empty. A list of parts gives its text parts joined in
-    order. A list with no text part, or any other type, is a reply this tool
-    cannot read, so it fails rather than passing as an empty answer.
+    Missing, null or an empty list is empty. An empty list must read as empty
+    so that one cut off at the token limit still raises EmptyResponseError,
+    which tells the user to raise --max-tokens. A list of parts gives its
+    text parts joined in order. A non-empty list with no text part, or any
+    other type, is a reply this tool cannot read, so it fails rather than
+    passing as an empty answer.
     """
-    if content is None or isinstance(content, str):
-        return content or ""
+    if isinstance(content, str):
+        return content
+    if content is None or content == []:
+        return ""
     if isinstance(content, list):
         parts = [
             part["text"]
