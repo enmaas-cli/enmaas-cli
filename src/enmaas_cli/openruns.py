@@ -38,6 +38,10 @@ LOCK_FILE = "open-runs.lock"
 # A process id can be reused, so a record whose process looks alive is still
 # settled once it is this old. Otherwise it could stay open forever.
 STALE_AFTER = timedelta(hours=48)
+# A record that starts later than this after now is refused. A run writes its
+# own start time, so only clock skew between processes can put it ahead, and
+# a forged future time would keep a record from ever turning stale.
+CLOCK_SKEW = timedelta(minutes=5)
 MAX_FILE_BYTES = 1 << 20
 # Bytes of index read in one call to settle or live_charge, shared by every
 # record it handles, so a command's cost does not grow with the record count.
@@ -121,6 +125,8 @@ def _parse(line: str) -> OpenRun | None:
     except ValueError:
         return None
     if moment.utcoffset() is None:
+        return None
+    if moment - datetime.now(UTC) > CLOCK_SKEW:
         return None
     return OpenRun(
         run_id=run_id,

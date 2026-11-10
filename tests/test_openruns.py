@@ -805,3 +805,65 @@ def test_live_charge_stops_reading_when_the_budget_runs_out(
     index_bytes = sum(reads) - os.path.getsize(state / openruns.OPEN_RUNS_FILE)
     assert index_bytes <= budget
     assert 4 <= total < 8
+
+
+def test_a_record_started_in_the_future_is_not_loaded(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(9)])
+    ahead = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    _write_records(state, [_record(outdir=str(outdir), pid=1, started=ahead)])
+    assert openruns._load(state) == []
+    assert openruns.live_charge(state) == 0
+
+
+def test_a_record_within_the_clock_skew_allowance_is_loaded(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    soon = (datetime.now(UTC) + openruns.CLOCK_SKEW - timedelta(seconds=30)).isoformat()
+    _write_records(state, [_record(started=soon)])
+    assert len(openruns._load(state)) == 1
+
+
+def _ledger_with(ledger: Path, charge: int) -> Path:
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "command": "ask",
+        "model": "m",
+        "dialect": "openai",
+        "input_tokens": charge,
+        "cached_tokens": None,
+        "output_tokens": 0,
+        "reasoning_tokens": None,
+        "elapsed": 1.0,
+        "status": "ok",
+        "schema_used": False,
+        "error_kind": None,
+        "items_total": None,
+        "items_ok": None,
+        "items_failed": None,
+        "charge": charge,
+    }
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+    return ledger
+
+
+def test_the_refusal_names_the_spend_from_open_runs_and_the_record_file(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(60)])
+    _write_records(state, [_record(outdir=str(outdir), pid=os.getppid())])
+    ledger = _ledger_with(state / "usage.jsonl", 50)
+    check = rolling_check(Config(budget_tokens=100, budget_window_days=7), ledger)
+    assert check.spent == 110
+    assert check.message == (
+        "110 of 100 tokens spent in the last 7 days, including 60 in runs still open "
+        f"({state / openruns.OPEN_RUNS_FILE})"
+    )
+
+
+def test_the_refusal_without_open_runs_does_not_mention_them(tmp_path: Path) -> None:
+    ledger = _ledger_with(tmp_path / "state" / "usage.jsonl", 150)
+    check = rolling_check(Config(budget_tokens=100, budget_window_days=7), ledger)
+    assert check.message == "150 of 100 tokens spent in the last 7 days"

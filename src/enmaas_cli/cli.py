@@ -617,16 +617,20 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
     # spend so far counts, so two runs side by side cannot each see the
     # whole allowance.
     spent = rolling_spend(events, window_days=config.budget_window_days)
-    spent += openruns.live_charge(ledger.parent)
+    live = openruns.live_charge(ledger.parent)
+    spent += live
     if spent >= config.budget_tokens:
-        return RollingCheck(
-            spent,
-            config.budget_tokens,
-            message=(
-                f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
-                f"{config.budget_window_days} days"
-            ),
+        message = (
+            f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
+            f"{config.budget_window_days} days"
         )
+        if live:
+            # The path lets the user find a record that should not be there.
+            message += (
+                f", including {live:,} in runs still open "
+                f"({ledger.parent / openruns.OPEN_RUNS_FILE})"
+            )
+        return RollingCheck(spent, config.budget_tokens, message=message)
     return RollingCheck(spent, config.budget_tokens, message=None)
 
 
