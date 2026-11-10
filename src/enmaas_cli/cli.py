@@ -1129,8 +1129,10 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
         _warn_if_untracked(recorded, config)
         # Removed after the ledger event, never before. A kill between the two
         # counts this run twice, which only over-counts. The other order
-        # could lose the spend.
-        openruns.end(state_root(), record)
+        # could lose the spend. When the ledger did not take the event, the
+        # record stays, so a later command settles the run once it can.
+        if recorded:
+            openruns.end(state_root(), record)
 
         if args.json:
             status = (

@@ -1159,3 +1159,34 @@ def test_end_leaves_the_record_on_a_held_lock(
     monkeypatch.setattr(openruns, "LOCK_WAIT_SECONDS", 0.5)
     openruns.end(lock_holder, OpenRun(**_record()))
     assert path.read_bytes() == before
+
+
+def test_a_run_whose_ledger_event_was_not_written_keeps_its_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.cli import main
+
+    state = _main_env(tmp_path, monkeypatch)
+    ledger = state / "usage.jsonl"
+    ledger.mkdir(parents=True)
+    items = tmp_path / "items.jsonl"
+    items.write_text('{"id": "a", "x": 1}\n{"id": "b", "x": 2}\n', encoding="utf-8")
+    template = tmp_path / "t.txt"
+    template.write_text("do {x}", encoding="utf-8")
+    argv = ["--config", str(tmp_path / "none.toml"), "map", "-m", "rits/zai-org/glm-5-3"]
+    argv += ["--dialect", "openai", "--items", str(items), "--template", str(template)]
+    argv += ["--outdir", str(tmp_path / "out"), "--retries", "0"]
+    assert main(argv) == 0
+    capsys.readouterr()
+    (record,) = openruns._load(state)
+    assert record.outdir == str(tmp_path / "out")
+
+    ledger.rmdir()
+    assert main(["--config", str(tmp_path / "none.toml"), *ASK]) == 0
+    capsys.readouterr()
+    events = _ledger_rows(ledger)
+    assert [(e["command"], e["error_kind"], e["charge"]) for e in events] == [
+        ("map", "Killed", 14),
+        ("ask", None, 7),
+    ]
+    assert not (state / openruns.OPEN_RUNS_FILE).exists()
