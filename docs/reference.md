@@ -426,9 +426,7 @@ run that crosses the ceiling partway through stops there rather than waiting to 
 caught next time. The window matches `enmaas usage --since DAYS`. Enforcement adds up the
 `charge` recorded per request, which covers every request the gateway metered,
 including one that returned no text and one whose answer later failed
-validation. The `usage` token totals come from the token counters, which skip an
-unbatched `map` item whose answer failed validation, so the two can differ by
-that work.
+validation.
 
 This lives in configuration on purpose: a standing policy you have to
 remember to type on every command is no guard at all. For a one-off run against different settings, the

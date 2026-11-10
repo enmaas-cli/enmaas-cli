@@ -18,8 +18,8 @@
   "outdir": "out",
   "index": "out/results.jsonl",
   "tokens": {
-    "input": 40,
-    "output": 6
+    "input": 90,
+    "output": 13
   },
   "elapsed": <ELAPSED>,
   "budget": {
@@ -56,4 +56,4 @@ results.jsonl  600
 {"id": "b", "status": "error", "path": null, "tokens": null, "error": "response is not valid JSON: Expecting value: line 1 column 1 (char 0)"}
 
 === usage.jsonl
-{"timestamp": "<TIME>", "command": "map", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 40, "cached_tokens": 10, "output_tokens": 6, "reasoning_tokens": 2, "elapsed": <ELAPSED>, "status": "ok", "schema_used": true, "error_kind": "PartialFailure", "items_total": 2, "items_ok": 1, "items_failed": 1, "charge": 93}
+{"timestamp": "<TIME>", "command": "map", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 90, "cached_tokens": 10, "output_tokens": 13, "reasoning_tokens": 2, "elapsed": <ELAPSED>, "status": "ok", "schema_used": true, "error_kind": "PartialFailure", "items_total": 2, "items_ok": 1, "items_failed": 1, "charge": 93}

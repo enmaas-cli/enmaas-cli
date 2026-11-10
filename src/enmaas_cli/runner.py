@@ -327,8 +327,7 @@ class MapOutcome:
     # The per-run budget's running total, job-wide when resumed. Not
     # derivable from input_tokens/cached_tokens above: clamping after
     # aggregation gives a different answer than summing per-request
-    # clamps, and those counters exclude requests that failed after
-    # consuming tokens. Defaulted so existing constructions still work.
+    # clamps. Defaulted so existing constructions still work.
     spent: int = 0
     # Which ceiling stopped the run: "per_run", "rolling" or None.
     # abort_reason only says "budget", which would make a rolling stop
@@ -400,15 +399,13 @@ class MapJob:
 class Tally:
     """The counters of one invocation.
 
-    `charged` is the budget's running total, counted uniformly: every
-    request that consumed tokens, including ones that then failed.
+    `charged` is the budget's running total: the sum of each request's
+    metered charge, failures included.
 
-    The four token counters are not that, and are not consistent either. A
-    batched request counts its usage before per-item validation, while a
-    single-item request counts it only once its answer is written, so a
-    schema-rejected answer is counted by one mode and not the other. That
-    is the reason the budget keeps its own total rather than deriving one
-    from these.
+    The four token counters add up every usage block the gateway returned,
+    whether or not the answer was usable, because every such reply was
+    billed. The budget still keeps its own total: a charge is clamped per
+    request, and clamping the sums gives a different number.
     """
 
     ok: int = 0
@@ -423,7 +420,7 @@ class Tally:
     failures: list[tuple[str, str]] = field(default_factory=list)
 
     def add(self, result: SendResult) -> None:
-        """Count one request's rows and the usage it counts toward the totals."""
+        """Count one request's rows and the usage its reply reported."""
         if result.usage is not None:
             self.input_tokens += result.usage.input_tokens or 0
             self.output_tokens += result.usage.output_tokens or 0
@@ -442,9 +439,9 @@ class Tally:
 class SendResult:
     """What one request produced, ready to be recorded.
 
-    `rows` holds one index row per item, in item order. `usage` is what the
-    request adds to the token totals, or None when it adds nothing.
-    `charge` is the metered cost of the request, failures included.
+    `rows` holds one index row per item, in item order. `usage` is the usage
+    the reply reported, or None when no reply arrived. `charge` is the
+    metered cost of the request, failures included.
     `internal` counts the rows failed by an error no handler expected.
     """
 
@@ -492,15 +489,19 @@ def _error_row(item_id: str, message: str) -> dict[str, Any]:
     return {"id": item_id, "status": "error", "path": None, "tokens": None, "error": message}
 
 
-def _failed(ids: list[str], message: str, charge: int, *, internal: bool = False) -> SendResult:
+def _failed(
+    ids: list[str], message: str, usage: Usage | None, *, internal: bool = False
+) -> SendResult:
     """A request that failed as a whole. Every item in it fails with its message.
 
-    Attributing the error to each item keeps the breaker counting items.
+    Attributing the error to each item keeps the breaker counting items. A
+    reply that arrived was billed, so its usage is still counted and
+    charged.
     """
     return SendResult(
         rows=[_error_row(item_id, message) for item_id in ids],
-        usage=None,
-        charge=charge,
+        usage=usage,
+        charge=metered(usage) if usage is not None else 0,
         internal=len(ids) if internal else 0,
     )
 
@@ -521,7 +522,7 @@ async def send_single(
         schema=plan.schema,
         schema_name=plan.job.schema_name,
     )
-    charge = 0
+    usage: Usage | None = None
     try:
         data = await call(
             client,
@@ -532,9 +533,9 @@ async def send_single(
             secret=settings.key,
         )
         completion = parse_response(data, plan.dialect)
-        # Charged before validation and the file write. A large answer a
+        # Kept before validation and the file write. A large answer a
         # validator rejects still cost its tokens.
-        charge = metered(completion.usage)
+        usage = completion.usage
         if plan.schema is not None:
             validate_against_schema(completion.text, plan.schema)
         path = plan.job.outdir / f"{item_id}.md"
@@ -542,15 +543,15 @@ async def send_single(
     except (CallError, ValidationError, OSError) as exc:
         if isinstance(exc, CallError):
             # A failed request can still have been billed, for example
-            # reasoning that ate the budget and returned nothing. Charge
+            # reasoning that ate the budget and returned nothing. Count
             # what the reply reported.
-            charge = metered(exc.usage)
-        return _failed([item_id], redact(str(exc), settings.key), charge)
+            usage = exc.usage
+        return _failed([item_id], redact(str(exc), settings.key), usage)
     except Exception as exc:
         # One unexpected error fails this item only, so the rest of the run
-        # and its charge rows survive. `charge` keeps what it held when the
+        # and its charge rows survive. `usage` keeps what it held when the
         # error was raised.
-        return _failed([item_id], _internal_message(exc), charge, internal=True)
+        return _failed([item_id], _internal_message(exc), usage, internal=True)
     row = {
         "id": item_id,
         "status": "ok",
@@ -565,7 +566,7 @@ async def send_single(
         **({"replaced": completion.replaced} if completion.replaced else {}),
         "error": None,
     }
-    return SendResult(rows=[row], usage=completion.usage, charge=charge)
+    return SendResult(rows=[row], usage=usage, charge=metered(completion.usage))
 
 
 def _batch_item(
@@ -619,7 +620,7 @@ async def send_batch(
         schema=None,
         schema_name=None,
     )
-    charge = 0
+    usage: Usage | None = None
     try:
         data = await call(
             client,
@@ -631,17 +632,17 @@ async def send_batch(
         )
         completion = parse_response(data, plan.dialect)
         # Before split_batch_response, so a reply this group cannot be split
-        # out of is still charged.
-        charge = metered(completion.usage)
+        # out of is still counted and charged.
+        usage = completion.usage
         answers = split_batch_response(completion.text, ids)
     except (CallError, ValidationError, OSError) as exc:
         if isinstance(exc, CallError):
-            charge = metered(exc.usage)
-        return _failed(ids, redact(str(exc), settings.key), charge)
+            usage = exc.usage
+        return _failed(ids, redact(str(exc), settings.key), usage)
     except Exception as exc:
-        # An unexpected error fails this group only. `charge` keeps what it
+        # An unexpected error fails this group only. `usage` keeps what it
         # held when the error was raised.
-        return _failed(ids, _internal_message(exc), charge, internal=True)
+        return _failed(ids, _internal_message(exc), usage, internal=True)
     rows: list[dict[str, Any]] = []
     internal = 0
     for item_id in ids:
@@ -655,7 +656,7 @@ async def send_batch(
         )
         rows.append(row)
         internal += int(unexpected)
-    return SendResult(rows=rows, usage=completion.usage, charge=charge, internal=internal)
+    return SendResult(rows=rows, usage=usage, charge=metered(completion.usage), internal=internal)
 
 
 def _index_failed(run: _RunState, exc: OSError, charge: int) -> None:

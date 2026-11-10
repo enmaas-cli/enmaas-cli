@@ -212,6 +212,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The token totals of a `map` run count every usage block the gateway
+  returned, so an item sent alone whose answer fails validation now counts in
+  the receipt, in `map --json` and in the ledger event.
 - `map --json` has a new `internal_errors` field, and the `map` receipt shows an
   `internal` line when it is above zero. Those items are already counted in
   `failed`. Please report them.

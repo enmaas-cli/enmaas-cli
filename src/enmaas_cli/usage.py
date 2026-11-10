@@ -50,9 +50,6 @@ class UsageEvent:
     # the sum of the per-request clamps. Measured at 102 versus 12 on two
     # requests of (10 in, 100 cached) and (100 in, 0 cached).
     #
-    # Also the only field that sees requests which consumed tokens and
-    # then failed, since the counters above record successes only.
-    #
     # Optional because rows written before this field existed have none;
     # rolling_spend falls back to deriving one for those.
     charge: int | None = None

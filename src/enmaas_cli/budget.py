@@ -161,8 +161,8 @@ def event_charge(event: UsageEvent) -> int:
     - Clamping after aggregation is not the sum of per-request clamps.
       Two requests of (10 in, 100 cached, 1 out) and (100 in, 0 cached,
       1 out) cost 102, but their combined event derives 12.
-    - The aggregate counters record successful requests only, so a map
-      run's failures, which were still charged, vanish between runs.
+    - In a row with no charge, the aggregate counters of a map run can
+      leave out failed requests that were still charged.
     - `output_tokens` can be absent where a reasoning breakdown is not.
 
     The fallback exists for rows written before `charge` was recorded. It

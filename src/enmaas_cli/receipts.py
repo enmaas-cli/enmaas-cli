@@ -198,7 +198,7 @@ def map_receipt(
     if token_budget:
         # outcome.spent, not a figure derived from the token counts above:
         # on a resumed run the ceiling is compared against the job total,
-        # and those counters only cover this invocation's successes.
+        # and those counters only cover this invocation.
         mark = "  <-- stopped here" if outcome.tripped_budget == "per_run" else ""
         lines.append(f"  budget    {outcome.spent:,} of {token_budget:,} tokens, this run{mark}")
     if rolling_ceiling is not None:

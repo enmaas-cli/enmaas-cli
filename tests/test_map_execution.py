@@ -696,7 +696,7 @@ async def test_outcome_charged_equals_the_charge_rows_the_run_wrote(
         nonlocal calls
         calls += 1
         if calls == 2:
-            # Consumed tokens, returned no text. Charged, not counted by
+            # Consumed tokens, returned no text. Charged, and counted by
             # the input/output counters.
             return httpx.Response(
                 200,
@@ -714,11 +714,12 @@ async def test_outcome_charged_equals_the_charge_rows_the_run_wrote(
     assert outcome.charged == sum(rows)
     # 3 x ((1000-900)+100) + ((300-0)+50)
     assert outcome.charged == 950
-    # And it is genuinely not the same as the counters, which miss the
-    # failure and clamp after aggregating.
-    assert (
-        outcome.charged
-        != max(0, outcome.input_tokens - outcome.cached_tokens) + outcome.output_tokens
+    # The counters include the failed request, because its reply reported
+    # usage.
+    assert (outcome.input_tokens, outcome.cached_tokens, outcome.output_tokens) == (
+        3300,
+        2700,
+        350,
     )
 
 
