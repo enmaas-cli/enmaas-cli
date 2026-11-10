@@ -9,16 +9,17 @@ import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .auth import cut_redacted, printable, redact
 from .dialect import Completion, Dialect
+from .errors import ExitCode
 from .outputs import state_root as state_root
 
 if TYPE_CHECKING:  # pragma: no cover
-    # Import-time cycle avoidance: runner imports budget, not receipts,
-    # but keeping this behind TYPE_CHECKING costs nothing and documents
-    # that receipts is a leaf.
+    # Types only. ask imports this module, and receipts stays a leaf.
+    from .ask import AskResult
+    from .budget import RollingCheck
     from .runner import MapOutcome
 
 PREVIEW_LIMIT = 160
@@ -142,6 +143,19 @@ def ask_receipt(
     return "\n".join(lines)
 
 
+def rolling_total(outcome: MapOutcome, rolling_spent: int) -> int:
+    """The rolling window's spend after the run, as the receipt and the JSON report it.
+
+    The accumulator's own total when the run tracked one. It is not
+    rolling_spent + outcome.spent: on a resumed job outcome.spent already
+    carries earlier invocations, so that sum counts them twice. The
+    fallback covers a run that tracked no accumulator.
+    """
+    if outcome.rolling_spent is not None:
+        return outcome.rolling_spent
+    return rolling_spent + outcome.charged
+
+
 def map_receipt(
     outcome: MapOutcome,
     *,
@@ -206,12 +220,7 @@ def map_receipt(
         # per-run flag was not used. Otherwise a rolling stop would print
         # no ceiling at all and look unexplained.
         mark = "  <-- stopped here" if outcome.tripped_budget == "rolling" else ""
-        # The accumulator's own total when the run tracked one. The
-        # fallback covers a refusal before any request, where no
-        # accumulator ran.
-        total = outcome.rolling_spent
-        if total is None:
-            total = rolling_spent + outcome.charged
+        total = rolling_total(outcome, rolling_spent)
         lines.append(f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}")
     lines.append(f"  elapsed   {outcome.elapsed:.1f}s")
     for item_id, message in outcome.failures[:FAILURE_LIMIT]:
@@ -235,3 +244,121 @@ def map_receipt(
     elif outcome.abort_reason is not None:
         lines.append("  resume    re-run with --resume to continue")
     return "\n".join(lines)
+
+
+def ask_json(result: AskResult) -> dict[str, Any]:
+    """The `ask --json` object, built from the same result as the text receipt."""
+    usage = result.usage
+    return {
+        "status": "ok" if result.exit_code == ExitCode.OK else "error",
+        "model": result.model,
+        "dialect": result.dialect,
+        "path": str(result.path) if result.completion is not None else None,
+        "tokens": {
+            "input": usage.input_tokens if usage else None,
+            "cached": usage.cached_tokens if usage else None,
+            "output": usage.output_tokens if usage else None,
+            "reasoning": usage.reasoning_tokens if usage else None,
+        },
+        "elapsed": result.elapsed,
+        # --json suppresses the receipt, so without this a repaired response
+        # would look untouched to a caller that only reads the
+        # machine-readable output.
+        "replaced": (result.completion.replaced if result.completion else 0),
+        "error": result.error,
+    }
+
+
+def _map_status(outcome: MapOutcome) -> str:
+    if outcome.abort_reason is not None:
+        return "aborted"
+    return "partial" if outcome.failed > 0 else "ok"
+
+
+def map_json(
+    outcome: MapOutcome,
+    *,
+    model: str,
+    token_budget: int | None = None,
+    rolling_ceiling: int | None = None,
+    rolling_spent: int = 0,
+    model_defaulted: bool = False,
+    batch_defaulted: bool = False,
+) -> dict[str, Any]:
+    """The `map --json` object, built from the same data as map_receipt."""
+    return {
+        "status": _map_status(outcome),
+        "model": model,
+        "batch": outcome.batch,
+        "defaulted": {"model": model_defaulted, "batch": batch_defaulted},
+        # Which of the two stop conditions fired. "aborted" alone cannot
+        # distinguish failures from overspending.
+        "abort_reason": outcome.abort_reason,
+        "total": outcome.total,
+        "ok": outcome.ok,
+        "failed": outcome.failed,
+        # Already inside "failed". Items failed by an error that no handler
+        # expected, which is a fault to report.
+        "internal_errors": outcome.internal_errors,
+        "skipped": outcome.skipped,
+        "attempted": outcome.attempted,
+        "outdir": str(outcome.outdir),
+        "index": str(outcome.outdir / "results.jsonl"),
+        "tokens": {
+            "input": outcome.input_tokens,
+            "output": outcome.output_tokens,
+        },
+        "elapsed": outcome.elapsed,
+        # Both ceilings reported separately, and "tripped" names which one
+        # stopped the run. A single flattened object could not say whether
+        # to raise the flag or the config, which are different remedies.
+        "budget": {
+            "per_run": (
+                None
+                if not token_budget
+                # Job-wide when resumed, matching what the ceiling is
+                # compared against.
+                else {"ceiling": token_budget, "spent": outcome.spent}
+            ),
+            "rolling": (
+                None
+                if rolling_ceiling is None
+                else {"ceiling": rolling_ceiling, "spent": rolling_total(outcome, rolling_spent)}
+            ),
+            "tripped": outcome.tripped_budget,
+        },
+        # Bounded like the receipt; the index keeps every message whole. Not
+        # made printable: JSON encoding escapes control characters already.
+        "failures": [
+            {"id": item_id, "error": cut_redacted(message, FAILURE_MESSAGE_CHARS)}
+            for item_id, message in outcome.failures[:FAILURE_LIMIT]
+        ],
+        "failures_truncated": len(outcome.failures) > FAILURE_LIMIT,
+        # Why the run stopped when the index could not be written.
+        "error": outcome.index_error,
+    }
+
+
+def refusal_receipt(command: str, rolling: RollingCheck) -> str:
+    """The text printed when the rolling budget refuses a command before any request."""
+    return f"enmaas {command} refused\n  budget    {rolling.message}"
+
+
+def refusal_json(rolling: RollingCheck) -> dict[str, Any]:
+    """The --json object for the same refusal.
+
+    Exit 3 already means "stopped early", so a bare exit code cannot
+    distinguish a budget refusal from a breaker abort. A --json caller gets
+    the same abort_reason vocabulary it would get from a run that started
+    and then stopped.
+    """
+    return {
+        "status": "refused",
+        "abort_reason": "budget",
+        "budget": {
+            "per_run": None,
+            "rolling": {"ceiling": rolling.ceiling, "spent": rolling.spent},
+            "tripped": "rolling",
+        },
+        "error": rolling.message,
+    }

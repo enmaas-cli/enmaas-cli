@@ -72,7 +72,7 @@ def _count(value: object) -> int:
 
 
 def charge_from_rows(rows: Iterable[dict[str, Any]]) -> int:
-    """Sum the charge rows run_map wrote to results.jsonl.
+    """Sum the charge rows a map run wrote to results.jsonl.
 
     Exact, because it reads what each request actually cost rather than
     recomputing from aggregates. Recomputing would clamp in the wrong
@@ -196,7 +196,7 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
     """Decide whether a configured rolling budget allows more work.
 
     Returns the spend as well as the verdict, because a map run needs to
-    carry the remaining allowance into run_map rather than recompute it.
+    carry the remaining allowance into the run rather than recompute it.
 
     A function returning a message is testable without capturing stdout,
     which is why the decision is made here rather than by the command line.

@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from .auth import printable, redact
-from .client import call
+from .client import CallSettings, call
 from .dialect import (
     Completion,
     Dialect,
@@ -79,19 +79,16 @@ def _failed_after_reply(
     )
 
 
-async def run_ask(
-    *,
+async def send_ask(
     client: httpx.AsyncClient,
-    base_url: str,
-    key: str,
+    settings: CallSettings,
+    *,
     model: str,
     prompt: str,
     system: str | None,
     dialect: Dialect | None,
     thinking: bool,
     max_tokens: int | None,
-    timeout: float,
-    retries: int,
     output: Path | None,
     run_root: Path,
     save_thinking: bool,
@@ -99,6 +96,8 @@ async def run_ask(
     schema_name: str | None = None,
     model_defaulted: bool = False,
 ) -> AskResult:
+    """Send one prompt, write the answer and report the result."""
+    key = settings.key
     prune_runs(run_root)
     run_dir = create_run_dir(run_root)
     path = output if output is not None else run_dir / "response.md"
@@ -128,7 +127,14 @@ async def run_ask(
 
     started = time.monotonic()
     try:
-        data = await call(client, base_url, request, timeout=timeout, retries=retries, secret=key)
+        data = await call(
+            client,
+            settings.base_url,
+            request,
+            timeout=settings.timeout,
+            retries=settings.retries,
+            secret=key,
+        )
         completion = parse_response(data, resolved)
     except CallError as exc:
         elapsed = time.monotonic() - started
@@ -239,4 +245,43 @@ async def run_ask(
         elapsed=elapsed,
         error=None,
         usage=completion.usage,
+    )
+
+
+async def run_ask(
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    key: str,
+    model: str,
+    prompt: str,
+    system: str | None,
+    dialect: Dialect | None,
+    thinking: bool,
+    max_tokens: int | None,
+    timeout: float,
+    retries: int,
+    output: Path | None,
+    run_root: Path,
+    save_thinking: bool,
+    schema_file: Path | None = None,
+    schema_name: str | None = None,
+    model_defaulted: bool = False,
+) -> AskResult:
+    """send_ask with its gateway settings given as keyword arguments."""
+    return await send_ask(
+        client,
+        CallSettings(base_url=base_url, key=key, timeout=timeout, retries=retries),
+        model=model,
+        prompt=prompt,
+        system=system,
+        dialect=dialect,
+        thinking=thinking,
+        max_tokens=max_tokens,
+        output=output,
+        run_root=run_root,
+        save_thinking=save_thinking,
+        schema_file=schema_file,
+        schema_name=schema_name,
+        model_defaulted=model_defaulted,
     )

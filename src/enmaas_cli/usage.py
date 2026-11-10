@@ -11,18 +11,24 @@ import resource
 import secrets
 import stat
 from dataclasses import MISSING, asdict, dataclass, fields
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from enmaas_cli.auth import printable
+from enmaas_cli.errors import ExitCode
 from enmaas_cli.pricing import (
     OPUS_REFERENCE,
     ModelPrice,
     cost_for,
     opus_equivalent,
 )
-from enmaas_cli.tokens import MAX_RECORDED
+from enmaas_cli.tokens import MAX_RECORDED, Usage
+
+if TYPE_CHECKING:  # pragma: no cover
+    # Types only: both modules reach this one through their own imports.
+    from enmaas_cli.ask import AskResult
+    from enmaas_cli.runner import MapOutcome
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,101 @@ class UsageEvent:
     # Optional because rows written before this field existed have none;
     # rolling_spend falls back to deriving one for those.
     charge: int | None = None
+
+
+def recorded_event(
+    *,
+    command: str,
+    model: str,
+    dialect: str,
+    usage: Usage,
+    elapsed: float,
+    status: str,
+    error_kind: str | None,
+    charge: int,
+) -> UsageEvent:
+    """The event for a run this CLI did not make, from what `record` was told."""
+    return UsageEvent(
+        timestamp=datetime.now(UTC),
+        command=command,
+        model=model,
+        dialect=dialect,
+        input_tokens=usage.input_tokens,
+        cached_tokens=usage.cached_tokens,
+        output_tokens=usage.output_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        elapsed=elapsed,
+        status=status,
+        schema_used=False,
+        error_kind=error_kind,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
+        charge=charge,
+    )
+
+
+def ask_event(result: AskResult, *, schema_used: bool, charge: int) -> UsageEvent:
+    """The event for one `ask`. `charge` is the metered cost of its reply."""
+    usage = result.usage
+    return UsageEvent(
+        timestamp=datetime.now(UTC),
+        command="ask",
+        model=result.model,
+        dialect=result.dialect,
+        input_tokens=usage.input_tokens if usage else None,
+        cached_tokens=usage.cached_tokens if usage else None,
+        output_tokens=usage.output_tokens if usage else None,
+        reasoning_tokens=usage.reasoning_tokens if usage else None,
+        elapsed=result.elapsed,
+        status="ok" if result.exit_code == ExitCode.OK else "error",
+        schema_used=schema_used,
+        error_kind=result.error_kind,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
+        charge=charge,
+    )
+
+
+# The error kind a map event records for each reason a run can stop early.
+# Each reason has its own kind, so a budget stop is never filed as a
+# breaker trip. A run with failures that did not stop is PartialFailure.
+_MAP_STOP_KINDS = {
+    "breaker": "CircuitBreakerError",
+    "budget": "TokenBudgetExceeded",
+    "interrupted": "Interrupted",
+    "index": "IndexWriteError",
+}
+
+
+def map_event(outcome: MapOutcome, *, model: str, dialect: str, schema_used: bool) -> UsageEvent:
+    """The event for one `map` invocation."""
+    error_kind = None
+    if outcome.abort_reason is not None or outcome.failed > 0:
+        error_kind = _MAP_STOP_KINDS.get(outcome.abort_reason or "", "PartialFailure")
+    return UsageEvent(
+        timestamp=datetime.now(UTC),
+        command="map",
+        model=model,
+        dialect=dialect,
+        input_tokens=outcome.input_tokens,
+        cached_tokens=outcome.cached_tokens,
+        output_tokens=outcome.output_tokens,
+        reasoning_tokens=outcome.reasoning_tokens,
+        elapsed=outcome.elapsed,
+        status="error" if outcome.abort_reason is not None else "ok",
+        schema_used=schema_used,
+        error_kind=error_kind,
+        items_total=outcome.total,
+        items_ok=outcome.ok,
+        items_failed=outcome.failed,
+        # The sum of each request's metered charge. The token counts above
+        # count every reply too, failures included, but the charge cannot
+        # be derived from them: it is clamped per request, and clamping the
+        # sums gives a different number.
+        charge=outcome.charged,
+    )
 
 
 @dataclass(frozen=True)

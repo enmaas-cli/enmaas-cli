@@ -12,7 +12,7 @@ import os
 import signal
 import sys
 import traceback
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,10 +21,10 @@ from typing import Any, NoReturn, TextIO, cast
 import httpx
 
 from . import gateway, openruns
-from .ask import run_ask
+from .ask import send_ask
 from .auth import AuthError, cut_redacted, printable, printable_block, redact, resolve_key
-from .budget import TokenBudget, metered, rolling_check
-from .client import _reply_object, make_client
+from .budget import RollingCheck, TokenBudget, metered, rolling_check
+from .client import CallSettings, _reply_object, make_client
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
@@ -41,20 +41,25 @@ from .outputs import (
     state_root,
 )
 from .receipts import (
-    FAILURE_LIMIT,
     FAILURE_MESSAGE_CHARS,
+    ask_json,
+    map_json,
     map_receipt,
+    refusal_json,
+    refusal_receipt,
 )
-from .runner import run_map
+from .runner import MapJob, run_job
 from .schema import ValidationError
 from .tokens import MAX_TOKEN_COUNT
 from .usage import (
     LedgerWrite,
-    UsageEvent,
+    ask_event,
     can_append,
     format_summary,
     format_summary_json,
     load_events_counted,
+    map_event,
+    recorded_event,
     summarize_usage,
     write_event,
 )
@@ -165,7 +170,7 @@ def _resolve_model(flag: str | None, config: Config) -> tuple[str, bool]:
 def _resolve_dialect_override(model: str, flag: Dialect | None, config: Config) -> Dialect | None:
     """Apply a configured dialect override unless the flag was given.
 
-    Returns the Literal type run_ask and run_map require. The config
+    Returns the Literal type send_ask and MapJob require. The config
     value is a plain str, so it is checked and then cast rather than
     returned as is; mypy strict rejects str where Dialect is expected.
     """
@@ -449,7 +454,7 @@ class Interrupt:
 class Final:
     """The exit code of a command that has finished and is printing its result.
 
-    Set by _dispatch just before the final output of every command,
+    Set by each command's handler just before its final output,
     refusals and errors included. From then on a stop signal changes
     nothing: the ledger already says what happened, and the process exits
     with this code. The one exception is a result that itself reports the
@@ -469,6 +474,31 @@ class Final:
 
 
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def _install_handlers(handler: Callable[[int, object], None]) -> dict[int, Any]:
+    """Install `handler` for both stop signals and return the handlers it replaced."""
+    previous: dict[int, Any] = {}
+    for signum in STOP_SIGNALS:
+        # ValueError: not the main thread. OSError: the platform refused.
+        with contextlib.suppress(ValueError, OSError):
+            if signal.getsignal(signum) is signal.SIG_IGN:
+                # A background job started with the signal ignored keeps
+                # ignoring it.
+                continue
+            previous[signum] = signal.signal(signum, handler)
+    return previous
+
+
+def _restore_handlers(previous: dict[int, Any], *, process: bool) -> None:
+    for number, handler in previous.items():
+        with contextlib.suppress(ValueError, OSError):
+            if process:
+                signal.signal(number, signal.SIG_IGN)
+            else:
+                # A previous handler of None was not set from Python and
+                # cannot be passed back; the default is the nearest.
+                signal.signal(number, signal.SIG_DFL if handler is None else handler)
 
 
 async def _guarded(
@@ -527,15 +557,7 @@ async def _guarded(
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
-    previous: dict[int, Any] = {}
-    for signum in STOP_SIGNALS:
-        # ValueError: not the main thread. OSError: the platform refused.
-        with contextlib.suppress(ValueError, OSError):
-            if signal.getsignal(signum) is signal.SIG_IGN:
-                # A background job started with the signal ignored keeps
-                # ignoring it.
-                continue
-            previous[signum] = signal.signal(signum, on_signal)
+    previous = _install_handlers(on_signal)
     try:
         code = await _dispatch(args, config, base_url, key, final)
         # A cancel that arrived after the work was done can be absorbed by
@@ -553,14 +575,7 @@ async def _guarded(
         interrupt.reported = True
         return _setup_error(args, "interrupted")
     finally:
-        for number, handler in previous.items():
-            with contextlib.suppress(ValueError, OSError):
-                if process:
-                    signal.signal(number, signal.SIG_IGN)
-                else:
-                    # A previous handler of None was not set from Python and
-                    # cannot be passed back; the default is the nearest.
-                    signal.signal(number, signal.SIG_DFL if handler is None else handler)
+        _restore_handlers(previous, process=process)
 
 
 def _final_error(args: argparse.Namespace, final: Final, interrupt: Interrupt, message: str) -> int:
@@ -587,6 +602,151 @@ def _flush_quietly() -> None:
             stream.flush()
 
 
+def _inspect(args: argparse.Namespace) -> int:
+    # The file can hold an answer, so its text is printed inert. Its lines
+    # and tabs are kept.
+    text = inspect_file(args.path, max_chars=args.max_chars)
+    sys.stdout.write(printable_block(text))
+    return int(ExitCode.OK)
+
+
+def _allow_read(args: argparse.Namespace) -> int:
+    allow_read(args.path)
+    return int(ExitCode.OK)
+
+
+# Commands that read no config, no key and no network.
+LOCAL_COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
+    "inspect": _inspect,
+    "allow-read": _allow_read,
+}
+GATEWAY_COMMANDS = frozenset({"models", "ask", "map"})
+# The commands that send requests that cost tokens.
+SPENDING_COMMANDS = frozenset({"ask", "map"})
+
+
+def _local(args: argparse.Namespace) -> int:
+    try:
+        return LOCAL_COMMANDS[args.command](args)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return int(ExitCode.ERROR)
+
+
+def _load_config(args: argparse.Namespace, config_path: Path) -> Config | None:
+    """The config, with its warnings printed. None when the command must stop."""
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        # A malformed [budget] table is the only fatal config error.
+        # Proceeding would run uncapped, which is what it was written to
+        # prevent, so refuse rather than warn.
+        if getattr(args, "json", False):
+            _setup_error(args, _error_text(str(exc), ""))
+        else:
+            print(f"enmaas: {exc}", file=sys.stderr)
+        return None
+    for warning in config.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return config
+
+
+def _gateway_access(
+    args: argparse.Namespace, config: Config, config_path: Path
+) -> tuple[str, str] | None:
+    """The gateway URL and the key, empty for a command that sends nothing.
+
+    None when either could not be found, after the error is reported.
+    """
+    if args.command not in GATEWAY_COMMANDS:
+        return "", ""
+    try:
+        base_url = resolve_base_url(config.base_url, os.environ, config_path)
+    except ValueError as exc:
+        _setup_error(args, str(exc))
+        return None
+    try:
+        key = resolve_key(
+            key_file=args.key_file,
+            env=dict(os.environ),
+            home=Path.home(),
+            # Passed unexpanded: a bad "~user" path must not fail a run
+            # where --key-file or $ENMAAS_KEY wins.
+            config_key_file=config.key_file or None,
+        )
+    except AuthError as exc:
+        _setup_error(args, str(exc))
+        return None
+    if key.warning:
+        print(f"warning: {key.warning}", file=sys.stderr)
+    return base_url, key.value
+
+
+def _late_cancel(args: argparse.Namespace, final: Final, interrupt: Interrupt) -> int:
+    """The exit after a cancel that was still pending when the command returned.
+
+    Such a cancel cancels the task itself, outside every handler in _guarded.
+    """
+    if final.code is not None:
+        final.overrides(interrupt)
+        return final.code
+    if not interrupt.reported:
+        interrupt.reported = True
+        _setup_error(args, "interrupted")
+    return int(ExitCode.ERROR)
+
+
+def _run_guarded(
+    args: argparse.Namespace,
+    config: Config,
+    base_url: str,
+    key: str,
+    interrupt: Interrupt,
+    final: Final,
+    *,
+    process: bool,
+) -> int:
+    """Run the command in an event loop. An error that escapes it is its one result."""
+    try:
+        code = asyncio.run(_guarded(args, config, base_url, key, interrupt, final, process=process))
+    except asyncio.CancelledError:
+        code = _late_cancel(args, final, interrupt)
+    except (DialectError, ValidationError, ValueError, OSError) as exc:
+        code = _final_error(args, final, interrupt, _error_text(str(exc), key))
+    except Exception as exc:
+        # Never the exception text: an error no handler expected can carry
+        # part of a reply or a prompt. Where it happened is enough to report
+        # it. CancelledError and KeyboardInterrupt are not Exception
+        # subclasses, so they reach the handlers for them.
+        message = f"internal error ({where(exc)})"
+        code = _final_error(args, final, interrupt, _error_text(message, key))
+        if os.environ.get("ENMAAS_DEBUG") == "1":
+            print(redact(traceback.format_exc(), key), file=sys.stderr, end="")
+    if interrupt.signum is not None:
+        # A further signal while the output is flushed must not raise.
+        for signum in STOP_SIGNALS:
+            signal.signal(signum, signal.SIG_IGN)
+        _flush_quietly()
+    return code
+
+
+def _interrupted_outside(args: argparse.Namespace, final: Final, interrupt: Interrupt) -> int:
+    """The exit after SIGINT outside the window where _guarded handles it.
+
+    That is either before its handler is installed or after it is removed.
+    """
+    if final.overrides(interrupt) and final.code is not None:
+        # The command had finished and printed. Nothing changes.
+        return final.code
+    if interrupt.signum is None:
+        interrupt.signum = signal.SIGINT
+    if not interrupt.reported and final.code is None:
+        # A --json caller still gets one object.
+        interrupt.reported = True
+        _setup_error(args, "interrupted")
+    return int(ExitCode.ERROR)
+
+
 def main(argv: list[str] | None = None, *, process: bool = False) -> int:
     """Run one command and return its exit code.
 
@@ -596,104 +756,23 @@ def main(argv: list[str] | None = None, *, process: bool = False) -> int:
     exits. In-process callers keep their own handlers.
     """
     args = build_parser().parse_args(argv)
-    if args.command in {"inspect", "allow-read"}:
-        try:
-            if args.command == "inspect":
-                # The file can hold an answer, so its text is printed inert.
-                # Its lines and tabs are kept.
-                text = inspect_file(args.path, max_chars=args.max_chars)
-                sys.stdout.write(printable_block(text))
-            else:
-                allow_read(args.path)
-        except (OSError, ValueError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return int(ExitCode.ERROR)
-        return int(ExitCode.OK)
+    if args.command in LOCAL_COMMANDS:
+        return _local(args)
     config_path = args.config or default_config_path()
-    try:
-        config = load_config(config_path)
-    except ConfigError as exc:
-        # A malformed [budget] table is the only fatal config error.
-        # Proceeding would run uncapped, which is what it was written to
-        # prevent, so refuse rather than warn.
-        if getattr(args, "json", False):
-            return _setup_error(args, _error_text(str(exc), ""))
-        print(f"enmaas: {exc}", file=sys.stderr)
-        return 1
-    for warning in config.warnings:
-        print(f"warning: {warning}", file=sys.stderr)
-
-    needs_gateway = args.command in {"models", "ask", "map"}
-    base_url = ""
-    key_value = ""
-    if needs_gateway:
-        try:
-            base_url = resolve_base_url(config.base_url, os.environ, config_path)
-        except ValueError as exc:
-            return _setup_error(args, str(exc))
-        try:
-            key = resolve_key(
-                key_file=args.key_file,
-                env=dict(os.environ),
-                home=Path.home(),
-                # Passed unexpanded: a bad "~user" path must not fail a run
-                # where --key-file or $ENMAAS_KEY wins.
-                config_key_file=config.key_file or None,
-            )
-        except AuthError as exc:
-            return _setup_error(args, str(exc))
-        if key.warning:
-            print(f"warning: {key.warning}", file=sys.stderr)
-        key_value = key.value
+    config = _load_config(args, config_path)
+    if config is None:
+        return int(ExitCode.ERROR)
+    access = _gateway_access(args, config, config_path)
+    if access is None:
+        return int(ExitCode.ERROR)
+    base_url, key = access
 
     interrupt = Interrupt()
     final = Final()
     try:
-        try:
-            code = asyncio.run(
-                _guarded(args, config, base_url, key_value, interrupt, final, process=process)
-            )
-        except asyncio.CancelledError:
-            # A cancel that was still pending when the command returned
-            # cancels the task itself, outside every handler in _guarded.
-            if final.code is not None:
-                final.overrides(interrupt)
-                code = final.code
-            else:
-                if not interrupt.reported:
-                    interrupt.reported = True
-                    _setup_error(args, "interrupted")
-                code = int(ExitCode.ERROR)
-        except (DialectError, ValidationError, ValueError, OSError) as exc:
-            code = _final_error(args, final, interrupt, _error_text(str(exc), key_value))
-        except Exception as exc:
-            # Never the exception text: an error no handler expected can
-            # carry part of a reply or a prompt. Where it happened is enough
-            # to report it. CancelledError and KeyboardInterrupt are not
-            # Exception subclasses, so they reach the handlers for them.
-            message = f"internal error ({where(exc)})"
-            code = _final_error(args, final, interrupt, _error_text(message, key_value))
-            if os.environ.get("ENMAAS_DEBUG") == "1":
-                print(redact(traceback.format_exc(), key_value), file=sys.stderr, end="")
-        if interrupt.signum is not None:
-            # A further signal while the output is flushed must not raise.
-            for signum in STOP_SIGNALS:
-                signal.signal(signum, signal.SIG_IGN)
-            _flush_quietly()
+        code = _run_guarded(args, config, base_url, key, interrupt, final, process=process)
     except KeyboardInterrupt:
-        # SIGINT outside the window where _guarded handles it, either before
-        # its handler is installed or after it is removed.
-        if final.overrides(interrupt) and final.code is not None:
-            # The command had finished and printed. Nothing changes.
-            code = final.code
-        else:
-            if interrupt.signum is None:
-                interrupt.signum = signal.SIGINT
-            if not interrupt.reported and final.code is None:
-                # A --json caller still gets one object.
-                interrupt.reported = True
-                _setup_error(args, "interrupted")
-            code = int(ExitCode.ERROR)
+        code = _interrupted_outside(args, final, interrupt)
     if interrupt.signum is not None:
         # End by the same signal, so the parent sees how the process stopped
         # (130 or 143 in a shell) rather than an ordinary exit code.
@@ -704,127 +783,82 @@ def main(argv: list[str] | None = None, *, process: bool = False) -> int:
     return code
 
 
-async def _dispatch(
-    args: argparse.Namespace, config: Config, base_url: str, key: str, final: Final
-) -> int:
-    if args.command == "record":
-        # A ledger that only sees this CLI's own calls understates reality:
-        # a tool talking to the gateway directly is invisible by
-        # construction. Recording is a subcommand rather than a library
-        # function so a caller in any language can be counted without
-        # taking a dependency on this package.
-        written = write_event(
-            state_root() / "usage.jsonl",
-            UsageEvent(
-                timestamp=datetime.now(UTC),
-                command=args.command_name,
-                model=args.model,
-                dialect=args.dialect,
-                input_tokens=args.input,
-                cached_tokens=args.cached,
-                output_tokens=args.output,
-                reasoning_tokens=args.reasoning,
-                elapsed=args.elapsed,
-                status=args.status,
-                schema_used=False,
-                error_kind=args.error_kind,
-                items_total=None,
-                items_ok=None,
-                items_failed=None,
-                # Derived the same way metered() would, so externally
-                # recorded work counts against a budget identically.
-                charge=metered(
-                    Usage(
-                        input_tokens=args.input,
-                        cached_tokens=args.cached,
-                        output_tokens=args.output,
-                        reasoning_tokens=args.reasoning,
-                    )
-                ),
-            ),
+def _record(args: argparse.Namespace, config: Config, final: Final) -> int:
+    """Record a run this CLI did not make.
+
+    A ledger that only sees this CLI's own calls understates reality: a
+    tool talking to the gateway directly is invisible by construction.
+    Recording is a subcommand rather than a library function so a caller in
+    any language can be counted without taking a dependency on this
+    package.
+    """
+    usage = Usage(
+        input_tokens=args.input,
+        cached_tokens=args.cached,
+        output_tokens=args.output,
+        reasoning_tokens=args.reasoning,
+    )
+    event = recorded_event(
+        command=args.command_name,
+        model=args.model,
+        dialect=args.dialect,
+        usage=usage,
+        elapsed=args.elapsed,
+        status=args.status,
+        error_kind=args.error_kind,
+        # Charged by metered(), as a request this CLI sends is, so
+        # externally recorded work counts against a budget identically.
+        charge=metered(usage),
+    )
+    written = write_event(state_root() / "usage.jsonl", event)
+    # Every handler sets this before its final output, so a stop signal
+    # from then on changes nothing.
+    final.code = int(ExitCode.OK)
+    _warn_if_untracked(written, config)
+    return int(ExitCode.OK)
+
+
+def _usage(args: argparse.Namespace, config: Config, final: Final) -> int:
+    ledger = state_root() / "usage.jsonl"
+    events, skipped, not_regular = load_events_counted(ledger)
+    final.code = int(ExitCode.OK)
+    if not_regular:
+        print(
+            f"warning: {printable(str(ledger))} is not a regular file, "
+            "so no usage was read from it",
+            file=sys.stderr,
         )
-        # Set before every final output, here and below, so a stop signal
-        # from then on changes nothing.
-        final.code = int(ExitCode.OK)
-        _warn_if_untracked(written, config)
-        return int(ExitCode.OK)
+    if skipped:
+        print(
+            f"warning: {skipped} rows of {printable(str(ledger))} could not be read "
+            "and were skipped",
+            file=sys.stderr,
+        )
 
-    # Handle usage command first (no timeout argument)
-    if args.command == "usage":
-        ledger = state_root() / "usage.jsonl"
-        events, skipped, not_regular = load_events_counted(ledger)
-        final.code = int(ExitCode.OK)
-        if not_regular:
-            print(
-                f"warning: {printable(str(ledger))} is not a regular file, "
-                "so no usage was read from it",
-                file=sys.stderr,
-            )
-        if skipped:
-            print(
-                f"warning: {skipped} rows of {printable(str(ledger))} could not be read "
-                "and were skipped",
-                file=sys.stderr,
-            )
+    if args.since is not None:
+        cutoff = datetime.now(UTC) - timedelta(days=args.since)
+        events = [e for e in events if e.timestamp >= cutoff]
 
-        if args.since is not None:
-            cutoff = datetime.now(UTC) - timedelta(days=args.since)
-            events = [e for e in events if e.timestamp >= cutoff]
+    summary = summarize_usage(events)
 
-        summary = summarize_usage(events)
+    if args.json:
+        print(format_summary_json(summary, config.prices, skipped_rows=skipped))
+    else:
+        print(format_summary(summary, since_days=args.since, prices=config.prices))
 
-        if args.json:
-            print(format_summary_json(summary, config.prices, skipped_rows=skipped))
-        else:
-            print(format_summary(summary, since_days=args.since, prices=config.prices))
+    return int(ExitCode.OK)
 
-        return int(ExitCode.OK)
 
-    if args.command in ("ask", "map"):
-        # Charge any map run that died without writing its ledger event,
-        # before the budget is checked, so the check sees that spend.
-        openruns.settle(state_root(), state_root() / "usage.jsonl")
-
-    # Both spending commands pass through here. Checked before the client
-    # is opened, so an over-budget invocation costs nothing at all.
-    rolling = rolling_check(config, state_root() / "usage.jsonl")
-    if rolling.message and args.command in ("ask", "map"):
+def _refused(args: argparse.Namespace, rolling: RollingCheck, final: Final) -> int | None:
+    """Refuse a spending command the budget does not allow. None when it may go on."""
+    if rolling.message:
         final.code = int(ExitCode.ABORTED)
         if getattr(args, "json", False):
-            # Exit 3 already means "stopped early", so a bare exit code
-            # cannot distinguish a budget refusal from a breaker abort.
-            # A --json caller gets the same abort_reason vocabulary it
-            # would get from a run that started and then stopped.
-            print(
-                json.dumps(
-                    {
-                        "status": "refused",
-                        "abort_reason": "budget",
-                        "budget": {
-                            "per_run": None,
-                            "rolling": {
-                                "ceiling": rolling.ceiling,
-                                "spent": rolling.spent,
-                            },
-                            "tripped": "rolling",
-                        },
-                        "error": rolling.message,
-                    },
-                    indent=2,
-                )
-            )
+            print(json.dumps(refusal_json(rolling), indent=2))
         else:
-            print(
-                f"enmaas {args.command} refused\n  budget    {rolling.message}",
-                file=sys.stderr,
-            )
+            print(refusal_receipt(args.command, rolling), file=sys.stderr)
         return int(ExitCode.ABORTED)
-
-    if (
-        args.command in ("ask", "map")
-        and rolling.ceiling is not None
-        and not can_append(state_root() / "usage.jsonl")
-    ):
+    if rolling.ceiling is not None and not can_append(state_root() / "usage.jsonl"):
         # A ledger that cannot be written reads as no spend on the next run,
         # so every run would start from zero and the budget would never bind.
         final.code = int(ExitCode.ERROR)
@@ -834,294 +868,212 @@ async def _dispatch(
             "written, so the token budget cannot be tracked; fix it or remove the [budget] "
             "table from the config",
         )
+    return None
+
+
+async def _models(
+    client: httpx.AsyncClient,
+    args: argparse.Namespace,
+    base_url: str,
+    key: str,
+    timeout: float,
+    final: Final,
+) -> int:
+    try:
+        rows = await run_models(
+            client=client,
+            base_url=base_url,
+            key=key,
+            dialect=args.dialect or "both",
+            timeout=timeout,
+        )
+    except (httpx.HTTPError, CallError) as exc:
+        final.code = int(ExitCode.ERROR)
+        return _setup_error(args, _error_text(str(exc), key))
+    final.code = int(ExitCode.OK)
+    if args.json:
+        # The same redaction as the text list. JSON encoding already
+        # escapes control characters, so nothing else is needed.
+        print(
+            json.dumps(
+                [{**row, "id": redact(row["id"], key)} for row in rows],
+                indent=2,
+            )
+        )
+    else:
+        for row in rows:
+            # A catalog id is gateway text, so it is printed inert.
+            model_id = printable(redact(row["id"], key))
+            print(f"{model_id:<45} {','.join(row['dialects'])}")
+    return int(ExitCode.OK)
+
+
+async def _ask(
+    client: httpx.AsyncClient,
+    settings: CallSettings,
+    args: argparse.Namespace,
+    config: Config,
+    final: Final,
+) -> int:
+    model, model_defaulted = _resolve_model(args.model, config)
+    dialect = _resolve_dialect_override(model, args.dialect, config)
+
+    prompt = assemble_prompt(prompt=_read_prompt(args), files=args.file)
+    result = await send_ask(
+        client,
+        settings,
+        model=model,
+        prompt=prompt,
+        system=args.system,
+        dialect=dialect,
+        thinking=resolve_thinking(args.thinking, model),
+        max_tokens=args.max_tokens,
+        output=args.output,
+        run_root=state_root(),
+        save_thinking=args.save_thinking,
+        schema_file=args.schema,
+        schema_name=args.schema_name,
+        model_defaulted=model_defaulted,
+    )
+
+    usage = result.usage
+    event = ask_event(
+        result,
+        schema_used=args.schema is not None,
+        charge=metered(usage) if usage else 0,
+    )
+    written = write_event(state_root() / "usage.jsonl", event)
+    _warn_if_untracked(written, config)
+    # Reported before the result is printed. From here a stop signal
+    # changes nothing.
+    final.code = result.exit_code
+
+    if args.json:
+        _emit(json.dumps(ask_json(result), indent=2))
+    elif args.stdout and result.exit_code == ExitCode.OK:
+        _emit(result.completion.text if result.completion else "")
+        _emit(result.receipt, sys.stderr)
+    else:
+        stream = sys.stdout if result.exit_code == ExitCode.OK else sys.stderr
+        _emit(result.receipt, stream)
+    return result.exit_code
+
+
+async def _map(
+    client: httpx.AsyncClient,
+    settings: CallSettings,
+    args: argparse.Namespace,
+    config: Config,
+    rolling: RollingCheck,
+    final: Final,
+) -> int:
+    model, model_defaulted = _resolve_model(args.model, config)
+    dialect = _resolve_dialect_override(model, args.dialect, config)
+    batch_defaulted = args.batch is None
+    # Resolved before the run, because the open-run record carries it.
+    resolved_dialect = resolve_dialect(model, dialect)
+    # When the run raises, the record stays on purpose. The next ask or map
+    # settles it, so spend from a run that died on an error counts.
+    record = openruns.begin(state_root(), outdir=args.outdir, model=model, dialect=resolved_dialect)
+
+    job = MapJob(
+        model=model,
+        items_path=args.items,
+        template_path=args.template,
+        outdir=args.outdir,
+        concurrency=args.concurrency if args.concurrency is not None else config.concurrency,
+        thinking=resolve_thinking(args.thinking, model),
+        max_tokens=args.max_tokens,
+        dialect=dialect,
+        resume=args.resume,
+        schema_file=args.schema,
+        schema_name=args.schema_name,
+        batch=args.batch,
+        token_budget=args.token_budget,
+        # Seeded with what the window has already consumed, so a long run
+        # that crosses the standing ceiling partway stops there rather than
+        # only being caught at the next invocation.
+        rolling_budget=(
+            TokenBudget(rolling.ceiling, spent=rolling.spent)
+            if rolling.ceiling is not None
+            else None
+        ),
+        # Tags the charge rows, so a settle counts only this run's rows.
+        run_id=record.run_id if record is not None else None,
+    )
+    outcome = await run_job(client, settings, job)
+
+    event = map_event(
+        outcome, model=model, dialect=resolved_dialect, schema_used=args.schema is not None
+    )
+    written = write_event(state_root() / "usage.jsonl", event)
+    _warn_if_untracked(written, config)
+    # Removed after the ledger event, never before. A kill between the two
+    # counts this run twice, which only over-counts. The other order could
+    # lose the spend. When the ledger did not take the event, the record
+    # stays, so a later command settles the run once it can.
+    if written.recorded:
+        openruns.end(state_root(), record)
+    # Reported before the result is printed. From here a stop signal
+    # changes nothing.
+    final.code = outcome.exit_code
+    final.interrupted = outcome.abort_reason == "interrupted"
+
+    if args.json:
+        obj = map_json(
+            outcome,
+            model=model,
+            token_budget=args.token_budget,
+            rolling_ceiling=rolling.ceiling,
+            rolling_spent=rolling.spent,
+            model_defaulted=model_defaulted,
+            batch_defaulted=batch_defaulted,
+        )
+        _emit(json.dumps(obj, indent=2))
+    else:
+        receipt = map_receipt(
+            outcome,
+            model=model,
+            token_budget=args.token_budget,
+            rolling_ceiling=rolling.ceiling,
+            rolling_spent=rolling.spent,
+            model_defaulted=model_defaulted,
+            batch_defaulted=batch_defaulted,
+        )
+        _emit(receipt)
+    return outcome.exit_code
+
+
+async def _dispatch(
+    args: argparse.Namespace, config: Config, base_url: str, key: str, final: Final
+) -> int:
+    """Run a command that reads the config, through its handler."""
+    if args.command == "record":
+        return _record(args, config, final)
+    if args.command == "usage":
+        return _usage(args, config, final)
+
+    if args.command in SPENDING_COMMANDS:
+        # Charge any map run that died without writing its ledger event,
+        # before the budget is checked, so the check sees that spend.
+        openruns.settle(state_root(), state_root() / "usage.jsonl")
+
+    # Both spending commands pass through here. Checked before the client
+    # is opened, so an over-budget invocation costs nothing at all.
+    rolling = rolling_check(config, state_root() / "usage.jsonl")
+    if args.command in SPENDING_COMMANDS:
+        refused = _refused(args, rolling, final)
+        if refused is not None:
+            return refused
 
     timeout = args.timeout if args.timeout is not None else config.timeout
     async with make_client(base_url) as client:
         if args.command == "models":
-            try:
-                rows = await run_models(
-                    client=client,
-                    base_url=base_url,
-                    key=key,
-                    dialect=args.dialect or "both",
-                    timeout=timeout,
-                )
-            except (httpx.HTTPError, CallError) as exc:
-                final.code = int(ExitCode.ERROR)
-                return _setup_error(args, _error_text(str(exc), key))
-            final.code = int(ExitCode.OK)
-            if args.json:
-                # The same redaction as the text list. JSON encoding already
-                # escapes control characters, so nothing else is needed.
-                print(
-                    json.dumps(
-                        [{**row, "id": redact(row["id"], key)} for row in rows],
-                        indent=2,
-                    )
-                )
-            else:
-                for row in rows:
-                    # A catalog id is gateway text, so it is printed inert.
-                    model_id = printable(redact(row["id"], key))
-                    print(f"{model_id:<45} {','.join(row['dialects'])}")
-            return int(ExitCode.OK)
-
+            return await _models(client, args, base_url, key, timeout, final)
+        settings = CallSettings(base_url=base_url, key=key, timeout=timeout, retries=args.retries)
         if args.command == "ask":
-            model, model_defaulted = _resolve_model(args.model, config)
-            dialect = _resolve_dialect_override(model, args.dialect, config)
-
-            prompt = assemble_prompt(prompt=_read_prompt(args), files=args.file)
-            result = await run_ask(
-                client=client,
-                base_url=base_url,
-                key=key,
-                model=model,
-                prompt=prompt,
-                system=args.system,
-                dialect=dialect,
-                thinking=resolve_thinking(args.thinking, model),
-                max_tokens=args.max_tokens,
-                timeout=timeout,
-                retries=args.retries,
-                output=args.output,
-                run_root=state_root(),
-                save_thinking=args.save_thinking,
-                schema_file=args.schema,
-                schema_name=args.schema_name,
-                model_defaulted=model_defaulted,
-            )
-
-            usage_obj = result.usage
-            written = write_event(
-                state_root() / "usage.jsonl",
-                UsageEvent(
-                    timestamp=datetime.now(UTC),
-                    command="ask",
-                    model=result.model,
-                    dialect=result.dialect,
-                    input_tokens=usage_obj.input_tokens if usage_obj else None,
-                    cached_tokens=usage_obj.cached_tokens if usage_obj else None,
-                    output_tokens=usage_obj.output_tokens if usage_obj else None,
-                    reasoning_tokens=usage_obj.reasoning_tokens if usage_obj else None,
-                    elapsed=result.elapsed,
-                    status="ok" if result.exit_code == ExitCode.OK else "error",
-                    schema_used=args.schema is not None,
-                    error_kind=result.error_kind,
-                    items_total=None,
-                    items_ok=None,
-                    items_failed=None,
-                    charge=metered(usage_obj) if usage_obj else 0,
-                ),
-            )
-            _warn_if_untracked(written, config)
-            # Reported before the result is printed. From here a stop signal
-            # changes nothing.
-            final.code = result.exit_code
-
-            if args.json:
-                # Machine-readable output
-                usage = result.usage
-                ask_obj = {
-                    "status": "ok" if result.exit_code == ExitCode.OK else "error",
-                    "model": result.model,
-                    "dialect": result.dialect,
-                    "path": str(result.path) if result.completion is not None else None,
-                    "tokens": {
-                        "input": usage.input_tokens if usage else None,
-                        "cached": usage.cached_tokens if usage else None,
-                        "output": usage.output_tokens if usage else None,
-                        "reasoning": usage.reasoning_tokens if usage else None,
-                    },
-                    "elapsed": result.elapsed,
-                    # --json suppresses the receipt, so without this a
-                    # repaired response would look untouched to a caller
-                    # that only reads the machine-readable output.
-                    "replaced": (result.completion.replaced if result.completion else 0),
-                    "error": result.error,
-                }
-                _emit(json.dumps(ask_obj, indent=2))
-            elif args.stdout and result.exit_code == ExitCode.OK:
-                _emit(result.completion.text if result.completion else "")
-                _emit(result.receipt, sys.stderr)
-            else:
-                stream = sys.stdout if result.exit_code == ExitCode.OK else sys.stderr
-                _emit(result.receipt, stream)
-            return result.exit_code
-
-        model, model_defaulted = _resolve_model(args.model, config)
-        dialect = _resolve_dialect_override(model, args.dialect, config)
-        batch_defaulted = args.batch is None
-        # Resolved before the run, because the open-run record carries it.
-        resolved_dialect = resolve_dialect(model, dialect)
-        # When run_map raises, the record stays on purpose. The next ask or
-        # map settles it, so spend from a run that died on an error counts.
-        record = openruns.begin(
-            state_root(), outdir=args.outdir, model=model, dialect=resolved_dialect
-        )
-
-        outcome = await run_map(
-            client=client,
-            base_url=base_url,
-            key=key,
-            model=model,
-            items_path=args.items,
-            template_path=args.template,
-            outdir=args.outdir,
-            concurrency=args.concurrency if args.concurrency is not None else config.concurrency,
-            retries=args.retries,
-            timeout=timeout,
-            thinking=resolve_thinking(args.thinking, model),
-            max_tokens=args.max_tokens,
-            dialect=dialect,
-            resume=args.resume,
-            schema_file=args.schema,
-            schema_name=args.schema_name,
-            batch=args.batch,
-            token_budget=args.token_budget,
-            # Seeded with what the window has already consumed, so a long
-            # run that crosses the standing ceiling partway stops there
-            # rather than only being caught at the next invocation.
-            rolling_budget=(
-                TokenBudget(rolling.ceiling, spent=rolling.spent)
-                if rolling.ceiling is not None
-                else None
-            ),
-            # Tags the charge rows, so a settle counts only this run's rows.
-            run_id=record.run_id if record is not None else None,
-        )
-
-        error_kind = None
-        if outcome.abort_reason is not None or outcome.failed > 0:
-            # Was hardcoded to CircuitBreakerError for any abort, which
-            # would have filed a budget stop as a breaker trip.
-            error_kind = {
-                "breaker": "CircuitBreakerError",
-                "budget": "TokenBudgetExceeded",
-                "interrupted": "Interrupted",
-                "index": "IndexWriteError",
-            }.get(outcome.abort_reason or "", "PartialFailure")
-        written = write_event(
-            state_root() / "usage.jsonl",
-            UsageEvent(
-                timestamp=datetime.now(UTC),
-                command="map",
-                model=model,
-                dialect=resolved_dialect,
-                input_tokens=outcome.input_tokens,
-                cached_tokens=outcome.cached_tokens,
-                output_tokens=outcome.output_tokens,
-                reasoning_tokens=outcome.reasoning_tokens,
-                elapsed=outcome.elapsed,
-                status="error" if outcome.abort_reason is not None else "ok",
-                schema_used=args.schema is not None,
-                error_kind=error_kind,
-                items_total=outcome.total,
-                items_ok=outcome.ok,
-                items_failed=outcome.failed,
-                # Not derived from the counters above: this is the sum of
-                # what each request actually cost, failures included.
-                charge=outcome.charged,
-            ),
-        )
-        _warn_if_untracked(written, config)
-        # Removed after the ledger event, never before. A kill between the two
-        # counts this run twice, which only over-counts. The other order
-        # could lose the spend. When the ledger did not take the event, the
-        # record stays, so a later command settles the run once it can.
-        if written.recorded:
-            openruns.end(state_root(), record)
-        # Reported before the result is printed. From here a stop signal
-        # changes nothing.
-        final.code = outcome.exit_code
-        final.interrupted = outcome.abort_reason == "interrupted"
-
-        if args.json:
-            status = (
-                "aborted"
-                if outcome.abort_reason is not None
-                else ("partial" if outcome.failed > 0 else "ok")
-            )
-            obj: dict[str, Any] = {
-                "status": status,
-                "model": model,
-                "batch": outcome.batch,
-                "defaulted": {"model": model_defaulted, "batch": batch_defaulted},
-                # Which of the two stop conditions fired. "aborted" alone
-                # cannot distinguish failures from overspending.
-                "abort_reason": outcome.abort_reason,
-                "total": outcome.total,
-                "ok": outcome.ok,
-                "failed": outcome.failed,
-                # Already inside "failed". Items failed by an error that no
-                # handler expected, which is a fault to report.
-                "internal_errors": outcome.internal_errors,
-                "skipped": outcome.skipped,
-                "attempted": outcome.attempted,
-                "outdir": str(outcome.outdir),
-                "index": str(outcome.outdir / "results.jsonl"),
-                "tokens": {
-                    "input": outcome.input_tokens,
-                    "output": outcome.output_tokens,
-                },
-                "elapsed": outcome.elapsed,
-                # Both ceilings reported separately, and "tripped"
-                # names which one stopped the run. A single flattened
-                # object could not say whether to raise the flag or the
-                # config, which are different remedies.
-                "budget": {
-                    "per_run": (
-                        None
-                        if not args.token_budget
-                        else {
-                            # Job-wide when resumed, matching what the
-                            # ceiling is compared against.
-                            "ceiling": args.token_budget,
-                            "spent": outcome.spent,
-                        }
-                    ),
-                    "rolling": (
-                        None
-                        if rolling.ceiling is None
-                        else {
-                            "ceiling": rolling.ceiling,
-                            # The accumulator, not rolling.spent +
-                            # outcome.spent: on a resumed job the latter
-                            # already carries prior invocations and so
-                            # counts them twice.
-                            "spent": (
-                                outcome.rolling_spent
-                                if outcome.rolling_spent is not None
-                                else rolling.spent + outcome.charged
-                            ),
-                        }
-                    ),
-                    "tripped": outcome.tripped_budget,
-                },
-                # Bounded like the receipt; the index keeps every message
-                # whole. Not made printable: JSON encoding escapes control
-                # characters already.
-                "failures": [
-                    {"id": item_id, "error": cut_redacted(message, FAILURE_MESSAGE_CHARS)}
-                    for item_id, message in outcome.failures[:FAILURE_LIMIT]
-                ],
-                "failures_truncated": len(outcome.failures) > FAILURE_LIMIT,
-                # Why the run stopped when the index could not be written.
-                "error": outcome.index_error,
-            }
-            _emit(json.dumps(obj, indent=2))
-        else:
-            _emit(
-                map_receipt(
-                    outcome,
-                    model=model,
-                    token_budget=args.token_budget,
-                    rolling_ceiling=rolling.ceiling,
-                    rolling_spent=rolling.spent,
-                    model_defaulted=model_defaulted,
-                    batch_defaulted=batch_defaulted,
-                )
-            )
-        return outcome.exit_code
+            return await _ask(client, settings, args, config, final)
+        return await _map(client, settings, args, config, rolling, final)
 
 
 def entry() -> NoReturn:

@@ -18,7 +18,7 @@ import httpx
 from .auth import redact
 from .batching import PER_ITEM_MARKER, build_batch_prompt, split_batch_response, split_template
 from .budget import TokenBudget, charge_from_rows, metered
-from .client import call
+from .client import CallSettings, call
 from .dialect import (
     Dialect,
     build_request,
@@ -362,16 +362,6 @@ class MapOutcome:
         if self.failed:
             return 2
         return 0
-
-
-@dataclass(frozen=True)
-class CallSettings:
-    """How every request of a run reaches the gateway."""
-
-    base_url: str
-    key: str
-    timeout: float
-    retries: int
 
 
 @dataclass(frozen=True)
@@ -878,6 +868,19 @@ def _outcome(plan: _Plan, run: _RunState, prior_spend: int, elapsed: float) -> M
     )
 
 
+async def run_job(client: httpx.AsyncClient, settings: CallSettings, job: MapJob) -> MapOutcome:
+    """Set up a map run, send its items and report the outcome."""
+    plan = _prepare(job)
+    # Read once and reused: it seeds the per-run budget and feeds the
+    # reported total, so a resumed run without a ceiling still tells the
+    # truth about the job.
+    prior_spend = spent_tokens(job.outdir) if job.resume else 0
+    run = _start(job, settings.key, prior_spend)
+    started = time.monotonic()
+    await _schedule(client, settings, plan, run)
+    return _outcome(plan, run, prior_spend, time.monotonic() - started)
+
+
 async def run_map(
     *,
     client: httpx.AsyncClient,
@@ -901,7 +904,7 @@ async def run_map(
     rolling_budget: TokenBudget | None = None,
     run_id: str | None = None,
 ) -> MapOutcome:
-    """Set up a map run, send its items and report the outcome."""
+    """run_job with its settings and job given as keyword arguments."""
     settings = CallSettings(base_url=base_url, key=key, timeout=timeout, retries=retries)
     job = MapJob(
         model=model,
@@ -920,12 +923,4 @@ async def run_map(
         rolling_budget=rolling_budget,
         run_id=run_id,
     )
-    plan = _prepare(job)
-    # Read once and reused: it seeds the per-run budget and feeds the
-    # reported total, so a resumed run without a ceiling still tells the
-    # truth about the job.
-    prior_spend = spent_tokens(outdir) if resume else 0
-    run = _start(job, key, prior_spend)
-    started = time.monotonic()
-    await _schedule(client, settings, plan, run)
-    return _outcome(plan, run, prior_spend, time.monotonic() - started)
+    return await run_job(client, settings, job)

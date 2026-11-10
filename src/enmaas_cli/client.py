@@ -7,6 +7,7 @@ import math
 import random
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -33,6 +34,16 @@ ERROR_BODY_CHARS = 500
 CONTENT_TYPE_CHARS = 80
 
 SleepFn = Callable[[float], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class CallSettings:
+    """How every request of a command reaches the gateway."""
+
+    base_url: str
+    key: str
+    timeout: float
+    retries: int
 
 
 def is_retryable(status: int, elapsed: float = 0.0) -> bool:
