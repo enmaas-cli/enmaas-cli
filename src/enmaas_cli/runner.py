@@ -176,20 +176,45 @@ def _charge_row(charge: int, *, items: int, run: str | None = None) -> str:
     return json.dumps(row)
 
 
+def _require_own_regular(fd: int, index: Path) -> None:
+    """Refuse an open index that is not a regular file owned by this user.
+
+    Checked on the descriptor, never by path. A FIFO would let another
+    process hold the write, and a file someone else owns could be read or
+    changed by them. A hard link is accepted: a backup tool can make one.
+    """
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"{index} is not a regular file; enmaas writes its index only to one")
+    if info.st_uid != os.getuid():
+        raise OSError(f"{index} is owned by another user; enmaas writes its index only to yours")
+
+
 def _append_index(index: Path, text: str) -> None:
     """Append rows to the index, never through a symbolic link.
 
     Mode 0o666 so the umask decides, as it did for a plain open. O_NOFOLLOW
     makes a link swapped in during the run fail the write instead of sending
-    the rows to the link's target.
+    the rows to the link's target. O_NONBLOCK keeps a FIFO swapped in from
+    blocking the open, so the check after it can refuse it.
     """
-    fd = os.open(index, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o666)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(index, flags, 0o666)
+    try:
+        _require_own_regular(fd, index)
+    except BaseException:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
 
 
 def _check_index(index: Path) -> None:
-    """Refuse an index that is a link or not a regular file, before anything is sent."""
+    """Refuse an index that cannot be written safely, before anything is sent.
+
+    A link, a path that is not a regular file and a file another user owns
+    are all refused.
+    """
     try:
         info = os.lstat(index)
     except FileNotFoundError:
@@ -198,6 +223,11 @@ def _check_index(index: Path) -> None:
         raise OSError(
             f"{index} is not a regular file; enmaas does not write its index through a link"
         )
+    fd = os.open(index, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        _require_own_regular(fd, index)
+    finally:
+        os.close(fd)
 
 
 def spent_tokens(outdir: Path) -> int:
@@ -266,7 +296,8 @@ class MapOutcome:
     total: int
     # Not a bool. A second way to abort arrived with token budgets, and a
     # receipt saying only "ABORTED" sends people hunting for failures that
-    # never happened. One of None, "breaker", "budget", "interrupted".
+    # never happened. One of None, "breaker", "budget", "interrupted",
+    # "index".
     abort_reason: str | None
     input_tokens: int
     output_tokens: int
@@ -304,9 +335,14 @@ class MapOutcome:
     # Items failed by an error no handler expected. Already counted in
     # `failed`; kept apart so the user can see it is a fault to report.
     internal_errors: int = 0
+    # Why the index could not be written, when abort_reason is "index".
+    index_error: str | None = None
 
     @property
     def exit_code(self) -> int:
+        # The run could not record its work, which is an error, not a stop.
+        if self.abort_reason == "index":
+            return 1
         if self.abort_reason is not None:
             return 3
         if self.failed:
@@ -415,6 +451,25 @@ async def run_map(
         "internal": 0,
     }
     failures: list[tuple[str, str]] = []
+    index_error: str | None = None
+
+    def index_failed(exc: OSError, charge: int) -> None:
+        """End the run in order after the index could not be written.
+
+        The request was billed, so its charge counts toward the ledger event
+        and both budgets. Tasks still waiting for the semaphore see the
+        abort reason and return without sending, because a request that
+        cannot be recorded must not be sent.
+        """
+        nonlocal abort_reason, tripped_budget, index_error
+        abort_reason = "index"
+        tripped_budget = None
+        if index_error is None:
+            index_error = redact(str(exc), key)
+        counts["charge"] += charge
+        for limit in (budget, rolling_budget):
+            if limit is not None:
+                limit.record(charge)
 
     async def process(item: dict[str, Any]) -> None:
         nonlocal abort_reason, tripped_budget
@@ -517,12 +572,9 @@ async def run_map(
                     index,
                     _charge_row(charge, items=1, run=run_id) + "\n" + json.dumps(row) + "\n",
                 )
-            except OSError:
-                # The run ends with this error. Requests that cannot be
-                # recorded must not be sent, so tasks still waiting for the
-                # semaphore return without sending.
-                abort_reason = "index"
-                raise
+            except OSError as exc:
+                index_failed(exc, charge)
+                return
             counts["charge"] += charge
             breaker.record(ok=ok)
             if breaker.should_abort() and abort_reason is None:
@@ -707,10 +759,9 @@ async def run_map(
                     + "\n"
                     + "".join(json.dumps(row) + "\n" for row in rows),
                 )
-            except OSError:
-                # The same rule as the single-item path above.
-                abort_reason = "index"
-                raise
+            except OSError as exc:
+                index_failed(exc, charge)
+                return
             counts["charge"] += charge
             for row in rows:
                 breaker.record(ok=row["status"] == "ok")
@@ -772,4 +823,5 @@ async def run_map(
         failures=failures,
         batch=batch,
         internal_errors=counts["internal"],
+        index_error=index_error if abort_reason == "index" else None,
     )

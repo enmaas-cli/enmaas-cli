@@ -138,6 +138,8 @@ def map_receipt(
         header = "enmaas map ABORTED (too many failures)"
     elif outcome.abort_reason == "interrupted":
         header = "enmaas map interrupted"
+    elif outcome.abort_reason == "index":
+        header = "enmaas map stopped: the index could not be written"
     else:
         header = "enmaas map ok"
 
@@ -148,8 +150,10 @@ def map_receipt(
         batch_mark = f"  (default: template {has} ===PER ITEM===)"
     else:
         batch_mark = ""
-    lines = [
-        header,
+    lines = [header]
+    if outcome.abort_reason == "index":
+        lines.append(f"  error     {printable(outcome.index_error or 'unknown')}")
+    lines += [
         f"  model     {model}{model_mark}",
         f"  batch     {outcome.batch}{batch_mark}",
         f"  items     {outcome.total} total: {outcome.attempted} attempted, "

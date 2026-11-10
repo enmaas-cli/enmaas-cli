@@ -292,28 +292,31 @@ async def test_an_index_that_cannot_be_written_stops_new_requests(
 
     monkeypatch.setattr(runner, "_append_index", guarded_append)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-        with pytest.raises(OSError, match="index is read-only"):
-            await run_map(
-                client=client,
-                base_url="https://g.test",
-                key="sk-oai-x",
-                model="rits/zai-org/glm-5-3",
-                items_path=items,
-                template_path=template,
-                outdir=tmp_path / "out",
-                concurrency=1,
-                retries=0,
-                timeout=5,
-                thinking=False,
-                max_tokens=None,
-                dialect="openai",
-                resume=False,
-                batch=2 if mode == BATCHED else 1,
-            )
+        outcome = await run_map(
+            client=client,
+            base_url="https://g.test",
+            key="sk-oai-x",
+            model="rits/zai-org/glm-5-3",
+            items_path=items,
+            template_path=template,
+            outdir=tmp_path / "out",
+            concurrency=1,
+            retries=0,
+            timeout=5,
+            thinking=False,
+            max_tokens=None,
+            dialect="openai",
+            resume=False,
+            batch=2 if mode == BATCHED else 1,
+        )
         # Give the tasks still waiting for the semaphore time to run.
         for _ in range(20):
             await asyncio.sleep(0.01)
     assert calls == 3
+    assert outcome.abort_reason == "index"
+    assert outcome.index_error == "index is read-only"
+    # The third request was billed although its rows were not written.
+    assert outcome.charged == 3 * 7
 
 
 def test_receipt_shows_the_internal_count(tmp_path: Path) -> None:

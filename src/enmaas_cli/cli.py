@@ -1221,6 +1221,7 @@ async def _dispatch(
                 "breaker": "CircuitBreakerError",
                 "budget": "TokenBudgetExceeded",
                 "interrupted": "Interrupted",
+                "index": "IndexWriteError",
             }.get(outcome.abort_reason or "", "PartialFailure")
         recorded = append_event(
             state_root() / "usage.jsonl",
@@ -1322,6 +1323,8 @@ async def _dispatch(
                 "failures": [
                     {"id": item_id, "error": message} for item_id, message in outcome.failures
                 ],
+                # Why the run stopped when the index could not be written.
+                "error": outcome.index_error,
             }
             _emit(json.dumps(obj, indent=2))
         else:
