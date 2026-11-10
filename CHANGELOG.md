@@ -18,7 +18,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A gateway error message that holds a newline or a terminal escape sequence
   can no longer add a line to the `ask` or `map` receipt or act on the
   terminal. The receipt prints it on one line with those characters replaced.
-  The `--json` output and `results.jsonl` keep the message as sent.
+  `ask --json` and `results.jsonl` keep the message as sent, and the
+  `map --json` failure list keeps it as sent up to 200 characters.
 - A reply that reports a token count above 10**12 no longer ends the run. Such
   a count reads as not reported, the same as a negative one.
 - A reply nested too deeply to decode now fails as `BadReplyError`, and a
@@ -91,12 +92,39 @@ and versions follow [Semantic Versioning](https://semver.org/).
   were, with the default put back for a handler not set from Python.
 - A reader that closes stdout before the receipt is printed no longer makes a
   finished `ask` or `map` exit 120 with a `BrokenPipeError`.
+- A gateway on `localhost` or a loopback address is now always reached
+  directly. The proxy variables `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`,
+  in either case, used to send those requests and the key to a proxy. TLS
+  settings such as `SSL_CERT_FILE` still apply, and any other gateway still
+  uses the proxy variables.
+- With `--json`, `ask` and `map` now print exactly one JSON object on stdout
+  on every exit, and `models` prints the error object when it fails. A
+  missing items file, a bad template, attachment,
+  prompt or schema, an unknown model dialect, a refused index and a malformed
+  `[budget]` table used to print text on stderr only. The error object is
+  `{"status": "error", "error": ...}`; its text has the key removed, is printed
+  on one line, and is cut to 200 characters.
+- An error inside enmaas that no handler expected no longer prints a
+  traceback. It is reported as `internal error (<class> at <file>:<line>)`,
+  never with its text. `ENMAAS_DEBUG=1` adds the traceback on stderr, with the
+  key removed.
+- A model catalog that is not a JSON object with a `data` list of objects with
+  a string `id`, such as an HTML page or a JSON list, now makes `models` exit 1
+  with one `error:` line naming the problem in place of a traceback. The error
+  never quotes the body.
 
 ### Changed
 
 - `map --json` has a new `internal_errors` field, and the `map` receipt shows an
   `internal` line when it is above zero. Those items are already counted in
   `failed`. Please report them.
+- The `map` receipt and `map --json` list at most the first 20 failures, each
+  message cut to 200 characters without splitting the redaction placeholder.
+  The receipt then says how many more the index holds, and `map --json` has a
+  new `failures_truncated` field. `results.jsonl` keeps every message whole,
+  and the skill gives commands that count and list failures from it.
+- The reference documents every field of the `ask`, `map`, refusal and error
+  JSON objects and of the `models` list.
 - The usage ledger can record `BadReplyError` as the `error_kind` of an `ask`.
 - The rolling budget check now adds what every `map` run with an open-run
   record still present has charged so far, whether it is still running or

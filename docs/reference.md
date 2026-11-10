@@ -11,7 +11,7 @@ Every command, flag and configuration key. For installation read
 enmaas models
 ```
 
-Lists the merged catalog from both the anthropic and openai dialect endpoints. `--dialect {anthropic,openai,both}` narrows it; `both` is the default. `--json` prints it as JSON. `--timeout SECONDS` bounds each catalog request. A gateway that serves only one dialect rejects the other probe, so pass `--dialect openai` or `--dialect anthropic` there.
+Lists the merged catalog from both the anthropic and openai dialect endpoints. `--dialect {anthropic,openai,both}` narrows it; `both` is the default. `--json` prints it as a JSON list, described in [JSON output](#json-output). `--timeout SECONDS` bounds each catalog request. A gateway that serves only one dialect rejects the other probe, so pass `--dialect openai` or `--dialect anthropic` there.
 
 ### Ask a single question
 
@@ -104,7 +104,7 @@ These go before the subcommand: `enmaas --key-file PATH models`.
 - `-m, --model MODEL`: The model to use. Optional; without it the configured `default_model` applies and the receipt says `(default)`.
 - `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
 - `--schema-name NAME`: The name sent with the schema. Defaults to `StructuredOutput`. `ask` and unbatched `map` send the schema and its name with the request; batched `map` keeps the schema local and validates each answer after the reply is split.
-- `--json`: Emit machine-readable JSON instead of plain-text receipts. For `ask`, prints an object with `status`, `model`, `dialect`, `path`, `tokens`, `elapsed`, and `error`. For `map`, prints an object with `status`, `model`, `batch`, `defaulted`, `abort_reason`, `total`, `ok`, `failed`, `internal_errors`, `skipped`, `attempted`, `outdir`, `index`, `tokens`, `elapsed`, `budget`, `failures`, and `error`. `internal_errors` counts the failed items that hit an error inside enmaas; they are already in `failed`, and are worth reporting. `abort_reason` is `breaker`, `budget`, `interrupted` or `index` when the run stopped early, and `error` holds the write error when it is `index`; both are null otherwise.
+- `--json`: Print exactly one JSON object on stdout in place of the receipt, on every exit: a result, a refusal or an error. See [JSON output](#json-output).
 - `--dialect {anthropic,openai}`: Override dialect selection. By default, the dialect is inferred from the model name.
 - `--max-tokens N`: Maximum output tokens. Must be positive.
 - `--timeout SECONDS`: Request timeout. Must be positive. Defaults to 280 seconds.
@@ -199,6 +199,123 @@ See [Runs that stop early](#runs-that-stop-early).
 
 On exit code 3 from `map`, re-run with `--resume` to skip completed items. If the stop was a per-run `--token-budget`, raise it on the resumed command. If it was the rolling `[budget]` in the config, which can also stop `ask`, raise the ceiling in the config or wait for the window to move; `--resume` alone will stop again immediately.
 
+## JSON output
+
+With `--json`, `ask` and `map` print exactly one JSON object on stdout, whatever
+happens: the command's result, a budget refusal, or an error. Warnings still go
+to stderr. No traceback is printed unless `ENMAAS_DEBUG=1` is set (see
+[Errors](#errors)).
+
+### The `ask` object
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `ok`, or `error` when the request or the answer failed |
+| `model` | string | The model called |
+| `dialect` | string | `openai` or `anthropic` |
+| `path` | string or null | The answer file, or null when no answer was saved |
+| `tokens` | object | Token counts the reply reported |
+| `tokens.input` | integer or null | Input tokens, cached ones included; null when not reported |
+| `tokens.cached` | integer or null | Input tokens read from a cache |
+| `tokens.output` | integer or null | Output tokens, reasoning included |
+| `tokens.reasoning` | integer or null | Reasoning tokens, when the reply reports them |
+| `elapsed` | number | Seconds from the request to the result |
+| `replaced` | integer | Characters that could not be encoded and became U+FFFD |
+| `error` | string or null | Why it failed, with the key removed; null on success |
+
+### The `map` object
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `ok`, `partial` when some items failed, or `aborted` when the run stopped early |
+| `model` | string | The model called |
+| `batch` | integer | Items per request, after the default was applied |
+| `defaulted` | object | Which choices the CLI made for you |
+| `defaulted.model` | boolean | The model came from `default_model` in the config |
+| `defaulted.batch` | boolean | The batch size came from the template |
+| `abort_reason` | string or null | `breaker`, `budget`, `interrupted` or `index` when the run stopped early |
+| `total` | integer | Items in the items file |
+| `ok` | integer | Items answered |
+| `failed` | integer | Items that failed |
+| `internal_errors` | integer | Failed items that hit an error inside enmaas, already in `failed`; please report them |
+| `skipped` | integer | Items `--resume` skipped |
+| `attempted` | integer | Items sent in this run |
+| `outdir` | string | The output directory |
+| `index` | string | The path of `results.jsonl` |
+| `tokens` | object | Token counts from the replies of this run |
+| `tokens.input` | integer | Input tokens |
+| `tokens.output` | integer | Output tokens |
+| `elapsed` | number | Seconds the run took |
+| `budget` | object | Both token ceilings and which one stopped the run |
+| `budget.per_run` | object or null | The `--token-budget` ceiling; null without the flag |
+| `budget.per_run.ceiling` | integer | The `--token-budget` value |
+| `budget.per_run.spent` | integer | Metered tokens of the whole job, resumes included |
+| `budget.rolling` | object or null | The `[budget]` ceiling in the config; null without it |
+| `budget.rolling.ceiling` | integer | The `tokens` value |
+| `budget.rolling.spent` | integer | Metered tokens in the window, this run included |
+| `budget.tripped` | string or null | `per_run` or `rolling` when a ceiling stopped the run |
+| `failures` | list | The first 20 failed items |
+| `failures[].id` | string | The item id |
+| `failures[].error` | string | The first 200 characters of the error, with the key removed |
+| `failures_truncated` | boolean | True when more than 20 items failed |
+| `error` | string or null | Why the index could not be written, when `abort_reason` is `index` |
+
+`results.jsonl` keeps every failure message whole. The skill gives commands
+that count the failures and list them from it.
+
+### The refusal object
+
+`ask` and `map` print this when a rolling `[budget]` refuses the command before
+any request, and exit 3.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `refused` |
+| `abort_reason` | string | `budget` |
+| `budget` | object | The ceiling that refused the command |
+| `budget.per_run` | null | Always null: no run started |
+| `budget.rolling` | object | The `[budget]` ceiling in the config |
+| `budget.rolling.ceiling` | integer | The `tokens` value |
+| `budget.rolling.spent` | integer | Metered tokens in the window, open runs included |
+| `budget.tripped` | string | `rolling` |
+| `error` | string | Why the command refused |
+
+### The error object
+
+`ask`, `map` and `models` print this when the command ends on an error before it
+has a result, and exit 1: a missing gateway URL or key, a malformed `[budget]`
+table, a bad items file, template, attachment, prompt or schema, a model whose
+dialect is unknown, an index that is refused, a failed or malformed model
+catalog, an interrupt before the result, or an error inside enmaas.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `error` |
+| `error` | string | What went wrong |
+
+### The `models` list
+
+`models --json` prints a list, one entry per model, sorted by id.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `[].id` | string | The model id |
+| `[].dialects` | list of strings | The catalogs that list it: `anthropic`, `openai` or both |
+
+### Errors
+
+Without `--json`, an error is one line on stderr starting `error: `. With
+`--json` it is the error object above. The text has the key removed and is
+printed on one line; an error that escaped the command is also cut to 200
+characters. A catalog that is not a JSON object with a `data` list of objects
+with a string `id` is reported by what is wrong, never by its content.
+
+An error inside enmaas that no handler expected is reported as
+`internal error (<class> at <file>:<line>)`. It never shows the error's text,
+which could quote a reply or a prompt. Set `ENMAAS_DEBUG=1` to also print the
+traceback to stderr, with the key removed. The traceback can hold the error's
+text, so share it with care.
+
 ## Circuit breaker
 
 The circuit breaker aborts a bulk map run on:
@@ -263,6 +380,12 @@ timeout = 280
 ```
 
 `base_url` has no default: it must be set here or in `ENMAAS_BASE_URL`, which wins when both are set. It must use `https://`; `http://` is accepted only for `localhost`, `127.0.0.0/8` and `::1`. `models`, `ask` and `map` exit 1 with a message naming the fix when neither is set; the local commands do not need it. `key_file` may name the key file when it is somewhere other than `~/.secrets/enmaas`. The other fields shown are the defaults except `dialect_overrides`.
+
+A gateway on `localhost` or a loopback address is always reached directly. enmaas
+ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms for it,
+because a proxy would receive the key, and plain `http://` is allowed only for
+such a host. TLS settings such as `SSL_CERT_FILE` and `SSL_CERT_DIR` still apply.
+Any other gateway uses the proxy variables as usual.
 
 The `dialect_overrides` table maps model names to dialect strings (`"anthropic"` or `"openai"`). An explicit `--dialect` flag on the command line takes precedence. Invalid dialect values are ignored with a warning.
 
@@ -476,7 +599,8 @@ ends until the process exits, so a late signal cannot end it by its default
 action or print a traceback.
 
 **Index write failures.** `map` refuses to start when `results.jsonl` is a link,
-is not a regular file, or belongs to another user. When a write to it fails
+is not a regular file, or belongs to another user. It exits 1 with an error, or
+with `--json` the error object. When a write to it fails
 during the run, for example because a FIFO was put in its place, the run sends
 no further requests and ends in order. It exits 1, writes its ledger event with
 `error_kind` `IndexWriteError` and every charge that was billed, removes its
