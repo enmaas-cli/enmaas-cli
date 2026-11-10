@@ -567,6 +567,9 @@ def _warn_if_untracked(recorded: bool, config: Config) -> None:
         )
 
 
+MAX_PROBLEMS_SHOWN = 5
+
+
 @dataclass(frozen=True)
 class RollingCheck:
     """Whether a standing budget permits this invocation, and where it stands."""
@@ -623,13 +626,18 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
     events, problems = load_events_strict(ledger)
     if problems:
         # An unreadable ledger is indistinguishable from one showing zero
-        # spend. Without a budget configured this would only warn.
+        # spend. Without a budget configured this would only warn. A few
+        # problems are enough to find the file, and the count bounds the
+        # message.
+        shown = "; ".join(problems[:MAX_PROBLEMS_SHOWN])
+        if len(problems) > MAX_PROBLEMS_SHOWN:
+            shown += f"; and {len(problems) - MAX_PROBLEMS_SHOWN} more"
         return RollingCheck(
             0,
             config.budget_tokens,
             message=(
-                "a token budget is configured but the usage ledger could not "
-                f"be read: {'; '.join(problems[:3])}"
+                f"a token budget is configured but the usage ledger {printable(str(ledger))} "
+                f"could not be read: {shown}"
             ),
         )
 

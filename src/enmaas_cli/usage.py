@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -137,6 +137,23 @@ def _recorded(value: object) -> int | None:
     return max(0, min(int(value), MAX_RECORDED))
 
 
+class RowError(ValueError):
+    """One ledger row failed a check.
+
+    The text is one of a fixed set chosen here, never a value or a key
+    taken from the row, so a forged row cannot put its content into a
+    message.
+    """
+
+
+_FIELDS = frozenset(field.name for field in fields(UsageEvent))
+_REQUIRED = frozenset(
+    field.name
+    for field in fields(UsageEvent)
+    if field.default is MISSING and field.default_factory is MISSING
+)
+
+
 def _event_from_row(data: object) -> UsageEvent:
     """Parse one ledger row, rejecting what must not be trusted.
 
@@ -145,28 +162,37 @@ def _event_from_row(data: object) -> UsageEvent:
     string count breaks the arithmetic downstream, and a timezone-naive
     timestamp raises when compared against an aware window cutoff. A
     budget that read any of those would be wrong rather than merely
-    incomplete.
+    incomplete. Every failure raises RowError.
     """
     if not isinstance(data, dict):
-        raise TypeError(f"expected a JSON object, got {type(data).__name__}")
+        raise RowError("not an object")
+    keys = set(data)
+    if not keys <= _FIELDS:
+        raise RowError("unknown field")
+    if not keys >= _REQUIRED:
+        raise RowError("missing field")
 
-    row = dict(data)
-    timestamp = datetime.fromisoformat(row.pop("timestamp"))
+    raw = data["timestamp"]
+    if not isinstance(raw, str):
+        raise RowError("bad timestamp")
+    try:
+        timestamp = datetime.fromisoformat(raw)
+    except ValueError:
+        raise RowError("bad timestamp") from None
     if timestamp.tzinfo is None:
-        raise ValueError("timestamp is timezone-naive")
+        raise RowError("bad timestamp")
 
     for name in _COUNT_FIELDS:
-        count = row.get(name)
+        count = data.get(name)
         if count is None:
             continue
-        # bool first: it subclasses int, so True would pass as 1.
-        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-            raise ValueError(f"{name} must be a nonnegative integer, got {count!r}")
-        # Bounded so that sums stay printable. The value is not repeated in
-        # the message, because a huge one would make the message huge.
-        if count > MAX_RECORDED:
-            raise ValueError(f"{name} is above {MAX_RECORDED}")
+        # bool first: it subclasses int, so True would pass as 1. Bounded so
+        # that sums stay printable.
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= MAX_RECORDED:
+            raise RowError("bad count")
 
+    row = dict(data)
+    row.pop("timestamp")
     return UsageEvent(timestamp=timestamp, **row)
 
 
@@ -211,9 +237,15 @@ def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
         # Bytes then decode, so invalid UTF-8 is reportable rather than
         # escaping as an exception that is not an OSError.
         text = ledger.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        return [], [f"{ledger} could not be read: {exc}"]
+    except UnicodeDecodeError:
+        return [], ["not UTF-8 text"]
+    except OSError as exc:
+        # The class name only. The message of a decode or read error can
+        # quote bytes of the file.
+        return [], [f"cannot be opened ({type(exc).__name__})"]
 
+    # Each problem is "line N: <reason>", with a reason from a fixed set, so
+    # no value or key from a row reaches the message.
     events: list[UsageEvent] = []
     problems: list[str] = []
     for number, line in enumerate(text.splitlines(), 1):
@@ -221,9 +253,14 @@ def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
         if not stripped:
             continue
         try:
-            events.append(_event_from_row(json.loads(stripped)))
-        except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as exc:
-            problems.append(f"{ledger} line {number}: {type(exc).__name__}: {exc}")
+            data = json.loads(stripped)
+        except ValueError:
+            problems.append(f"line {number}: not JSON")
+            continue
+        try:
+            events.append(_event_from_row(data))
+        except RowError as exc:
+            problems.append(f"line {number}: {exc}")
     return events, problems
 
 

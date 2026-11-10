@@ -570,7 +570,7 @@ def test_strict_reader_rejects_negative_counts(tmp_path: Path) -> None:
 
     events, problems = load_events_strict(ledger)
     assert events == []
-    assert any("nonnegative" in p for p in problems)
+    assert problems == ["line 1: bad count"]
 
 
 def test_strict_reader_rejects_string_counts(tmp_path: Path) -> None:
@@ -591,7 +591,7 @@ def test_strict_reader_rejects_naive_timestamps(tmp_path: Path) -> None:
 
     events, problems = load_events_strict(ledger)
     assert events == []
-    assert any("naive" in p for p in problems)
+    assert problems == ["line 1: bad timestamp"]
 
 
 def test_strict_reader_reports_invalid_utf8(tmp_path: Path) -> None:
@@ -605,7 +605,7 @@ def test_strict_reader_reports_invalid_utf8(tmp_path: Path) -> None:
     events, problems = load_events_strict(ledger)
     assert events == []
     assert len(problems) == 1
-    assert "could not be read" in problems[0]
+    assert problems == ["not UTF-8 text"]
 
 
 def test_strict_reader_agrees_with_the_forgiving_one_when_healthy(
@@ -802,3 +802,35 @@ def test_text_from_a_ledger_row_prints_on_one_line(tmp_path: Path) -> None:
     assert len(forged) == 2
     assert all("calls" in line or "unpriced" in line for line in forged)
     assert not any(line.startswith("x") for line in text.splitlines())
+
+
+def test_the_budget_refusal_never_prints_ledger_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://gw.example.test")
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+    ledger = tmp_path / "state" / "enmaas" / "runs" / "usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    forged_key = "\x1b]0;title\x07\nforged line"
+    rows = [
+        json.dumps(_ok_row(**{forged_key: 1})),
+        json.dumps(_ok_row(timestamp="9" * 200_000)),
+        *["not json \x1b[2J"] * 6,
+    ]
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    config = tmp_path / "budget.toml"
+    config.write_text("[budget]\nwindow_days = 7\ntokens = 100\n", encoding="utf-8")
+    argv = ["--config", str(config), "ask", "-m", "m", "--dialect", "openai", "-p", "hi"]
+    assert main(argv) == 3
+    err = capsys.readouterr().err
+    assert len(err) < 1000
+    assert all(ch.isprintable() for line in err.splitlines() for ch in line)
+    assert "forged" not in err
+    assert "9" * 20 not in err
+    assert "line 1: unknown field; line 2: bad timestamp; line 3: not JSON" in err
+    assert err.rstrip("\n").endswith("; and 3 more")
