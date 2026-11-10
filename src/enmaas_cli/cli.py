@@ -9,6 +9,7 @@ import enum
 import importlib.metadata
 import ipaddress
 import json
+import math
 import os
 import signal
 import sys
@@ -56,7 +57,7 @@ from .usage import (
     append_event,
     format_summary,
     format_summary_json,
-    load_events,
+    load_events_counted,
     load_events_strict,
     summarize_usage,
 )
@@ -118,6 +119,9 @@ def nonnegative_float(value: str) -> float:
         number = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value} is not a number") from None
+    # The ledger reader refuses nan and inf, so they are never written.
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"{value} is not a finite number")
     if number < 0:
         raise argparse.ArgumentTypeError(f"{value} is negative")
     return number
@@ -1022,7 +1026,13 @@ async def _dispatch(
     # Handle usage command first (no timeout argument)
     if args.command == "usage":
         ledger = state_root() / "usage.jsonl"
-        events = load_events(ledger)
+        events, skipped = load_events_counted(ledger)
+        if skipped:
+            print(
+                f"warning: {skipped} rows of {printable(str(ledger))} could not be read "
+                "and were skipped",
+                file=sys.stderr,
+            )
 
         if args.since is not None:
             cutoff = datetime.now(UTC) - timedelta(days=args.since)
@@ -1031,7 +1041,7 @@ async def _dispatch(
         summary = summarize_usage(events)
 
         if args.json:
-            print(format_summary_json(summary, config.prices))
+            print(format_summary_json(summary, config.prices, skipped_rows=skipped))
         else:
             print(format_summary(summary, since_days=args.since, prices=config.prices))
 

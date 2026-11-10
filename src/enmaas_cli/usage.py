@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime
@@ -75,6 +76,13 @@ _COUNT_FIELDS = (
 )
 
 
+# Text fields every event carries. Printed by `enmaas usage` and used as keys.
+_TEXT_FIELDS = ("command", "model", "dialect", "status")
+# The longest text field a row may hold. A writer cuts to this length, and a
+# reader refuses a longer one, so a row stays cheap to read and print.
+MAX_TEXT_CHARS = 1024
+
+
 def _is_disabled() -> bool:
     """Check if usage logging is disabled via environment variable."""
     return bool(os.environ.get("ENMAAS_NO_USAGE_LOG", ""))
@@ -108,6 +116,16 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
     # refuse this tool's own ledger as corrupt.
     for name in _COUNT_FIELDS:
         data[name] = _recorded(data.get(name))
+    # The same rules the reader checks, so this tool's own rows always read
+    # back: text cut to MAX_TEXT_CHARS, and an elapsed time that is a finite
+    # number of zero or more.
+    for name in (*_TEXT_FIELDS, "error_kind"):
+        value = data.get(name)
+        if isinstance(value, str):
+            data[name] = value[:MAX_TEXT_CHARS]
+    elapsed = data.get("elapsed")
+    if not _is_elapsed(elapsed):
+        data["elapsed"] = 0.0
 
     # try/except around the whole `with`, not contextlib.suppress inside
     # it. A buffered write only reaches the disk on close, so the close
@@ -154,6 +172,17 @@ _REQUIRED = frozenset(
 )
 
 
+def _is_elapsed(value: object) -> bool:
+    # bool first: it subclasses int.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and len(value) <= MAX_TEXT_CHARS
+
+
 def _event_from_row(data: object) -> UsageEvent:
     """Parse one ledger row, rejecting what must not be trusted.
 
@@ -182,6 +211,15 @@ def _event_from_row(data: object) -> UsageEvent:
     if timestamp.tzinfo is None:
         raise RowError("bad timestamp")
 
+    # Text is used as a dictionary key and printed, and elapsed is summed, so
+    # a value of any other type would raise in `enmaas usage`.
+    if not all(_is_text(data[name]) for name in _TEXT_FIELDS):
+        raise RowError("bad text field")
+    if data["error_kind"] is not None and not _is_text(data["error_kind"]):
+        raise RowError("bad text field")
+    if not _is_elapsed(data["elapsed"]):
+        raise RowError("bad elapsed")
+
     for name in _COUNT_FIELDS:
         count = data.get(name)
         if count is None:
@@ -197,28 +235,34 @@ def _event_from_row(data: object) -> UsageEvent:
 
 
 def load_events(ledger: Path) -> list[UsageEvent]:
-    """Load all valid events, tolerating corrupt final line or missing file.
+    """Load all valid events, tolerating corrupt rows or a missing file.
 
     Deliberately forgiving: `enmaas usage` should report what it can
     rather than crash. Enforcement uses load_events_strict instead.
     """
+    return load_events_counted(ledger)[0]
+
+
+def load_events_counted(ledger: Path) -> tuple[list[UsageEvent], int]:
+    """The valid events and how many rows were skipped. Never raises on ledger content."""
     if not ledger.exists():
-        return []
+        return [], 0
 
     events: list[UsageEvent] = []
+    skipped = 0
     with contextlib.suppress(OSError, UnicodeDecodeError):
         content = ledger.read_text(encoding="utf-8")
         for line in content.splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
-            # AttributeError is in the set because a row of JSON `null`
-            # reaches .pop on a None and used to crash this function.
-            with contextlib.suppress(
-                json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError
-            ):
+            try:
                 events.append(_event_from_row(json.loads(stripped)))
-    return events
+            except (ValueError, RecursionError):
+                # RowError and JSONDecodeError are ValueErrors. A deeply
+                # nested row raises RecursionError in the decoder.
+                skipped += 1
+    return events, skipped
 
 
 def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
@@ -256,6 +300,9 @@ def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
             data = json.loads(stripped)
         except ValueError:
             problems.append(f"line {number}: not JSON")
+            continue
+        except RecursionError:
+            problems.append(f"line {number}: nested too deeply")
             continue
         try:
             events.append(_event_from_row(data))
@@ -385,8 +432,17 @@ def format_summary(
     return "\n".join(lines)
 
 
-def format_summary_json(summary: UsageSummary, prices: dict[str, ModelPrice] | None = None) -> str:
-    """Format summary as JSON for machine consumption."""
+def format_summary_json(
+    summary: UsageSummary,
+    prices: dict[str, ModelPrice] | None = None,
+    *,
+    skipped_rows: int = 0,
+) -> str:
+    """Format summary as JSON for machine consumption.
+
+    `skipped_rows` counts the ledger rows that could not be read, so a
+    caller that reads only stdout still learns the totals are partial.
+    """
     spend, unpriced, reference = compute_costs(summary, prices)
     obj = {
         "total_calls": summary.total_calls,
@@ -401,6 +457,7 @@ def format_summary_json(summary: UsageSummary, prices: dict[str, ModelPrice] | N
         "unpriced_models": unpriced,
         "opus_equivalent_usd": reference,
         "opus_reference": OPUS_REFERENCE.label,
+        "skipped_rows": skipped_rows,
     }
     return json.dumps(obj, indent=2)
 

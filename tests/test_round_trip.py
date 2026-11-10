@@ -130,6 +130,18 @@ def _write_record(env: Env) -> None:
     assert main(argv) == 0
 
 
+def _write_record_with_long_text(env: Env) -> None:
+    long = "x" * 5000
+    big = str(MAX_TOKEN_COUNT)
+    argv = ["--config", str(env.config), "record", "--model", long, "--command", long]
+    argv += ["--input", big, "--output", big, "--error-kind", long, "--status", "error"]
+    assert main([*argv, "--elapsed", "1e300"]) == 0
+
+
+def _write_ask_with_a_long_model(env: Env) -> None:
+    assert main(["--config", str(env.config), *ASK, "-m", "m" * 5000]) == 0
+
+
 def _write_event_above_the_cap(env: Env) -> None:
     huge = _recorded_cap() * 10
     names = ("input_tokens", "cached_tokens", "output_tokens", "reasoning_tokens", "charge")
@@ -173,6 +185,8 @@ WRITERS: dict[str, Callable[[Env], None]] = {
     "ask event": _write_ask,
     "map event and charge rows": _write_map,
     "record": _write_record,
+    "record with long text": _write_record_with_long_text,
+    "ask with a long model": _write_ask_with_a_long_model,
     "event above the cap": _write_event_above_the_cap,
     "Killed event": _write_killed,
     "charge rows above the cap": _write_charge_rows,
