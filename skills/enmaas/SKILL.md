@@ -227,9 +227,13 @@ and sets `failures_truncated`. `results.jsonl` in the outdir keeps every
 message whole. Use these commands to read it instead of printing the file.
 Each item counts by its latest row, so an item a resume fixed is not counted.
 
+`-I` runs Python in isolated mode, so a `json.py` in the current directory
+cannot run. The listing makes each printed value printable and cuts it, so an
+id or an error cannot drive the terminal.
+
 Count the failed items:
 
-    python3 -c '
+    python3 -I -c '
     import json, sys
     last = {}
     for line in open(sys.argv[1], encoding="utf-8"):
@@ -242,10 +246,13 @@ Count the failed items:
     print(sum(1 for row in last.values() if row["status"] == "error"))
     ' /tmp/triage/results.jsonl
 
-List the first 20 failed ids, each with the first 200 characters of its error:
+List the first 20 failed ids, each cut to 100 characters, with the first 200
+characters of its error:
 
-    python3 -c '
+    python3 -I -c '
     import json, sys
+    def shown(value, limit):
+        return "".join(ch if ch.isprintable() else "?" for ch in str(value)[:limit])
     last = {}
     for line in open(sys.argv[1], encoding="utf-8"):
         try:
@@ -256,8 +263,7 @@ List the first 20 failed ids, each with the first 200 characters of its error:
             last[str(row["id"])] = row
     failed = [row for row in last.values() if row["status"] == "error"]
     for row in failed[:20]:
-        text = str(row.get("error"))[:200]
-        print(row["id"], "".join(ch if ch.isprintable() else " " for ch in text))
+        print(shown(row["id"], 100), shown(row.get("error"), 200))
     ' /tmp/triage/results.jsonl
 
 ## Reasoning consumes the output budget

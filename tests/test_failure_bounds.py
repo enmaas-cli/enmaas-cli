@@ -181,7 +181,7 @@ def test_a_key_at_the_cut_never_shows_in_part(
 
 
 def _skill_commands() -> list[str]:
-    """Every indented code block in the skill that starts with `python3 -c`."""
+    """Every indented code block in the skill that starts with `python3 -I -c`."""
     blocks: list[list[str]] = []
     current: list[str] | None = None
     for line in SKILL.read_text(encoding="utf-8").split("\n"):
@@ -195,10 +195,14 @@ def _skill_commands() -> list[str]:
         else:
             current = None
     commands = ["\n".join(block).strip("\n") for block in blocks]
-    return [command for command in commands if command.startswith("python3 -c")]
+    found = [command for command in commands if command.startswith("python3")]
+    # Isolated mode: otherwise the working directory is first on the import
+    # path, and a json.py in a repository would run.
+    assert all(command.startswith("python3 -I -c") for command in found), found
+    return found
 
 
-def _run_skill_command(command: str, index: Path) -> list[str]:
+def _run_skill_command(command: str, index: Path, cwd: Path | None = None) -> list[str]:
     assert command.count(SKILL_INDEX) == 1
     script = command.replace(SKILL_INDEX, str(index))
     # Run by a shell exactly as written, with this interpreter as python3.
@@ -209,6 +213,7 @@ def _run_skill_command(command: str, index: Path) -> list[str]:
         text=True,
         timeout=60,
         env={"PATH": f"{bindir}:/usr/bin:/bin"},
+        cwd=cwd,
         check=False,
     )
     assert done.returncode == 0, done.stderr
@@ -248,4 +253,47 @@ def test_the_skill_commands_use_each_items_latest_row(
     )
     count, listing = _skill_commands()
     assert _run_skill_command(count, index) == ["1"]
-    assert _run_skill_command(listing, index) == ["b line break"]
+    assert _run_skill_command(listing, index) == ["b line?break"]
+
+
+def test_the_skill_commands_do_not_import_code_from_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    marker = tmp_path / "marker"
+    (repo / "json.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\nfrom importlib import import_module\n",
+        encoding="utf-8",
+    )
+    index = repo / "results.jsonl"
+    index.write_text(json.dumps({"id": "a", "status": "error", "error": "x"}) + "\n")
+    for command in _skill_commands():
+        _run_skill_command(command, index, cwd=repo)
+        assert not marker.exists(), command
+
+
+def test_the_skill_listing_prints_a_hostile_row_bounded_and_inert(tmp_path: Path) -> None:
+    index = tmp_path / "results.jsonl"
+    long_id = "\x1b]0;TITLE\x07\x1b[2J" + "I" * 1_000_000
+    rows = [
+        {"id": long_id, "status": "error", "error": "\x1b]52;c;SGVsbG8=\x07" + "E" * 1000},
+        {"id": {"k": ["\x1b[31m"] * 5}, "status": "error", "error": "e"},
+    ]
+    index.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    _, listing = _skill_commands()
+    lines = _run_skill_command(listing, index)
+    output = "\n".join(lines)
+    assert len(output) < 10_000
+    assert "\x1b" not in output and "\x07" not in output
+    first_id, first_error = lines[0].split(" ", 1)
+    assert first_id == "?]0;TITLE??[2J" + "I" * 86
+    assert first_error == "?]52;c;SGVsbG8=?" + "E" * 184
+
+
+def test_the_skill_listing_shows_at_most_twenty_rows(tmp_path: Path) -> None:
+    index = tmp_path / "results.jsonl"
+    rows = [{"id": f"i{n}", "status": "error", "error": "e"} for n in range(25)]
+    index.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    _, listing = _skill_commands()
+    assert len(_run_skill_command(listing, index)) == 20
