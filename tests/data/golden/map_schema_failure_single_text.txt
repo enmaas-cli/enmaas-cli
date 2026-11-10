@@ -1,0 +1,32 @@
+=== exit 2
+=== stdout
+enmaas map ok
+  model     rits/zai-org/glm-5-3
+  batch     1  (default: template has no ===PER ITEM===)
+  items     2 total: 2 attempted, 1 ok, 1 failed, 0 skipped
+  outdir    out
+  index     out/results.jsonl
+  tokens    in 40   out 6
+  elapsed   <ELAPSED>
+  failure   b  response is not valid JSON: Expecting value: line 1 column 1 (char 0)
+
+=== stderr
+
+=== out
+.enmaas-output/  755
+.enmaas-output/11dd481a3da4aeae885606cdbde0921c891443bd4edb5adaac199a5d0262ad6a.json  600
+{"version": 1, "basename": "b.md", "state": "protected"}
+
+.enmaas-output/fecccc97532467adbf93017b357c8b17e0c75527df76a143de5cfecc2613f615.json  600
+{"version": 1, "basename": "a.md", "state": "protected"}
+
+a.md  600
+{"answer": "yes"}
+results.jsonl  600
+{"type": "request", "charge": 36, "items": 1, "run": "<RUN>"}
+{"id": "a", "status": "ok", "path": "out/a.md", "tokens": {"in": 40, "out": 6}, "error": null}
+{"type": "request", "charge": 57, "items": 1, "run": "<RUN>"}
+{"id": "b", "status": "error", "path": null, "tokens": null, "error": "response is not valid JSON: Expecting value: line 1 column 1 (char 0)"}
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "map", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 40, "cached_tokens": 10, "output_tokens": 6, "reasoning_tokens": 2, "elapsed": <ELAPSED>, "status": "ok", "schema_used": true, "error_kind": "PartialFailure", "items_total": 2, "items_ok": 1, "items_failed": 1, "charge": 93}

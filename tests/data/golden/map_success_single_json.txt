@@ -1,0 +1,56 @@
+=== exit 0
+=== stdout
+{
+  "status": "ok",
+  "model": "rits/zai-org/glm-5-3",
+  "batch": 1,
+  "defaulted": {
+    "model": false,
+    "batch": true
+  },
+  "abort_reason": null,
+  "total": 2,
+  "ok": 2,
+  "failed": 0,
+  "internal_errors": 0,
+  "skipped": 0,
+  "attempted": 2,
+  "outdir": "out",
+  "index": "out/results.jsonl",
+  "tokens": {
+    "input": 80,
+    "output": 12
+  },
+  "elapsed": <ELAPSED>,
+  "budget": {
+    "per_run": null,
+    "rolling": null,
+    "tripped": null
+  },
+  "failures": [],
+  "failures_truncated": false,
+  "error": null
+}
+
+=== stderr
+
+=== out
+.enmaas-output/  755
+.enmaas-output/11dd481a3da4aeae885606cdbde0921c891443bd4edb5adaac199a5d0262ad6a.json  600
+{"version": 1, "basename": "b.md", "state": "protected"}
+
+.enmaas-output/fecccc97532467adbf93017b357c8b17e0c75527df76a143de5cfecc2613f615.json  600
+{"version": 1, "basename": "a.md", "state": "protected"}
+
+a.md  600
+{"answer": "yes"}
+b.md  600
+{"answer": "yes"}
+results.jsonl  600
+{"type": "request", "charge": 36, "items": 1, "run": "<RUN>"}
+{"id": "a", "status": "ok", "path": "out/a.md", "tokens": {"in": 40, "out": 6}, "error": null}
+{"type": "request", "charge": 36, "items": 1, "run": "<RUN>"}
+{"id": "b", "status": "ok", "path": "out/b.md", "tokens": {"in": 40, "out": 6}, "error": null}
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "map", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 80, "cached_tokens": 20, "output_tokens": 12, "reasoning_tokens": 4, "elapsed": <ELAPSED>, "status": "ok", "schema_used": false, "error_kind": null, "items_total": 2, "items_ok": 2, "items_failed": 0, "charge": 72}
