@@ -1135,7 +1135,7 @@ def test_a_record_file_owned_by_another_user_is_not_loaded(
 
 @pytest.mark.parametrize(
     "model",
-    ["m\nforged", "m\x1b]0;title\x07", "m with space", "", "m" * 257, "m‮", "m\u0085"],
+    ["m\nforged", "m\x1b]0;title\x07", "", "m" * 1025, "m‮", "m\u0085", "m\x00"],
 )
 def test_a_record_with_an_unsafe_model_name_is_not_loaded(tmp_path: Path, model: str) -> None:
     state = tmp_path / "state"
@@ -1143,7 +1143,17 @@ def test_a_record_with_an_unsafe_model_name_is_not_loaded(tmp_path: Path, model:
     assert openruns._load(state) == []
 
 
-@pytest.mark.parametrize("model", ["rits/zai-org/glm-5-3", "claude-opus-4@2025.1:x+y", "m" * 256])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "rits/zai-org/glm-5-3",
+        "claude-opus-4@2025.1:x+y",
+        "claude-sonnet-4-5[1m]",
+        "my model",
+        "modèle",
+        "m" * 1024,
+    ],
+)
 def test_a_record_with_a_normal_model_name_is_loaded(tmp_path: Path, model: str) -> None:
     state = tmp_path / "state"
     _write_records(state, [_record(model=model)])
@@ -1679,3 +1689,11 @@ def test_two_settles_racing_on_one_dead_record_charge_it_once(
         first.join(10)
     assert [(row["error_kind"], row["charge"]) for row in _ledger_rows(ledger)] == [("Killed", 5)]
     assert _run_ids(state) == []
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-4-5[1m]", "my model"])
+def test_begin_records_a_printable_model_id(tmp_path: Path, model: str) -> None:
+    state = tmp_path / "state"
+    run = openruns.begin(state, outdir=tmp_path / "out", model=model, dialect="anthropic")
+    assert run is not None
+    assert [r.model for r in openruns._load(state)] == [model]

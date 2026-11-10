@@ -14,7 +14,8 @@ Every record is treated as untrusted. A forged one can add spend, because
 that only makes a budget stricter. It can never lower spend, print file
 content, block a later command for good, or cost more than a bounded amount
 of time and memory. The model and dialect of a record are written to the
-ledger, and both are checked against a strict shape first. No content of an
+ledger, so the model must be printable and short and the dialect must be a
+known one. No content of an
 index is written, printed or returned; only the sum of its charge rows.
 """
 
@@ -25,7 +26,6 @@ import errno
 import fcntl
 import json
 import os
-import re
 import secrets
 import stat
 import sys
@@ -38,7 +38,7 @@ from typing import Any, NamedTuple, TypeGuard
 
 from .budget import charge_from_rows
 from .tokens import MAX_RECORDED
-from .usage import UsageEvent, _is_disabled, append_event
+from .usage import MAX_TEXT_CHARS, UsageEvent, _is_disabled, append_event
 
 OPEN_RUNS_FILE = "open-runs.jsonl"
 LOCK_FILE = "open-runs.lock"
@@ -66,9 +66,10 @@ MAX_PATH_CHARS = 4096
 # the holder is stuck. Giving up keeps a stuck process from stopping others.
 LOCK_WAIT_SECONDS = 5.0
 LOCK_RETRY_SECONDS = 0.05
-# The model is written to the ledger and printed by `enmaas usage`, so only
-# characters that are safe on one terminal line are taken.
-MODEL_PATTERN = re.compile(r"[A-Za-z0-9._:/@+-]{1,256}")
+# The model is written to the ledger and printed by `enmaas usage`, so it
+# must be printable on one terminal line, and no longer than the ledger
+# reader takes.
+MAX_MODEL_CHARS = MAX_TEXT_CHARS
 # os.kill takes a C int. A larger pid would raise OverflowError, not OSError.
 MAX_PID = (1 << 31) - 1
 DIALECTS = frozenset({"anthropic", "openai"})
@@ -160,7 +161,9 @@ def _parse(line: str) -> OpenRun | None:
     dialect = data.get("dialect")
     if not _is_text(run_id, 64):
         return None
-    if not isinstance(model, str) or MODEL_PATTERN.fullmatch(model) is None:
+    if not isinstance(model, str) or not 0 < len(model) <= MAX_MODEL_CHARS:
+        return None
+    if not model.isprintable():
         return None
     if not _is_text(dialect, 64) or dialect not in DIALECTS:
         return None
