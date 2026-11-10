@@ -28,6 +28,7 @@ import re
 import secrets
 import stat
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -59,6 +60,10 @@ MAX_LINE_BYTES = 64 << 10
 READ_CHUNK_BYTES = 64 << 10
 REQUEST_MARKER = b'"request"'
 MAX_PATH_CHARS = 4096
+# The lock is held only for a short read and write, so a longer wait means
+# the holder is stuck. Giving up keeps a stuck process from stopping others.
+LOCK_WAIT_SECONDS = 5.0
+LOCK_RETRY_SECONDS = 0.05
 # The model is written to the ledger and printed by `enmaas usage`, so only
 # characters that are safe on one terminal line are taken.
 MODEL_PATTERN = re.compile(r"[A-Za-z0-9._:/@+-]{1,256}")
@@ -253,6 +258,19 @@ def _require_owner(info: os.stat_result) -> None:
         raise OSError("an open-run file is owned by another user")
 
 
+def _acquire(fd: int) -> None:
+    """Take the exclusive lock, or raise OSError after LOCK_WAIT_SECONDS."""
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise OSError("the open-run lock is held by another process") from None
+            time.sleep(LOCK_RETRY_SECONDS)
+
+
 @contextlib.contextmanager
 def _locked(state_dir: Path) -> Iterator[None]:
     """Hold the exclusive lock that every read-modify-write of the file takes."""
@@ -261,7 +279,7 @@ def _locked(state_dir: Path) -> Iterator[None]:
     fd = os.open(state_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         _require_owner(os.fstat(fd))
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _acquire(fd)
         yield
     finally:
         # Closing the descriptor releases the lock.

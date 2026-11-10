@@ -163,7 +163,7 @@ def test_every_change_holds_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyP
     openruns.end(state, run)
     _write_records(state, [dead])
     openruns.settle(state, state / "usage.jsonl")
-    lock = f"flock {fcntl.LOCK_EX}"
+    lock = f"flock {fcntl.LOCK_EX | fcntl.LOCK_NB}"
     assert events == [lock, "replace", lock, "unlink", lock, "unlink"]
 
 
@@ -1084,3 +1084,78 @@ def test_a_record_with_a_normal_model_name_is_loaded(tmp_path: Path, model: str)
     state = tmp_path / "state"
     _write_records(state, [_record(model=model)])
     assert [run.model for run in openruns._load(state)] == [model]
+
+
+@pytest.fixture
+def lock_holder(tmp_path: Path) -> Any:
+    """A child process that holds the open-run lock until the test ends."""
+    import contextlib
+    import time
+
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    code = (
+        "import fcntl, os, sys\n"
+        f"fd = os.open({str(state / openruns.LOCK_FILE)!r}, os.O_RDWR | os.O_CREAT, 0o600)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "print('locked', flush=True)\n"
+        "sys.stdin.read()\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert child.stdout is not None
+        deadline = time.monotonic() + 10
+        line = child.stdout.readline()
+        assert line == "locked\n" and time.monotonic() < deadline
+        yield state
+    finally:
+        assert child.stdin is not None
+        with contextlib.suppress(OSError):
+            child.stdin.close()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=10)
+
+
+def test_settle_gives_up_on_a_held_lock(lock_holder: Path, tmp_path: Path) -> None:
+    import time
+
+    state = lock_holder
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(5)])
+    path = _write_records(state, [_record(outdir=str(outdir))])
+    before = path.read_bytes()
+    started = time.monotonic()
+    openruns.settle(state, state / "usage.jsonl")
+    assert time.monotonic() - started < 7
+    assert path.read_bytes() == before
+    assert not (state / "usage.jsonl").exists()
+
+
+def test_begin_warns_on_a_held_lock(
+    lock_holder: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import time
+
+    monkeypatch.setattr(openruns, "LOCK_WAIT_SECONDS", 0.5)
+    started = time.monotonic()
+    assert openruns.begin(lock_holder, outdir=tmp_path / "out", model="m", dialect="openai") is None
+    assert time.monotonic() - started < 3
+    assert capsys.readouterr().err == BEGIN_LINE
+
+
+def test_end_leaves_the_record_on_a_held_lock(
+    lock_holder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_records(lock_holder, [_record()])
+    before = path.read_bytes()
+    monkeypatch.setattr(openruns, "LOCK_WAIT_SECONDS", 0.5)
+    openruns.end(lock_holder, OpenRun(**_record()))
+    assert path.read_bytes() == before
