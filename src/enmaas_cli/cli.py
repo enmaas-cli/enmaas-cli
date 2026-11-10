@@ -601,11 +601,25 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
             ),
         )
 
-    # Runs still in progress have not written their ledger event yet. Their
-    # spend so far counts, so two runs side by side cannot each see the
-    # whole allowance. Read before the ledger: a run that ends between the
-    # two reads is then counted twice for this one check, never zero times.
-    live = openruns.live_charge(ledger.parent)
+    # Runs with a record still present have not written their ledger event
+    # yet. Their spend so far counts, so two runs side by side cannot each
+    # see the whole allowance. Read before the ledger: a run that ends
+    # between the two reads is then counted twice for this one check, never
+    # zero times.
+    opened = openruns.open_charge(ledger.parent)
+    if not opened.complete:
+        # Some spend could not be read. Sending on a guess could pass the
+        # ceiling, so the command refuses.
+        return RollingCheck(
+            0,
+            config.budget_tokens,
+            message=(
+                f"open-run records in {ledger.parent / openruns.OPEN_RUNS_FILE} could not "
+                "all be read, so the token budget cannot be checked; run the command "
+                "again, or delete that file if you did not create it"
+            ),
+        )
+    live = opened.charge
     events, problems = load_events_strict(ledger)
     if problems:
         # An unreadable ledger is indistinguishable from one showing zero

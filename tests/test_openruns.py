@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from enmaas_cli import budget, openruns
@@ -273,7 +274,7 @@ def test_a_live_record_is_kept_and_counted(tmp_path: Path) -> None:
     openruns.settle(state, state / "usage.jsonl")
     assert _ledger_rows(state / "usage.jsonl") == []
     assert _run_ids(state) == ["0123456789abcdef"]
-    assert openruns.live_charge(state) == 10
+    assert openruns.open_charge(state) == (10, True)
 
 
 def test_a_live_child_process_keeps_its_record(tmp_path: Path) -> None:
@@ -285,7 +286,7 @@ def test_a_live_child_process_keeps_its_record(tmp_path: Path) -> None:
         _write_records(state, [_record(outdir=str(outdir), pid=child.pid)])
         openruns.settle(state, state / "usage.jsonl")
         assert _run_ids(state) == ["0123456789abcdef"]
-        assert openruns.live_charge(state) == 4
+        assert openruns.open_charge(state) == (4, True)
     finally:
         assert child.stdin is not None
         child.stdin.close()
@@ -297,7 +298,8 @@ def test_a_record_from_this_process_is_dead(tmp_path: Path) -> None:
     outdir = tmp_path / "out"
     _index(outdir, [_charge(4)])
     _write_records(state, [_record(outdir=str(outdir), pid=os.getpid())])
-    assert openruns.live_charge(state) == 0
+    # Counted while present, dead or alive.
+    assert openruns.open_charge(state) == (4, True)
     openruns.settle(state, state / "usage.jsonl")
     (event,) = _ledger_rows(state / "usage.jsonl")
     assert event["charge"] == 4
@@ -309,7 +311,7 @@ def test_a_stale_record_with_a_live_pid_is_settled(tmp_path: Path) -> None:
     _index(outdir, [_charge(8)])
     started = (datetime.now(UTC) - timedelta(hours=49)).isoformat()
     _write_records(state, [_record(outdir=str(outdir), pid=os.getppid(), started=started)])
-    assert openruns.live_charge(state) == 0
+    assert openruns.open_charge(state) == (8, True)
     openruns.settle(state, state / "usage.jsonl")
     (event,) = _ledger_rows(state / "usage.jsonl")
     assert event["charge"] == 8
@@ -441,7 +443,7 @@ def test_a_record_file_that_is_a_link_is_not_followed(tmp_path: Path) -> None:
     target.write_text(json.dumps(_record(pid=os.getppid())) + "\n", encoding="utf-8")
     before = target.read_text(encoding="utf-8")
     (state / openruns.OPEN_RUNS_FILE).symlink_to(target)
-    assert openruns.live_charge(state) == 0
+    assert openruns.open_charge(state) == (0, False)
     openruns.settle(state, state / "usage.jsonl")
     assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
     assert target.read_text(encoding="utf-8") == before
@@ -452,7 +454,7 @@ def test_a_record_file_that_is_a_fifo_does_not_block(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir()
     os.mkfifo(state / openruns.OPEN_RUNS_FILE)
-    assert openruns.live_charge(state) == 0
+    assert openruns.open_charge(state) == (0, True)
     openruns.settle(state, state / "usage.jsonl")
 
 
@@ -492,7 +494,7 @@ def test_no_usage_log_turns_it_all_off(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv("ENMAAS_NO_USAGE_LOG", "1")
     assert openruns.begin(state, outdir=outdir, model="m", dialect="openai") is None
     openruns.settle(state, state / "usage.jsonl")
-    assert openruns.live_charge(state) == 0
+    assert openruns.open_charge(state) == (0, True)
     openruns.end(state, OpenRun(**_record(run_id="dead")))
     assert path.read_text(encoding="utf-8") == before
     assert not (state / "usage.jsonl").exists()
@@ -542,7 +544,8 @@ def test_nothing_read_is_ever_printed(tmp_path: Path, capsys: pytest.CaptureFixt
         [_record(outdir=str(outdir)), _record(outdir=str(outdir), pid=os.getppid())],
         extra=secret + "\n",
     )
-    assert openruns.live_charge(state) == 5
+    # Both records carry the same run id, so each counts the same row.
+    assert openruns.open_charge(state) == (10, True)
     openruns.settle(state, state / "usage.jsonl")
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -585,12 +588,12 @@ def test_a_charge_above_the_cap_is_skipped_when_settling(tmp_path: Path) -> None
     assert not (state / openruns.OPEN_RUNS_FILE).exists()
 
 
-def test_a_charge_above_the_cap_is_skipped_in_live_charge(tmp_path: Path) -> None:
+def test_a_charge_above_the_cap_is_skipped_in_open_charge(tmp_path: Path) -> None:
     state = tmp_path / "state"
     outdir = tmp_path / "out"
     _index(outdir, [_charge(HUGE), _charge(HUGE), _charge(21)])
     _write_records(state, [_record(outdir=str(outdir), pid=os.getppid())])
-    assert openruns.live_charge(state) == 21
+    assert openruns.open_charge(state) == (21, True)
 
 
 def _main_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -688,7 +691,7 @@ def test_a_record_whose_handling_raises_is_dropped_and_the_rest_settle(
     assert "secret" not in captured.err
 
 
-def test_a_live_record_whose_handling_raises_is_skipped(
+def test_a_live_record_whose_handling_raises_makes_the_read_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     state = tmp_path / "state"
@@ -712,9 +715,10 @@ def test_a_live_record_whose_handling_raises_is_skipped(
         return real(rows)
 
     monkeypatch.setattr(openruns, "charge_from_rows", charge_from_rows)
-    assert openruns.live_charge(state) == 5
+    assert openruns.open_charge(state) == (5, False)
     captured = capsys.readouterr()
-    assert captured.err == SKIPPED_WARNING
+    # Nothing is dropped: the budget check refuses instead.
+    assert captured.err == ""
     assert _run_ids(state) == ["bad", "good"]
 
 
@@ -845,7 +849,7 @@ def test_an_index_longer_than_the_budget_is_settled_with_what_was_read(
     assert not (state / openruns.OPEN_RUNS_FILE).exists()
 
 
-def test_live_charge_stops_reading_when_the_budget_runs_out(
+def test_open_charge_stops_reading_when_the_budget_runs_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = tmp_path / "state"
@@ -857,10 +861,11 @@ def test_live_charge_stops_reading_when_the_budget_runs_out(
         records.append(_record(outdir=str(tmp_path / name), run_id=name, pid=os.getppid()))
     _write_records(state, records)
     reads = _count_reads(monkeypatch)
-    total = openruns.live_charge(state)
+    total, complete = openruns.open_charge(state)
     index_bytes = sum(reads) - os.path.getsize(state / openruns.OPEN_RUNS_FILE)
     assert index_bytes <= budget
     assert 4 <= total < 8
+    assert not complete
 
 
 def test_a_record_started_in_the_future_is_not_loaded(tmp_path: Path) -> None:
@@ -870,7 +875,7 @@ def test_a_record_started_in_the_future_is_not_loaded(tmp_path: Path) -> None:
     ahead = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     _write_records(state, [_record(outdir=str(outdir), pid=1, started=ahead)])
     assert openruns._load(state) == []
-    assert openruns.live_charge(state) == 0
+    assert openruns.open_charge(state) == (0, True)
 
 
 def test_a_record_within_the_clock_skew_allowance_is_loaded(tmp_path: Path) -> None:
@@ -954,7 +959,7 @@ def test_two_runs_on_one_directory_are_each_charged_their_own_rows(tmp_path: Pat
             _record(outdir=str(outdir), run_id="b", pid=os.getppid(), offset=offset_b),
         ],
     )
-    assert openruns.live_charge(state) == 7 + 30
+    assert openruns.open_charge(state) == (7 + 30, True)
 
 
 def test_map_through_main_tags_its_charge_rows_with_its_record(
@@ -995,10 +1000,18 @@ def test_map_through_main_tags_its_charge_rows_with_its_record(
     assert all("run" not in json.loads(line) for line in lines)
 
 
-def _too_large_warning(state: Path) -> str:
+def _too_large_warning(state: Path, reason: str = "is too large") -> str:
     return (
-        f"warning: {state / openruns.OPEN_RUNS_FILE} is too large and was ignored; "
+        f"warning: {state / openruns.OPEN_RUNS_FILE} {reason} and was ignored; "
         "delete it if you did not create it\n"
+    )
+
+
+def _full_line(state: Path, reason: str) -> str:
+    return (
+        "warning: the open-run record could not be written because "
+        f"{state / openruns.OPEN_RUNS_FILE} {reason}; "
+        "if this run is killed its spend is not counted\n"
     )
 
 
@@ -1026,7 +1039,8 @@ def test_a_file_the_loader_refuses_is_reported_and_left_alone(
         assert path.stat().st_size == openruns.MAX_FILE_BYTES + 1
     before = path.read_bytes()
     assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
-    assert capsys.readouterr().err == _too_large_warning(state) + BEGIN_LINE
+    reason = "holds too many records" if shape == "too many records" else "is too large"
+    assert capsys.readouterr().err == _full_line(state, reason)
     assert path.read_bytes() == before
 
 
@@ -1037,9 +1051,10 @@ def test_the_too_large_warning_prints_once_per_command(
     path = _many_records(state, openruns.MAX_RECORDS + 1)
     before = path.read_bytes()
     openruns.settle(state, state / "usage.jsonl")
-    assert openruns.live_charge(state) == 0
+    assert openruns.open_charge(state) == (0, False)
     assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
-    assert capsys.readouterr().err == _too_large_warning(state) + BEGIN_LINE
+    reason = "holds too many records"
+    assert capsys.readouterr().err == _too_large_warning(state, reason) + _full_line(state, reason)
     assert path.read_bytes() == before
     assert not (state / "usage.jsonl").exists()
 
@@ -1057,7 +1072,7 @@ def test_begin_never_writes_more_records_than_the_loader_takes(
     path = _many_records(state, openruns.MAX_RECORDS)
     before = path.read_bytes()
     assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
-    assert capsys.readouterr().err == BEGIN_LINE
+    assert capsys.readouterr().err == _full_line(state, "holds too many records")
     assert path.read_bytes() == before
 
 
@@ -1099,7 +1114,7 @@ def test_files_owned_by_another_user_are_not_used(
     assert openruns.begin(state, outdir=outdir, model="m", dialect="openai") is None
     assert capsys.readouterr().err == BEGIN_LINE
     openruns.settle(state, state / "usage.jsonl")
-    assert openruns.live_charge(state) == 0
+    assert openruns.open_charge(state) == (0, False)
     assert path.read_bytes() == before
     assert not (state / "usage.jsonl").exists()
 
@@ -1365,3 +1380,214 @@ def test_end_when_the_record_is_already_gone_does_nothing(tmp_path: Path) -> Non
     assert not (state / openruns.OPEN_RUNS_FILE).exists()
     openruns.end(state, other)
     assert not (state / openruns.OPEN_RUNS_FILE).exists()
+
+
+# Taken at import, before any test replaces it.
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _counting_gateway(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the mock gateway of _main_env with one that records each request path."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_with(handler))
+    return seen
+
+
+def _client_with(handler: Any) -> Any:
+    def make(*args: Any, **kwargs: Any) -> Any:
+        return _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler))
+
+    return make
+
+
+def _hold_lock(state: Path) -> subprocess.Popen[str]:
+    """Start a child that holds the open-run lock of `state` until its stdin closes."""
+    state.mkdir(parents=True, exist_ok=True)
+    code = (
+        "import fcntl, os, sys\n"
+        f"fd = os.open({str(state / openruns.LOCK_FILE)!r}, os.O_RDWR | os.O_CREAT, 0o600)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "print('locked', flush=True)\n"
+        "sys.stdin.read()\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    assert child.stdout is not None
+    assert child.stdout.readline() == "locked\n"
+    return child
+
+
+def _release(child: subprocess.Popen[str]) -> None:
+    assert child.stdin is not None
+    child.stdin.close()
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_a_dead_run_that_cannot_be_settled_still_counts_against_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.cli import main
+
+    state = _main_env(tmp_path, monkeypatch)
+    seen = _counting_gateway(monkeypatch)
+    monkeypatch.setattr(openruns, "LOCK_WAIT_SECONDS", 0.5)
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(5000)])
+    _write_records(state, [_record(outdir=str(outdir))])
+    holder = _hold_lock(state)
+    try:
+        assert main(["--config", str(_budget_config(tmp_path, 1000)), *ASK]) == 3
+    finally:
+        _release(holder)
+    assert seen == []
+    err = capsys.readouterr().err
+    assert "5,000 of 1,000 tokens spent" in err
+    assert _run_ids(state) == [RUN_ID]
+
+
+def test_a_small_real_run_is_settled_ahead_of_large_planted_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    budget = 256 << 10
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", budget)
+    records = []
+    for n in range(5):
+        _padded_index(tmp_path / f"planted{n}", 2 * budget, [1], f"planted{n}")
+        records.append(_record(outdir=str(tmp_path / f"planted{n}"), run_id=f"planted{n}"))
+    _index(tmp_path / "real", [_charge(9, run="real")])
+    records.append(_record(outdir=str(tmp_path / "real"), run_id="real"))
+    _write_records(state, records)
+    openruns.settle(state, state / "usage.jsonl")
+    assert 9 in [row["charge"] for row in _ledger_rows(state / "usage.jsonl")]
+    assert "real" not in _run_ids(state)
+
+
+def test_a_small_live_run_is_counted_ahead_of_a_large_planted_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    budget = 256 << 10
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", budget)
+    _padded_index(tmp_path / "planted", 2 * budget, [1], "planted")
+    _index(tmp_path / "real", [_charge(9, run="real")])
+    _write_records(
+        state,
+        [
+            _record(outdir=str(tmp_path / "planted"), run_id="planted", pid=os.getppid()),
+            _record(outdir=str(tmp_path / "real"), run_id="real", pid=os.getppid()),
+        ],
+    )
+    read = openruns.open_charge(state)
+    assert read.charge == 9
+    # The planted index was cut short by what the real one used.
+    assert not read.complete
+
+
+def _refuse_open(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    import errno
+
+    real_open = os.open
+
+    def open_(target: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if str(target) == str(path):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_)
+
+
+INCOMPLETE_REFUSAL = (
+    "open-run records in {path} could not all be read, so the token budget cannot be "
+    "checked; run the command again, or delete that file if you did not create it"
+)
+
+
+def test_an_index_that_cannot_be_opened_keeps_its_record_until_it_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    index = _index(outdir, [_charge(5)])
+    _write_records(state, [_record(outdir=str(outdir))])
+    _refuse_open(monkeypatch, index)
+    ledger = state / "usage.jsonl"
+
+    openruns.settle(state, ledger)
+    assert _run_ids(state) == [RUN_ID]
+    assert openruns.open_charge(state) == (0, False)
+    check = rolling_check(Config(budget_tokens=100, budget_window_days=7), ledger)
+    assert check.message == INCOMPLETE_REFUSAL.format(path=state / openruns.OPEN_RUNS_FILE)
+    assert capsys.readouterr().err == ""
+
+    class Later(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> Any:
+            return datetime.now(tz) + openruns.STALE_AFTER + timedelta(hours=1)
+
+    monkeypatch.setattr(openruns, "datetime", Later)
+    openruns.settle(state, ledger)
+    assert _run_ids(state) == []
+    assert _ledger_rows(ledger) == []
+    assert capsys.readouterr().err == SKIPPED_WARNING.replace("RuntimeError", "PermissionError")
+
+
+@pytest.mark.parametrize("budgeted", [True, False])
+def test_an_unreadable_record_file_refuses_only_under_a_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    budgeted: bool,
+) -> None:
+    from enmaas_cli.cli import main
+
+    state = _main_env(tmp_path, monkeypatch)
+    seen = _counting_gateway(monkeypatch)
+    state.mkdir(parents=True)
+    target = tmp_path / "target.jsonl"
+    target.write_text("", encoding="utf-8")
+    (state / openruns.OPEN_RUNS_FILE).symlink_to(target)
+    config = _budget_config(tmp_path, 1000) if budgeted else tmp_path / "none.toml"
+    code = main(["--config", str(config), *ASK])
+    err = capsys.readouterr().err
+    if budgeted:
+        assert code == 3
+        assert seen == []
+        assert INCOMPLETE_REFUSAL.format(path=state / openruns.OPEN_RUNS_FILE) in err
+    else:
+        assert code == 0
+        assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    ("shape", "reason"),
+    [("too many records", "holds too many records"), ("too many bytes", "is too large")],
+)
+def test_begin_names_the_file_and_the_reason_when_it_is_full(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], shape: str, reason: str
+) -> None:
+    state = tmp_path / "state"
+    if shape == "too many records":
+        _many_records(state, openruns.MAX_RECORDS)
+    else:
+        path = _write_records(state, [_record()])
+        with path.open("ab") as handle:
+            handle.write(b"x" * (openruns.MAX_FILE_BYTES + 1 - path.stat().st_size))
+    assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
+    assert capsys.readouterr().err == _full_line(state, reason)

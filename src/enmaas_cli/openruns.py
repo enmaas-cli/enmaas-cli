@@ -21,6 +21,7 @@ index is written, printed or returned; only the sum of its charge rows.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -52,7 +53,7 @@ MAX_FILE_BYTES = 1 << 20
 # Records honored in one file. A run writes one record, so more than this
 # many at once is not normal use, and each record costs a probe and a read.
 MAX_RECORDS = 256
-# Bytes of index read in one call to settle or live_charge, shared by every
+# Bytes of index read in one call to settle or open_charge, shared by every
 # record it handles, so a command's cost does not grow with the record count.
 MAX_READ_BYTES = 64 << 20
 # A charge row is short. A longer line is skipped unparsed, so one huge line
@@ -77,6 +78,10 @@ BEGIN_WARNING = (
     "warning: the open-run record could not be written; "
     "if this run is killed its spend is not counted"
 )
+FULL_WARNING = (
+    "warning: the open-run record could not be written because {path} {reason}; "
+    "if this run is killed its spend is not counted"
+)
 # Names the exception class only. Its text could hold content read from a file.
 DROPPED_WARNING = (
     "warning: an open-run record could not be read and was dropped; "
@@ -84,8 +89,19 @@ DROPPED_WARNING = (
 )
 
 
+TOO_MANY_RECORDS = "holds too many records"
+TOO_MANY_BYTES = "is too large"
+
+
 class _TooLarge(OSError):
-    """The record file holds more bytes or records than the loader takes."""
+    """The record file holds more bytes or records than the loader takes.
+
+    `reason` completes a sentence that starts with the file's path.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 # Paths already reported as too large. A process runs one command, so this
@@ -93,12 +109,12 @@ class _TooLarge(OSError):
 _reported_too_large: set[str] = set()
 
 
-def _warn_too_large(state_dir: Path) -> None:
+def _warn_too_large(state_dir: Path, reason: str) -> None:
     path = str(state_dir / OPEN_RUNS_FILE)
     if path not in _reported_too_large:
         _reported_too_large.add(path)
         print(
-            f"warning: {path} is too large and was ignored; delete it if you did not create it",
+            f"warning: {path} {reason} and was ignored; delete it if you did not create it",
             file=sys.stderr,
         )
 
@@ -205,19 +221,19 @@ def _load(state_dir: Path) -> list[OpenRun]:
             return []
         _require_owner(info)
         if info.st_size > MAX_FILE_BYTES:
-            raise _TooLarge(OPEN_RUNS_FILE)
+            raise _TooLarge(TOO_MANY_BYTES)
         raw = _read_bounded(fd, MAX_FILE_BYTES + 1)
     finally:
         os.close(fd)
     if len(raw) > MAX_FILE_BYTES:
-        raise _TooLarge(OPEN_RUNS_FILE)
+        raise _TooLarge(TOO_MANY_BYTES)
     runs: list[OpenRun] = []
     for line in raw.decode("utf-8", errors="replace").splitlines():
         run = _parse(line)
         if run is not None:
             runs.append(run)
             if len(runs) > MAX_RECORDS:
-                raise _TooLarge(OPEN_RUNS_FILE)
+                raise _TooLarge(TOO_MANY_RECORDS)
     return runs
 
 
@@ -249,8 +265,10 @@ def _prepare(state_dir: Path, runs: list[OpenRun]) -> Path | None:
         os.unlink(path)
         return None
     text = "".join(json.dumps(asdict(run)) + "\n" for run in runs)
-    if len(runs) > MAX_RECORDS or len(text.encode("utf-8")) > MAX_FILE_BYTES:
-        raise OSError("the open-run record file would be too large")
+    if len(runs) > MAX_RECORDS:
+        raise _TooLarge(TOO_MANY_RECORDS)
+    if len(text.encode("utf-8")) > MAX_FILE_BYTES:
+        raise _TooLarge(TOO_MANY_BYTES)
     temporary, fd = _temporary(state_dir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -328,6 +346,23 @@ def _index_size(outdir: str) -> int:
     return info.st_size if stat.S_ISREG(info.st_mode) else 0
 
 
+def _tail_size(run: OpenRun) -> int:
+    """Bytes of the run's index after its offset, 0 when it cannot be sized."""
+    try:
+        return max(0, _index_size(run.outdir) - run.offset)
+    except OSError:
+        return 0
+
+
+def _smallest_first(runs: list[OpenRun]) -> list[OpenRun]:
+    """Records in order of the index they still have to read, smallest first.
+
+    The read budget is shared, so a large planted index read first could
+    use it ahead of a small real run. One stat per record.
+    """
+    return sorted(runs, key=_tail_size)
+
+
 def begin(state_dir: Path, *, outdir: Path, model: str, dialect: str) -> OpenRun | None:
     """Record a map run before it sends anything. None when it could not be recorded."""
     if _is_disabled():
@@ -351,9 +386,11 @@ def begin(state_dir: Path, *, outdir: Path, model: str, dialect: str) -> OpenRun
             runs = _load(state_dir)
             runs.append(run)
             _store(state_dir, runs)
-    except OSError as exc:
-        if isinstance(exc, _TooLarge):
-            _warn_too_large(state_dir)
+    except _TooLarge as exc:
+        path = state_dir / OPEN_RUNS_FILE
+        print(FULL_WARNING.format(path=path, reason=exc.reason), file=sys.stderr)
+        return None
+    except OSError:
         print(BEGIN_WARNING, file=sys.stderr)
         return None
     return run
@@ -376,8 +413,12 @@ class IndexRead(NamedTuple):
     charge: int
     # Bytes read, taken from the caller's read budget.
     used: int
-    # False when the budget ran out before the end of the index.
+    # False when the budget ran out before the end of the index, or the
+    # index could not be read.
     complete: bool
+    # The class name of the error when the index exists as a regular file
+    # but could not be read, such as a permission error. None otherwise.
+    failed: str | None = None
 
 
 @dataclass
@@ -442,7 +483,7 @@ def _charge_rows(
 
 
 def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
-    """Sum the charge rows this run wrote after its offset. Any failure gives 0.
+    """Sum the charge rows this run wrote after its offset.
 
     The offset is where reading starts. A row counts only when its `run`
     field is the record's run id.
@@ -452,15 +493,26 @@ def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
     must be a regular file, so a forged record cannot point this at a device
     or a FIFO. Only the sum leaves this function, never the content of a row.
     The sum is clamped to MAX_RECORDED, the limit of every recorded value.
+
+    A missing index or directory, a link, or a path that is not a regular
+    file gives 0 and a complete read. A deleted directory is the documented
+    undercount, and the others are forged. Any other error, such as a
+    permission error, gives an incomplete read that names the error class,
+    because the spend may be real and only out of reach for now.
     """
     limit = MAX_READ_BYTES if budget is None else budget
+    path = os.path.join(run.outdir, INDEX_NAME)
     try:
-        fd = os.open(
-            os.path.join(run.outdir, INDEX_NAME),
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-        )
-    except OSError:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return IndexRead(0, 0, True)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (FileNotFoundError, NotADirectoryError):
         return IndexRead(0, 0, True)
+    except OSError as exc:
+        # A link swapped in after the lstat, or a FIFO or socket in its place.
+        if exc.errno in (errno.ELOOP, errno.ENXIO):
+            return IndexRead(0, 0, True)
+        return IndexRead(0, 0, False, type(exc).__name__)
     progress = _Progress()
     try:
         info = os.fstat(fd)
@@ -468,8 +520,8 @@ def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
             return IndexRead(0, 0, True)
         os.lseek(fd, run.offset, os.SEEK_SET)
         charge = charge_from_rows(_charge_rows(fd, limit, progress, run.run_id))
-    except OSError:
-        return IndexRead(0, progress.used, True)
+    except OSError as exc:
+        return IndexRead(0, progress.used, False, type(exc).__name__)
     finally:
         os.close(fd)
     return IndexRead(min(charge, MAX_RECORDED), progress.used, progress.at_end)
@@ -523,17 +575,22 @@ def settle(state_dir: Path, ledger: Path) -> None:
 
     A record is removed only when there was nothing to charge or the ledger
     took the event. A record whose event could not be written stays, so the
-    next run tries again rather than losing the spend.
+    next run tries again rather than losing the spend. A record whose index
+    could not be read stays too, until it is older than STALE_AFTER.
     """
     if _is_disabled():
         return
     try:
         _settle(state_dir, ledger)
-    except _TooLarge:
-        _warn_too_large(state_dir)
+    except _TooLarge as exc:
+        _warn_too_large(state_dir, exc.reason)
     except OSError:
         # Nothing was settled. The records stay for the next command.
         pass
+
+
+def _is_stale(run: OpenRun, now: datetime) -> bool:
+    return now - datetime.fromisoformat(run.started) > STALE_AFTER
 
 
 def _settle(state_dir: Path, ledger: Path) -> None:
@@ -552,38 +609,57 @@ def _settle(state_dir: Path, ledger: Path) -> None:
     with _locked(state_dir):
         runs = _load(state_dir)
         now = datetime.now(UTC)
-        kept: list[OpenRun] = []
+        # Records to remove, by identity: two forged records can be equal.
+        settled: list[OpenRun] = []
         owed: list[tuple[OpenRun, int]] = []
         warned = False
-        budget = MAX_READ_BYTES
-        remaining = budget
+        dead: list[OpenRun] = []
         for run in runs:
             # One record that cannot be handled must not stop the command or
             # come back on every later one, so it is dropped with a warning.
             try:
-                if remaining <= 0 or not _is_dead(run, now):
-                    # Out of budget: the next command reads it.
-                    kept.append(run)
-                    continue
+                if _is_dead(run, now):
+                    dead.append(run)
+            except Exception as exc:
+                warned = _warn_dropped(type(exc).__name__, warned)
+                settled.append(run)
+        budget = MAX_READ_BYTES
+        remaining = budget
+        for run in _smallest_first(dead):
+            if remaining <= 0:
+                # Out of budget: the next command reads it.
+                break
+            try:
                 read = charge_since(run, remaining)
                 fresh = remaining == budget
                 remaining -= read.used
+                if read.failed is not None:
+                    # The spend may be real, so the record waits for a later
+                    # command. A record that never becomes readable is
+                    # dropped once it is stale, so it cannot stay for good.
+                    if _is_stale(run, now):
+                        warned = _warn_dropped(read.failed, warned)
+                        settled.append(run)
+                    continue
                 if not read.complete and not fresh:
                     # Cut short by what earlier records used. The next command
-                    # starts with this record and a full budget, so the charge
-                    # is counted whole. Nothing more is read now.
+                    # reads it with a full budget, so the charge is counted
+                    # whole. Nothing more is read now.
                     remaining = 0
-                    kept.append(run)
                     continue
                 # A record that had the full budget and still did not finish
                 # is settled with what was read. Keeping it would block every
                 # later command on the same read.
+                settled.append(run)
                 if read.charge > 0:
                     owed.append((run, read.charge))
             except Exception as exc:
-                warned = _warn_dropped(exc, warned)
-        if len(kept) == len(runs):
+                warned = _warn_dropped(type(exc).__name__, warned)
+                settled.append(run)
+        if not settled:
             return
+        gone = {id(run) for run in settled}
+        kept = [run for run in runs if id(run) not in gone]
         temporary = _prepare(state_dir, kept)
         try:
             refused = [
@@ -598,44 +674,66 @@ def _settle(state_dir: Path, ledger: Path) -> None:
             _commit(state_dir, temporary)
             return
         _discard(temporary)
-        _store(state_dir, [run for run in runs if run in kept or run in refused])
+        back = gone - {id(run) for run in refused}
+        _store(state_dir, [run for run in runs if id(run) not in back])
 
 
-def _warn_dropped(exc: Exception, warned: bool) -> bool:
+def _warn_dropped(kind: str, warned: bool) -> bool:
     """Print the dropped-record warning once per call. Returns that it was printed."""
     if not warned:
-        print(DROPPED_WARNING.format(kind=type(exc).__name__), file=sys.stderr)
+        print(DROPPED_WARNING.format(kind=kind), file=sys.stderr)
     return True
 
 
-def live_charge(state_dir: Path) -> int:
-    """What runs still in progress have spent so far, from their own index rows.
+class OpenCharge(NamedTuple):
+    """What the records still present have spent, and whether all of it was read."""
+
+    charge: int
+    # False when some spend could not be read, so the sum may be short.
+    complete: bool
+
+
+def open_charge(state_dir: Path) -> OpenCharge:
+    """What every run with a record still present has spent, from its own index rows.
+
+    Called after settle, so a dead record still here is one settle could not
+    handle. Its spend counts all the same, dead or alive.
+
+    The read is incomplete when the record file could not be loaded, an
+    index could not be read, or the shared read budget ran out with records
+    unread. A record that had the whole budget and still did not reach the
+    end of its index counts what was read, as settle does.
 
     Read without the lock: the file is only ever replaced whole, so a reader
     sees one complete version or the other.
     """
     if _is_disabled():
-        return 0
+        return OpenCharge(0, True)
     try:
         runs = _load(state_dir)
-    except _TooLarge:
-        _warn_too_large(state_dir)
-        return 0
+    except _TooLarge as exc:
+        _warn_too_large(state_dir, exc.reason)
+        return OpenCharge(0, False)
     except OSError:
-        return 0
-    now = datetime.now(UTC)
+        return OpenCharge(0, False)
     total = 0
-    warned = False
-    # One budget for every record. Records past it count as zero here.
-    remaining = MAX_READ_BYTES
-    for run in runs:
+    complete = True
+    # One budget for every record, read smallest index first.
+    budget = MAX_READ_BYTES
+    remaining = budget
+    for run in _smallest_first(runs):
         if remaining <= 0:
+            complete = False
             break
         try:
-            if not _is_dead(run, now):
-                read = charge_since(run, remaining)
-                remaining -= read.used
-                total += read.charge
-        except Exception as exc:
-            warned = _warn_dropped(exc, warned)
-    return min(total, MAX_RECORDED)
+            read = charge_since(run, remaining)
+        except Exception:
+            # Nothing is dropped here. The check refuses instead.
+            complete = False
+            continue
+        fresh = remaining == budget
+        remaining -= read.used
+        total += read.charge
+        if read.failed is not None or (not read.complete and not fresh):
+            complete = False
+    return OpenCharge(min(total, MAX_RECORDED), complete)
