@@ -176,6 +176,20 @@ def _charge_row(charge: int, *, items: int, run: str | None = None) -> str:
     return json.dumps(row)
 
 
+def _charge_row_parts(run: str) -> tuple[str, str, str]:
+    """The text of this run's charge row around its two numbers.
+
+    A row _charge_row writes for `run` is head + charge + middle + items +
+    tail. Taken from the row it writes with both numbers 0, split at the
+    first two zeros: no text before the two numbers holds a digit, and the
+    run id comes after them. A reader builds its pattern from these parts,
+    so the reader and the writer cannot drift apart.
+    """
+    head, rest = _charge_row(0, items=0, run=run).split("0", 1)
+    middle, tail = rest.split("0", 1)
+    return head, middle, tail
+
+
 def _require_own_regular(fd: int, index: Path) -> None:
     """Refuse an open index that is not a regular file owned by this user.
 

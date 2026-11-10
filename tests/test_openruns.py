@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
-from enmaas_cli import budget, openruns
+from enmaas_cli import openruns
 from enmaas_cli import usage as usage_module
 from enmaas_cli.cli import rolling_check
 from enmaas_cli.config import Config
@@ -675,17 +675,17 @@ def test_a_record_whose_handling_raises_is_dropped_and_the_rest_settle(
             _record(outdir=str(tmp_path / "b"), run_id="good"),
         ],
     )
-    real = budget.charge_from_rows
+    real = openruns._sum_charges
     calls = 0
 
-    def charge_from_rows(rows: Any) -> int:
+    def sum_charges(charges: Any) -> int:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("secret text from a row")
-        return real(rows)
+        return real(charges)
 
-    monkeypatch.setattr(openruns, "charge_from_rows", charge_from_rows)
+    monkeypatch.setattr(openruns, "_sum_charges", sum_charges)
     openruns.settle(state, state / "usage.jsonl")
     assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
     assert not (state / openruns.OPEN_RUNS_FILE).exists()
@@ -707,17 +707,17 @@ def test_a_live_record_whose_handling_raises_makes_the_read_incomplete(
             _record(outdir=str(tmp_path / "b"), run_id="good", pid=os.getppid()),
         ],
     )
-    real = budget.charge_from_rows
+    real = openruns._sum_charges
     calls = 0
 
-    def charge_from_rows(rows: Any) -> int:
+    def sum_charges(charges: Any) -> int:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("secret text from a row")
-        return real(rows)
+        return real(charges)
 
-    monkeypatch.setattr(openruns, "charge_from_rows", charge_from_rows)
+    monkeypatch.setattr(openruns, "_sum_charges", sum_charges)
     assert openruns.open_charge(state) == (5, False)
     captured = capsys.readouterr()
     # Nothing is dropped: the budget check refuses instead.
@@ -791,7 +791,7 @@ def test_a_line_without_the_request_marker_is_not_parsed(
 
     monkeypatch.setattr(json, "loads", loads)
     assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))).charge == 3
-    assert len(parsed) == 1
+    assert parsed == []
 
 
 def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -1699,18 +1699,6 @@ def test_begin_records_a_printable_model_id(tmp_path: Path, model: str) -> None:
     assert [r.model for r in openruns._load(state)] == [model]
 
 
-def test_every_charge_row_the_runner_writes_matches_the_scan_pattern() -> None:
-    from enmaas_cli.runner import _charge_row
-    from enmaas_cli.tokens import MAX_RECORDED
-
-    for charge in (-5, 0, 1, MAX_RECORDED, MAX_RECORDED * 10):
-        for items in (1, 10**6, 2**63):
-            for run in (None, "0" * 16, "f" * 64):
-                line = _charge_row(charge, items=items, run=run).encode("utf-8")
-                assert openruns.CHARGE_LINE.fullmatch(line), line
-                assert len(line) <= openruns.MAX_LINE_BYTES
-
-
 def _random_index(rng: Any, run_id: str) -> bytes:
     from enmaas_cli.runner import _charge_row
 
@@ -1751,24 +1739,21 @@ def test_the_scan_agrees_with_the_reference_reader(
 
     rng = random.Random(20261110)
     index = tmp_path / "index.jsonl"
-    reference = openruns._reference_lines
-    scan = openruns._candidate_lines
+    pattern = openruns.charge_pattern(RUN_ID)
     for case in range(5000):
         data = _random_index(rng, RUN_ID)
         index.write_bytes(data)
         monkeypatch.setattr(openruns, "READ_CHUNK_BYTES", rng.randrange(1, 80))
-        monkeypatch.setattr(openruns, "MAX_LINE_BYTES", rng.randrange(20, 200))
         budget = rng.randrange(0, len(data) + 20)
         results = []
-        for lines in (reference, scan):
-            monkeypatch.setattr(openruns, "_candidate_lines", lines)
+        for read in (openruns._reference_charges, openruns._scan_charges):
             fd = os.open(index, os.O_RDONLY)
             try:
                 progress = openruns._Progress()
-                rows = list(openruns._charge_rows(fd, budget, progress, RUN_ID))
+                charges = list(read(fd, budget, progress, pattern))
             finally:
                 os.close(fd)
-            results.append((rows, progress.used, progress.at_end))
+            results.append((charges, progress.used, progress.at_end))
         assert results[0] == results[1], (case, data, budget)
 
 

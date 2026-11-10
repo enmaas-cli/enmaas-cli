@@ -37,7 +37,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypeGuard
 
-from .budget import charge_from_rows
+from .runner import _charge_row_parts
 from .tokens import MAX_RECORDED
 from .usage import MAX_TEXT_CHARS, UsageEvent, _is_disabled, append_event
 
@@ -58,16 +58,12 @@ MAX_RECORDS = 256
 # every record the pass handles, so a command's cost does not grow with the
 # record count. A command makes both passes, so it reads at most twice this.
 MAX_READ_BYTES = 64 << 20
-# A charge row is short. A longer line is skipped unparsed, so one huge line
-# cannot cost memory or parse time.
-MAX_LINE_BYTES = 64 << 10
 READ_CHUNK_BYTES = 64 << 10
-# Every charge row starts with this text, the way json.dumps writes the row
-# _charge_row builds. Only a line that starts with it is parsed.
-CHARGE_PREFIX = b'{"type": "request"'
-# One scan per chunk finds the lines that can be charge rows, so a line that
-# is not one costs no Python work. The length is checked per match.
-CHARGE_LINE = re.compile(rb'^\{"type": "request"[^\n]*', re.MULTILINE)
+# The digits a charge and an item count can have in a charge row. A charge
+# is at most MAX_RECORDED, which has 19 digits. A request never carries more
+# items than a run can hold in memory.
+CHARGE_DIGITS = 19
+ITEMS_DIGITS = 10
 MAX_PATH_CHARS = 4096
 # The lock is held only for a short read and write, so a longer wait means
 # the holder is stuck. Giving up keeps a stuck process from stopping others.
@@ -443,49 +439,76 @@ class _Progress:
     at_end: bool = False
 
 
-def _reference_lines(fd: int, budget: int, progress: _Progress) -> Iterator[bytes]:
-    """Every line of at most MAX_LINE_BYTES, read in chunks up to `budget` bytes.
+class ChargePattern(NamedTuple):
+    """How to find one run's charge rows in its index."""
 
-    A plain line splitter, kept as the reference the scan below is tested
-    against. A longer line is dropped as it streams past.
+    # Matches a whole charge row of the run, with the charge as group 1.
+    regex: re.Pattern[bytes]
+    # The longest line the regex can match. A longer line is never one.
+    longest: int
+
+
+def charge_pattern(run_id: str) -> ChargePattern:
+    """The pattern of a whole charge row that _charge_row writes for `run_id`.
+
+    Built from the writer's own text, so the two cannot drift. The run id is
+    in the pattern, so a row of another run, or of no run, does not match,
+    and no line is ever parsed as JSON.
+    """
+    head, middle, tail = (part.encode("utf-8") for part in _charge_row_parts(run_id))
+    regex = re.compile(
+        b"^"
+        + re.escape(head)
+        + rb"(\d{1,%d})" % CHARGE_DIGITS
+        + re.escape(middle)
+        + rb"\d{1,%d}" % ITEMS_DIGITS
+        + re.escape(tail)
+        + b"$",
+        re.MULTILINE,
+    )
+    longest = len(head) + CHARGE_DIGITS + len(middle) + ITEMS_DIGITS + len(tail)
+    return ChargePattern(regex, longest)
+
+
+def _reference_charges(
+    fd: int, budget: int, progress: _Progress, pattern: ChargePattern
+) -> Iterator[int]:
+    """The charge of every line that is a whole charge row, read in chunks up to `budget` bytes.
+
+    A plain line splitter with the same pattern, kept as the reference the
+    scan below is tested against. It holds any line whole, so it is not
+    used on an index.
     """
     pending = b""
-    skipping = False
     while progress.used < budget:
         chunk = os.read(fd, min(READ_CHUNK_BYTES, budget - progress.used))
         if not chunk:
             progress.at_end = True
             break
         progress.used += len(chunk)
-        start = 0
-        while (newline := chunk.find(b"\n", start)) >= 0:
-            if not skipping and len(pending) + newline - start <= MAX_LINE_BYTES:
-                yield pending + chunk[start:newline]
-            pending = b""
-            skipping = False
-            start = newline + 1
-        if not skipping:
-            pending += chunk[start:]
-            if len(pending) > MAX_LINE_BYTES:
-                pending = b""
-                skipping = True
+        *lines, pending = (pending + chunk).split(b"\n")
+        for line in lines:
+            if match := pattern.regex.fullmatch(line):
+                yield int(match.group(1))
     # A last line with no newline is used only at the end of the file. A
     # line cut by the budget is not.
-    if pending and not skipping and progress.at_end:
-        yield pending
+    if pending and progress.at_end and (match := pattern.regex.fullmatch(pending)):
+        yield int(match.group(1))
 
 
-def _candidate_lines(fd: int, budget: int, progress: _Progress) -> Iterator[bytes]:
-    """Lines of at most MAX_LINE_BYTES that start with CHARGE_PREFIX.
+def _scan_charges(
+    fd: int, budget: int, progress: _Progress, pattern: ChargePattern
+) -> Iterator[int]:
+    """The charge of every whole charge row of the pattern's run.
 
-    Reads in chunks up to `budget` bytes, so memory stays flat: one chunk
-    and one partial line. Each chunk is scanned once with CHARGE_LINE, so a
-    file of lines that are not charge rows costs no Python work per line.
-    Only the line that crosses into a chunk from the one before is handled
-    on its own.
+    Reads in chunks up to `budget` bytes. Each chunk is scanned once by the
+    pattern, so a line that is not a charge row of this run costs no Python
+    work and is never parsed. Memory stays flat: one chunk, and the start of
+    a line that crosses into the next chunk, kept only while it is short
+    enough to be a row.
     """
     pending = b""
-    # True inside a line longer than MAX_LINE_BYTES, which is skipped.
+    # True inside a line longer than any row, which is skipped.
     skipping = False
     while progress.used < budget:
         chunk = os.read(fd, min(READ_CHUNK_BYTES, budget - progress.used))
@@ -497,52 +520,39 @@ def _candidate_lines(fd: int, budget: int, progress: _Progress) -> Iterator[byte
         if last < 0:
             if not skipping:
                 pending += chunk
-                if len(pending) > MAX_LINE_BYTES:
+                if len(pending) > pattern.longest:
                     pending = b""
                     skipping = True
             continue
         first = chunk.find(b"\n")
         # The line ending at the first newline began in an earlier chunk.
-        if not skipping and len(pending) + first <= MAX_LINE_BYTES:
-            head = pending + chunk[: min(first, len(CHARGE_PREFIX))]
-            if head.startswith(CHARGE_PREFIX):
-                yield pending + chunk[:first]
-        for match in CHARGE_LINE.finditer(chunk, first + 1, last):
-            if match.end() - match.start() <= MAX_LINE_BYTES:
-                yield match.group()
+        fits = not skipping and len(pending) + first <= pattern.longest
+        if fits and (match := pattern.regex.fullmatch(pending + chunk[:first])):
+            yield int(match.group(1))
+        for match in pattern.regex.finditer(chunk, first + 1, last):
+            yield int(match.group(1))
         pending = chunk[last + 1 :]
-        skipping = len(pending) > MAX_LINE_BYTES
+        skipping = len(pending) > pattern.longest
         if skipping:
             pending = b""
-    if pending and not skipping and progress.at_end and pending.startswith(CHARGE_PREFIX):
-        yield pending
+    if not skipping and progress.at_end and (match := pattern.regex.fullmatch(pending)):
+        yield int(match.group(1))
 
 
-def _charge_rows(
-    fd: int, budget: int, progress: _Progress, run_id: str
-) -> Iterator[dict[str, Any]]:
-    """The charge rows tagged with `run_id`.
+def _sum_charges(charges: Iterator[int]) -> int:
+    """The sum of the charges, each taken only when it is at most MAX_RECORDED.
 
-    A row without the tag, or with another run's, is never counted. Another
-    run on the same directory writes its own ledger event for its rows.
+    No writer of this tool writes a larger one, and the bound keeps each
+    term small enough to print.
     """
-    for line in _candidate_lines(fd, budget, progress):
-        # Only a line that starts the way a charge row does is parsed.
-        if not line.startswith(CHARGE_PREFIX):
-            continue
-        try:
-            parsed = json.loads(line.decode("utf-8", errors="replace"))
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(parsed, dict) and parsed.get("run") == run_id:
-            yield parsed
+    return sum(charge for charge in charges if charge <= MAX_RECORDED)
 
 
 def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
     """Sum the charge rows this run wrote after its offset.
 
-    The offset is where reading starts. A row counts only when its `run`
-    field is the record's run id.
+    The offset is where reading starts. A line counts only when it is a
+    whole charge row as the runner writes it for the record's run id.
 
     Reads at most `budget` bytes, MAX_READ_BYTES by default, as a stream, and
     never holds the rows. The index is opened without following a link and
@@ -575,7 +585,8 @@ def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
         if not stat.S_ISREG(info.st_mode) or info.st_size < run.offset:
             return IndexRead(0, 0, True)
         os.lseek(fd, run.offset, os.SEEK_SET)
-        charge = charge_from_rows(_charge_rows(fd, limit, progress, run.run_id))
+        pattern = charge_pattern(run.run_id)
+        charge = _sum_charges(_scan_charges(fd, limit, progress, pattern))
     except OSError as exc:
         return IndexRead(0, progress.used, False, type(exc).__name__)
     finally:
