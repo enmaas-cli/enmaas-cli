@@ -37,6 +37,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   files, `sed` and `awk` script files, `jq --rawfile` and `--slurpfile`,
   `diff --from-file` and `--to-file`, `sort --files0-from`, `less` key and tag
   files, and `strings @file`.
+- A `--schema` file can no longer make enmaas fetch anything. Before, a
+  `$ref` to an `http://` or `file://` address in the schema was retrieved
+  while an answer was checked, so a schema from another party could make
+  enmaas contact any host, after the paid request was already sent. Now a
+  `$ref`, `$dynamicRef` or `$recursiveRef` that does not start with `#` stops
+  the command before any request, and validation has nothing it could
+  retrieve.
 
 ### Fixed
 

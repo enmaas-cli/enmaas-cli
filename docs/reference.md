@@ -102,7 +102,7 @@ These go before the subcommand: `enmaas --key-file PATH models`.
 ### Common flags (`ask` and `map`)
 
 - `-m, --model MODEL`: The model to use. Optional; without it the configured `default_model` applies and the receipt says `(default)`.
-- `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
+- `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. Every `$ref`, `$dynamicRef` and `$recursiveRef` must point inside the file, so it starts with `#`; enmaas never fetches a schema. A file nested more than 100 levels deep is refused. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
 - `--schema-name NAME`: The name sent with the schema. Defaults to `StructuredOutput`. `ask` and unbatched `map` send the schema and its name with the request; batched `map` keeps the schema local and validates each answer after the reply is split.
 - `--json`: Print exactly one JSON object on stdout in place of the receipt, on every exit: a result, a refusal or an error. See [JSON output](#json-output).
 - `--dialect {anthropic,openai}`: Override dialect selection. By default, the dialect is inferred from the model name.

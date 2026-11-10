@@ -413,7 +413,7 @@ def test_schema_check_that_recurses_too_deeply_is_a_validation_error(
 ) -> None:
     from enmaas_cli import schema as schema_module
 
-    def deep(instance: object, schema: object) -> None:
+    def deep(instance: object, schema: object, **kwargs: object) -> None:
         raise RecursionError("maximum recursion depth exceeded")
 
     monkeypatch.setattr("enmaas_cli.schema.jsonschema.validate", deep)
