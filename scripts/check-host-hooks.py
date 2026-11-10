@@ -29,7 +29,7 @@ DENIAL = "enmaas containment:"
 HOOK_ERROR = "could not check tool input"
 HOOKS_FILE = ROOT / "hooks" / "hooks.json"
 GUARD = ROOT / "hooks" / "pre-tool-use.py"
-HOOK_TEMPLATE = 'python3 -S "${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use.py"'
+HOOK_TEMPLATE = 'python3 -I -S "${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use.py"'
 CASES = (
     "read",
     "shell-read",
@@ -182,7 +182,7 @@ def repo_hook_groups() -> list[dict[str, Any]]:
     """
     config = json.loads(HOOKS_FILE.read_text(encoding="utf-8"))
     groups: list[dict[str, Any]] = config["hooks"]["PreToolUse"]
-    command = "python3 -S " + shlex.quote(str(GUARD))
+    command = "python3 -I -S " + shlex.quote(str(GUARD))
     for group in groups:
         for handler in group["hooks"]:
             if handler["command"] != HOOK_TEMPLATE:
@@ -309,7 +309,7 @@ def run_case(
         + shlex.quote(str(ROOT / "src"))
         + " exec "
         + shlex.quote(sys.executable)
-        + " -c 'from enmaas_cli.cli import main; raise SystemExit(main())' \"$@\"\n",
+        + " -c 'from enmaas_cli.cli import entry; entry()' \"$@\"\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)

@@ -399,3 +399,23 @@ class TestSchemaFileValidation:
                     schema_name="Test",
                 )
         assert call_count["count"] == 0
+
+
+def test_response_nested_too_deeply_is_a_validation_error() -> None:
+    from enmaas_cli.schema import validate_against_schema
+
+    with pytest.raises(ValidationError, match="^response is nested too deeply$"):
+        validate_against_schema("[" * 200_000 + "]" * 200_000, {"type": "array"})
+
+
+def test_schema_check_that_recurses_too_deeply_is_a_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from enmaas_cli import schema as schema_module
+
+    def deep(instance: object, schema: object, **kwargs: object) -> None:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("enmaas_cli.schema.jsonschema.validate", deep)
+    with pytest.raises(ValidationError, match="^response is nested too deeply$"):
+        schema_module.validate_against_schema("[1]", {"type": "array"})

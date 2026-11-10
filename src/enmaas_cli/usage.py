@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
+import math
 import os
-from dataclasses import asdict, dataclass
+import resource
+import secrets
+import stat
+from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
+from enmaas_cli.auth import printable
 from enmaas_cli.pricing import (
     OPUS_REFERENCE,
     ModelPrice,
     cost_for,
     opus_equivalent,
 )
+from enmaas_cli.tokens import MAX_RECORDED
 
 
 @dataclass(frozen=True)
@@ -73,13 +81,140 @@ _COUNT_FIELDS = (
 )
 
 
+# Text fields every event carries. Printed by `enmaas usage` and used as keys.
+_TEXT_FIELDS = ("command", "model", "dialect", "status")
+# The longest text field a row may hold. A writer cuts to this length, and a
+# reader refuses a longer one, so a row stays cheap to read and print.
+MAX_TEXT_CHARS = 1024
+
+
 def _is_disabled() -> bool:
     """Check if usage logging is disabled via environment variable."""
     return bool(os.environ.get("ENMAAS_NO_USAGE_LOG", ""))
 
 
+class NotRegularFile(OSError):
+    """The ledger path is a link, a FIFO or anything else that is not a regular file."""
+
+
+def _open_for_append(ledger: Path) -> int:
+    """Open the ledger to append one row, creating it and its directory if missing.
+
+    The state directory is created private, mode 0o700, and a new ledger
+    mode 0o600: both name the user's models and what they cost. An existing
+    file keeps its mode.
+
+    Defends against a planted file at the ledger path. O_NOFOLLOW refuses a
+    link, so a row cannot be sent to the link's target. O_NONBLOCK makes a
+    FIFO with no reader fail at once instead of blocking the command, and
+    the type check on the descriptor refuses a FIFO that has a reader.
+    """
+    ledger.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(ledger, flags, 0o600)
+    except OSError:
+        # A link fails here with ELOOP and a FIFO with no reader with ENXIO.
+        # Both are named as what they are, so the warning can say which path
+        # to fix instead of an error class that does not point at it.
+        try:
+            planted = not stat.S_ISREG(os.lstat(ledger).st_mode)
+        except OSError:
+            planted = False
+        if planted:
+            raise NotRegularFile(f"{ledger} is not a regular file") from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise NotRegularFile(f"{ledger} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+# The room a budgeted command proves before it sends a request. Far more
+# than one row, small enough to cost nothing.
+LEDGER_HEADROOM = 64 * 1024
+
+
+def can_append(ledger: Path) -> bool:
+    """Whether one row could be appended now, by the same rules append_event uses.
+
+    Proves three things: the ledger opens for append, its directory has room
+    for a row, and the process file size limit lets the ledger grow by
+    LEDGER_HEADROOM bytes. An open alone is not enough: on a full disk or at
+    a size limit the ledger still opens, and every budgeted run would spend
+    and record nothing. Creates the ledger and its directory when they are
+    missing, and writes no row. A budget can only bind when its spend is
+    written down, so a budgeted command proves this before it sends a
+    request.
+
+    Not proved: room can still run out while the request is in flight. The
+    write then fails, and the command warns that the run was not recorded.
+    """
+    try:
+        fd = _open_for_append(ledger)
+        try:
+            size = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)
+    if soft != resource.RLIM_INFINITY and size + LEDGER_HEADROOM > soft:
+        return False
+    return _has_room(ledger.parent)
+
+
+def _has_room(directory: Path) -> bool:
+    """Whether LEDGER_HEADROOM bytes can be written to a new file in `directory`.
+
+    The probe file is created exclusively and without following a link, so
+    it never touches a file that is already there, and it is always removed.
+    """
+    probe = directory / f".usage-room-{os.getpid()}-{secrets.token_hex(8)}"
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return False
+    try:
+        try:
+            left = memoryview(bytes(LEDGER_HEADROOM))
+            while left:
+                written = os.write(fd, left)
+                if written <= 0:
+                    return False
+                left = left[written:]
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    finally:
+        # The write is already proved or refused, so a failed removal does
+        # not change the answer.
+        with contextlib.suppress(OSError):
+            os.unlink(probe)
+    return True
+
+
+class LedgerWrite(NamedTuple):
+    """What became of one ledger row."""
+
+    recorded: bool
+    # Why a write that was tried failed, safe to print on one line. None
+    # when the row was written, or when ENMAAS_NO_USAGE_LOG meant no write
+    # was tried.
+    failure: str | None
+
+
 def append_event(ledger: Path, event: UsageEvent) -> bool:
-    """Write one event as a JSON line. Returns whether it was recorded.
+    """Write one event as a JSON line. Returns whether it was recorded."""
+    return write_event(ledger, event).recorded
+
+
+def write_event(ledger: Path, event: UsageEvent) -> LedgerWrite:
+    """Write one event as a JSON line, and say why when it was not written.
 
     Failure never breaks the call: the work is already done and paid for
     by the time this runs, so raising here would turn a bookkeeping
@@ -87,27 +222,34 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
 
     But it does report. A ledger that silently refuses writes is
     indistinguishable from one showing no spend, so a caller enforcing a
-    budget needs to know the ceiling just stopped tracking.
+    budget needs to know the ceiling just stopped tracking, and a user
+    without one needs to know rows stopped. A link or a FIFO at the ledger
+    path is refused the same way, and the reason names the path. Any other
+    reason is the error class only: the message of an OS error can quote
+    more than the path.
     """
     if _is_disabled():
-        return False
-
-    try:
-        ledger.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return False
+        return LedgerWrite(recorded=False, failure=None)
 
     # Convert datetime to ISO string for JSON
     data = asdict(event)
     data["timestamp"] = event.timestamp.isoformat()
-    # Coerce counts on the way out. A gateway reporting 10.0 instead of
-    # 10 would otherwise be written verbatim, and the strict reader
-    # would then reject this tool's own ledger as corrupt on the next
-    # budgeted run.
+    # Every count is written as an integer from 0 to MAX_RECORDED, the
+    # range the strict reader accepts. Otherwise a float such as 10.0, or
+    # a sum above the reader's limit, would make the next budgeted run
+    # refuse this tool's own ledger as corrupt.
     for name in _COUNT_FIELDS:
+        data[name] = _recorded(data.get(name))
+    # The same rules the reader checks, so this tool's own rows always read
+    # back: text cut to MAX_TEXT_CHARS, and an elapsed time that is a finite
+    # number of zero or more.
+    for name in (*_TEXT_FIELDS, "error_kind"):
         value = data.get(name)
-        if isinstance(value, float):
-            data[name] = max(0, int(value))
+        if isinstance(value, str):
+            data[name] = value[:MAX_TEXT_CHARS]
+    elapsed = data.get("elapsed")
+    if not _is_elapsed(elapsed):
+        data["elapsed"] = 0.0
 
     # try/except around the whole `with`, not contextlib.suppress inside
     # it. A buffered write only reaches the disk on close, so the close
@@ -116,11 +258,55 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
     # to report success, which is the dropped spend this return value
     # exists to surface.
     try:
-        with ledger.open("a", encoding="utf-8") as handle:
+        with os.fdopen(_open_for_append(ledger), "w", encoding="utf-8") as handle:
             handle.write(json.dumps(data) + "\n")
-    except OSError:
+    except NotRegularFile:
+        return LedgerWrite(False, f"{printable(str(ledger))} is not a regular file")
+    except OSError as exc:
+        return LedgerWrite(False, type(exc).__name__)
+    return LedgerWrite(recorded=True, failure=None)
+
+
+def _recorded(value: object) -> int | None:
+    """A count as the ledger stores it: None, or an integer from 0 to MAX_RECORDED."""
+    if value is None:
+        return None
+    if isinstance(value, float):
+        # NaN compares false with everything, so it is caught first.
+        if value != value:
+            return 0
+        value = int(max(0.0, min(value, float(MAX_RECORDED))))
+    if not isinstance(value, int):
+        return None
+    return max(0, min(int(value), MAX_RECORDED))
+
+
+class RowError(ValueError):
+    """One ledger row failed a check.
+
+    The text is one of a fixed set chosen here, never a value or a key
+    taken from the row, so a forged row cannot put its content into a
+    message.
+    """
+
+
+_FIELDS = frozenset(field.name for field in fields(UsageEvent))
+_REQUIRED = frozenset(
+    field.name
+    for field in fields(UsageEvent)
+    if field.default is MISSING and field.default_factory is MISSING
+)
+
+
+def _is_elapsed(value: object) -> bool:
+    # bool first: it subclasses int.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return True
+    return math.isfinite(value) and value >= 0
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and len(value) <= MAX_TEXT_CHARS
 
 
 def _event_from_row(data: object) -> UsageEvent:
@@ -131,50 +317,135 @@ def _event_from_row(data: object) -> UsageEvent:
     string count breaks the arithmetic downstream, and a timezone-naive
     timestamp raises when compared against an aware window cutoff. A
     budget that read any of those would be wrong rather than merely
-    incomplete.
+    incomplete. Every failure raises RowError.
     """
     if not isinstance(data, dict):
-        raise TypeError(f"expected a JSON object, got {type(data).__name__}")
+        raise RowError("not an object")
+    keys = set(data)
+    if not keys <= _FIELDS:
+        raise RowError("unknown field")
+    if not keys >= _REQUIRED:
+        raise RowError("missing field")
 
-    row = dict(data)
-    timestamp = datetime.fromisoformat(row.pop("timestamp"))
+    raw = data["timestamp"]
+    if not isinstance(raw, str):
+        raise RowError("bad timestamp")
+    try:
+        timestamp = datetime.fromisoformat(raw)
+    except ValueError:
+        raise RowError("bad timestamp") from None
     if timestamp.tzinfo is None:
-        raise ValueError("timestamp is timezone-naive")
+        raise RowError("bad timestamp")
+
+    # Text is used as a dictionary key and printed, and elapsed is summed, so
+    # a value of any other type would raise in `enmaas usage`.
+    if not all(_is_text(data[name]) for name in _TEXT_FIELDS):
+        raise RowError("bad text field")
+    if data["error_kind"] is not None and not _is_text(data["error_kind"]):
+        raise RowError("bad text field")
+    if not _is_elapsed(data["elapsed"]):
+        raise RowError("bad elapsed")
 
     for name in _COUNT_FIELDS:
-        count = row.get(name)
+        count = data.get(name)
         if count is None:
             continue
-        # bool first: it subclasses int, so True would pass as 1.
-        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-            raise ValueError(f"{name} must be a nonnegative integer, got {count!r}")
+        # bool first: it subclasses int, so True would pass as 1. Bounded so
+        # that sums stay printable.
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= MAX_RECORDED:
+            raise RowError("bad count")
 
+    row = dict(data)
+    row.pop("timestamp")
     return UsageEvent(timestamp=timestamp, **row)
 
 
+def _open_for_read(ledger: Path) -> int | None:
+    """Open the ledger to read it. None when it does not exist.
+
+    Raises NotRegularFile for a link, a FIFO or any other path that is not a
+    regular file. A FIFO would block the read until some other process
+    wrote to it, which hung every command that reads the ledger. The open
+    is nonblocking and the type is checked on the descriptor, so nothing
+    waits. A link is refused because the writer never writes through one.
+    """
+    try:
+        fd = os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise NotRegularFile(f"{ledger} is not a regular file") from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise NotRegularFile(f"{ledger} is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_ledger(ledger: Path) -> bytes | None:
+    """The whole ledger, or None when it does not exist. Raises OSError."""
+    fd = _open_for_read(ledger)
+    if fd is None:
+        return None
+    chunks: list[bytes] = []
+    try:
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
 def load_events(ledger: Path) -> list[UsageEvent]:
-    """Load all valid events, tolerating corrupt final line or missing file.
+    """Load all valid events, tolerating corrupt rows or a missing file.
 
     Deliberately forgiving: `enmaas usage` should report what it can
     rather than crash. Enforcement uses load_events_strict instead.
     """
-    if not ledger.exists():
-        return []
+    return load_events_counted(ledger).events
 
+
+class LedgerRead(NamedTuple):
+    """What the forgiving reader found."""
+
+    events: list[UsageEvent]
+    # Rows that could not be read.
+    skipped: int
+    # True when the ledger path is not a regular file, so nothing was read.
+    not_regular: bool
+
+
+def load_events_counted(ledger: Path) -> LedgerRead:
+    """The valid events and how many rows were skipped. Never raises on ledger content."""
     events: list[UsageEvent] = []
-    with contextlib.suppress(OSError, UnicodeDecodeError):
-        content = ledger.read_text(encoding="utf-8")
-        for line in content.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            # AttributeError is in the set because a row of JSON `null`
-            # reaches .pop on a None and used to crash this function.
-            with contextlib.suppress(
-                json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError
-            ):
-                events.append(_event_from_row(json.loads(stripped)))
-    return events
+    skipped = 0
+    try:
+        raw = _read_ledger(ledger)
+    except NotRegularFile:
+        return LedgerRead([], 0, True)
+    except OSError:
+        return LedgerRead([], 0, False)
+    if raw is None:
+        return LedgerRead([], 0, False)
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return LedgerRead([], 0, False)
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            events.append(_event_from_row(json.loads(stripped)))
+        except (ValueError, RecursionError):
+            # RowError and JSONDecodeError are ValueErrors. A deeply
+            # nested row raises RecursionError in the decoder.
+            skipped += 1
+    return LedgerRead(events, skipped, False)
 
 
 def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
@@ -184,18 +455,28 @@ def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
     Reporting should degrade; enforcement must not. A budget that mistook
     an unreadable ledger for one showing zero spend would never bind.
 
-    A missing file is not a problem: a fresh install has spent nothing.
+    A missing file is not a problem: a fresh install has spent nothing. A
+    path that is not a regular file is one problem that names the path.
     """
-    if not ledger.exists():
+    try:
+        raw = _read_ledger(ledger)
+    except NotRegularFile:
+        return [], [f"{printable(str(ledger))} is not a regular file"]
+    except OSError as exc:
+        # The class name only. The message of a read error can quote bytes
+        # of the file.
+        return [], [f"cannot be opened ({type(exc).__name__})"]
+    if raw is None:
         return [], []
-
     try:
         # Bytes then decode, so invalid UTF-8 is reportable rather than
         # escaping as an exception that is not an OSError.
-        text = ledger.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        return [], [f"{ledger} could not be read: {exc}"]
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return [], ["not UTF-8 text"]
 
+    # Each problem is "line N: <reason>", with a reason from a fixed set, so
+    # no value or key from a row reaches the message.
     events: list[UsageEvent] = []
     problems: list[str] = []
     for number, line in enumerate(text.splitlines(), 1):
@@ -203,9 +484,17 @@ def load_events_strict(ledger: Path) -> tuple[list[UsageEvent], list[str]]:
         if not stripped:
             continue
         try:
-            events.append(_event_from_row(json.loads(stripped)))
-        except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as exc:
-            problems.append(f"{ledger} line {number}: {type(exc).__name__}: {exc}")
+            data = json.loads(stripped)
+        except ValueError:
+            problems.append(f"line {number}: not JSON")
+            continue
+        except RecursionError:
+            problems.append(f"line {number}: nested too deeply")
+            continue
+        try:
+            events.append(_event_from_row(data))
+        except RowError as exc:
+            problems.append(f"line {number}: {exc}")
     return events, problems
 
 
@@ -307,8 +596,11 @@ def format_summary(
             inp = int(stats["input_tokens"])
             out = int(stats["output_tokens"])
             elapsed = float(stats["elapsed"])
+            # Ledger text is printed through printable(): a row is not
+            # trusted, and a newline or escape in it would forge output.
             lines.append(
-                f"  {model:<40}  {calls:>4} calls  {inp:>10,} in  {out:>10,} out  {elapsed:>8.1f}s"
+                f"  {printable(model):<40}  {calls:>4} calls  "
+                f"{inp:>10,} in  {out:>10,} out  {elapsed:>8.1f}s"
             )
         lines.append("")
 
@@ -320,15 +612,24 @@ def format_summary(
             out = int(stats["output_tokens"])
             elapsed = float(stats["elapsed"])
             lines.append(
-                f"  {command:<10}  {calls:>4} calls  "
+                f"  {printable(command):<10}  {calls:>4} calls  "
                 f"{inp:>10,} in  {out:>10,} out  {elapsed:>8.1f}s"
             )
 
     return "\n".join(lines)
 
 
-def format_summary_json(summary: UsageSummary, prices: dict[str, ModelPrice] | None = None) -> str:
-    """Format summary as JSON for machine consumption."""
+def format_summary_json(
+    summary: UsageSummary,
+    prices: dict[str, ModelPrice] | None = None,
+    *,
+    skipped_rows: int = 0,
+) -> str:
+    """Format summary as JSON for machine consumption.
+
+    `skipped_rows` counts the ledger rows that could not be read, so a
+    caller that reads only stdout still learns the totals are partial.
+    """
     spend, unpriced, reference = compute_costs(summary, prices)
     obj = {
         "total_calls": summary.total_calls,
@@ -343,6 +644,7 @@ def format_summary_json(summary: UsageSummary, prices: dict[str, ModelPrice] | N
         "unpriced_models": unpriced,
         "opus_equivalent_usd": reference,
         "opus_reference": OPUS_REFERENCE.label,
+        "skipped_rows": skipped_rows,
     }
     return json.dumps(obj, indent=2)
 
@@ -387,7 +689,8 @@ def _cost_lines(summary: UsageSummary, table: dict[str, ModelPrice]) -> list[str
     lines = [f"Spend:            ${spend:,.2f}"]
     if unpriced:
         lines.append(
-            f"  unpriced:       {', '.join(unpriced)} (no rate configured, so not counted above)"
+            f"  unpriced:       {', '.join(printable(m) for m in unpriced)} "
+            "(no rate configured, so not counted above)"
         )
     lines.append(f"Opus-equivalent:  ${reference:,.2f}")
     lines.append(f"  reference:      {OPUS_REFERENCE.label}")

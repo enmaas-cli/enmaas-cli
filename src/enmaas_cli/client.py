@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import random
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
-from .auth import REDACTION, redact
+from .auth import cut_redacted, printable, redact
 from .dialect import Request
+from .errors import BadReplyError
+
+# Re-exported so existing importers of this name from this module keep working.
+from .errors import GatewayError as GatewayError
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 # 90% of the measured ~300s gateway ceiling.
@@ -24,17 +30,9 @@ JITTER_FRACTION = 0.5
 # run for as long as it asks.
 MAX_RETRY_AFTER_SECONDS = 60.0
 ERROR_BODY_CHARS = 500
+CONTENT_TYPE_CHARS = 80
 
 SleepFn = Callable[[float], Awaitable[None]]
-
-
-class GatewayError(Exception):
-    """A request failed after exhausting its retry budget, or failed terminally."""
-
-    def __init__(self, message: str, *, status: int | None, attempts: int) -> None:
-        super().__init__(message)
-        self.status = status
-        self.attempts = attempts
 
 
 def is_retryable(status: int, elapsed: float = 0.0) -> bool:
@@ -66,17 +64,40 @@ def _retry_after(response: httpx.Response) -> float | None:
 
 
 def _error_detail(body: str, secret: str) -> str:
-    """Redact the key from an error body, then cut it to a bounded length.
+    """Redact the key from an error body, then cut it to a bounded length."""
+    return cut_redacted(redact(body, secret), ERROR_BODY_CHARS)
 
-    The cut never splits the placeholder, so a reader can still see that a
-    key was removed.
+
+def _reply_object(response: httpx.Response, secret: str) -> dict[str, Any]:
+    """Decode a 200 body that must be a JSON object, or raise BadReplyError.
+
+    The message names only the content type and the body length. It never
+    quotes the body, because a 200 body can be model output. The request was
+    served and may have been billed, so the caller must not retry it.
+
+    The content type is gateway text, so it is redacted, then made
+    printable, then cut. Redaction comes before any cut, or part of a key
+    can survive the cut.
     """
-    redacted = redact(body, secret)
-    cut = ERROR_BODY_CHARS
-    start = redacted.find(REDACTION, max(0, cut - len(REDACTION) + 1))
-    if 0 <= start < cut:
-        cut = start + len(REDACTION)
-    return redacted[:cut]
+    try:
+        data = response.json()
+    except RecursionError:
+        # The JSON decoder recurses once per nesting level, so a deep enough
+        # body raises here. It is a bad reply like any other.
+        kind = "JSON nested too deeply"
+    except ValueError:
+        kind = "not JSON"
+    else:
+        if isinstance(data, dict):
+            return data
+        kind = "JSON that is not an object"
+    content_type = cut_redacted(
+        printable(redact(response.headers.get("content-type", "none"), secret)),
+        CONTENT_TYPE_CHARS,
+    )
+    raise BadReplyError(
+        f"gateway reply is {kind} (content type {content_type}, {len(response.content)} bytes)"
+    )
 
 
 def _backoff(attempt: int) -> float:
@@ -128,9 +149,17 @@ async def call(
                     status=None,
                     attempts=attempt,
                 ) from None
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # A decoding error can follow a request the gateway served and
+            # billed, so any other client error is terminal and never retried.
+            raise GatewayError(
+                redact(f"{type(exc).__name__}: {exc}", secret),
+                status=None,
+                attempts=attempt,
+            ) from None
         else:
             if response.status_code == 200:
-                return dict(response.json())
+                return _reply_object(response, secret)
             last_status = response.status_code
             last_detail = _error_detail(response.text, secret)
             if not is_retryable(response.status_code, _elapsed()):
@@ -160,3 +189,30 @@ async def call(
         status=last_status,
         attempts=retries + 1,
     )
+
+
+def is_loopback(host: str | None) -> bool:
+    """Whether a host names this machine: localhost or a loopback address."""
+    if host is None:
+        # A missing host is reported by the URL check itself.
+        return True
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def make_client(base_url: str) -> httpx.AsyncClient:
+    """The one place a client is built.
+
+    A gateway on this machine is reached directly. A proxy from the
+    environment would receive the key in a header, and cleartext http is
+    allowed only for a loopback host. An explicit transport makes httpx skip
+    the proxy variables. TLS variables such as SSL_CERT_FILE still apply,
+    because the transport reads them itself.
+    """
+    if is_loopback(urlsplit(base_url).hostname):
+        return httpx.AsyncClient(transport=httpx.AsyncHTTPTransport())
+    return httpx.AsyncClient()

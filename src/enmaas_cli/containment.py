@@ -64,7 +64,7 @@ _RG_VALUES = _words(
 _GREP_VALUES = _words(
     """
 -d -D --label --binary-files --directories --devices --include --exclude --exclude-from
---exclude-dir --group-separator
+--exclude-dir --group-separator --include-from --from
 """
 )
 _SEARCH_SWITCHES = _words(
@@ -92,17 +92,19 @@ _GREP_SWITCHES = _words(
     """
 --extended-regexp --basic-regexp --perl-regexp --no-ignore-case --null-data
 --no-messages --byte-offset --line-buffered --silent --recursive --dereference-recursive
---initial-tab --no-group-separator --color --colour --binary
+--initial-tab --no-group-separator --color --colour --binary --ignore-files --config
 """
 ) | {"-" + char for char in "EFGPiwxzsvVbnHhoqaIrRLTZUlc"}
 _VALUE_OPTIONS = {
     "head": {"-n", "-c", "--lines", "--bytes"},
     "tail": {"-n", "-c", "--lines", "--bytes", "--sleep-interval"},
     "sed": {"-e", "-f", "--expression", "--file"},
-    "awk": {"-F", "-v", "-f", "-e", "--file", "--source"},
-    "gawk": {"-F", "-v", "-f", "-e", "--file", "--source"},
+    "awk": _words("-F -v -f -e --file --source -E --exec -i --include -l --load"),
+    "gawk": _words("-F -v -f -e --file --source -E --exec -i --include -l --load"),
     "cut": {"-b", "-c", "-f", "-d", "--bytes", "--characters", "--fields", "--delimiter"},
-    "sort": {"-k", "-t", "-S", "-o", "--key", "--field-separator", "--output"},
+    "sort": _words("-k -t -S -o --key --field-separator --output --files0-from --random-source"),
+    "diff": {"-X", "--exclude-from", "--from-file", "--to-file"},
+    "less": {"-k", "--lesskey-file", "--lesskey-src", "-T", "--tag-file"},
     "jq": {
         "-f",
         "--from-file",
@@ -115,6 +117,27 @@ _VALUE_OPTIONS = {
         "--slurpfile",
     },
 }
+# Options whose value names a file the reader opens and reads: a pattern,
+# script, ignore, key or name-list file. A tool can quote such a file in an
+# error, so it is checked even when the output holds only names or counts.
+# The grep set also names ugrep options, because some hosts run ugrep as grep.
+_GREP_INPUTS = _words("-f --file --exclude-from --include-from --from --ignore-files --config")
+_AWK_INPUTS = _words("-f --file -E --exec -i --include -l --load -D --debug")
+_INPUT_FILE_OPTIONS = {
+    "grep": _GREP_INPUTS,
+    "egrep": _GREP_INPUTS,
+    "fgrep": _GREP_INPUTS,
+    "rg": {"-f", "--file", "--ignore-file"},
+    "sed": {"-f", "--file"},
+    "awk": _AWK_INPUTS,
+    "gawk": _AWK_INPUTS,
+    "jq": {"-f", "--from-file", "--rawfile", "--slurpfile"},
+    "diff": {"-X", "--exclude-from", "--from-file", "--to-file"},
+    "sort": {"--files0-from", "--random-source"},
+    "less": {"-k", "--lesskey-file", "--lesskey-src", "-T", "--tag-file"},
+}
+# Short options whose value is optional and, when given, attached: gawk -Dfile.
+_ATTACHED_VALUE_OPTIONS = {"awk": {"-D"}, "gawk": {"-D"}}
 _PREFIX = "enmaas containment: "
 # Preserve quoted and escaped punctuation until command boundaries are checked.
 _QUOTED_PUNCTUATION = str.maketrans({char: chr(0xE000 + i) for i, char in enumerate(";&|()<>\n~")})
@@ -138,6 +161,37 @@ _SED_FILE_COMMAND = re.compile(
 _AWK_GETLINE_FILE = re.compile(r'getline\b[^<"\n;]*<\s*"([^"\n]*)"')
 _AWK_PIPE_GETLINE = re.compile(r'"([^"\n]*)"\s*\|&?\s*getline\b')
 _PROGRAM_READERS = {"sed", "awk", "gawk"}
+_HEREDOC_START = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([\w]+))")
+
+# Bash decodes these escapes inside $'...'. Any other escape is left to Bash
+# rules the guard does not copy, so the string counts as unreadable.
+_ANSI_C_ESCAPES = {
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+}
+_ANSI_C_OCTAL = re.compile(r"[0-7]{1,3}")
+_ANSI_C_HEX = {
+    "x": re.compile(r"[0-9A-Fa-f]{1,2}"),
+    "u": re.compile(r"[0-9A-Fa-f]{1,4}"),
+    "U": re.compile(r"[0-9A-Fa-f]{1,8}"),
+}
+# Stands in for a $'...' string the guard cannot read. A command that runs a
+# known reader with it anywhere in its words is denied, because the guard
+# cannot tell which file the reader opens.
+_UNRESOLVED = "\ue0ff"
+# Runs of text that hold no character the dollar quote pass acts on.
+_UNQUOTED_PLAIN = re.compile(r"[^\\'\"$`#<>()\n]+")
+_QUOTED_PLAIN = re.compile(r"[^\\\"$`]+")
 
 
 def _shell_value(value: str) -> str:
@@ -349,6 +403,10 @@ def _reader_arguments(name: str, args: list[str]) -> Iterator[tuple[str | None, 
                         yield "!unknown", []
                         break
                     values = []
+                    if option in _ATTACHED_VALUE_OPTIONS.get(name, set()):
+                        attached = token[position + 1 :]
+                        yield option, [attached] if attached else []
+                        break
                     if _option_arity(name, option):
                         value = token[position + 1 :]
                         if not value:
@@ -377,10 +435,19 @@ def _program_paths(name: str, programs: list[str]) -> list[str]:
     return paths
 
 
-def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None, bool, list[str]]:
-    """Return file operands, a search glob, metadata-only output, and program file names."""
+def _reader_operands(
+    name: str, args: list[str]
+) -> tuple[list[str], str | None, bool, list[str], list[str]]:
+    """Return file operands, a search glob, metadata-only output, program file names
+    and input files.
+
+    Input files are the values of options that name a file the reader opens as
+    input, kept apart from the files it searches or prints.
+    """
     operands: list[str] = []
     programs: list[str] = []
+    inputs: list[str] = []
+    input_options = _INPUT_FILE_OPTIONS.get(name, set())
     pattern: str | None = None
     expression_given = False
     metadata = False
@@ -401,27 +468,28 @@ def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None,
     for option, values in _reader_arguments(name, args):
         value = values[0] if values else ""
         if option is not None:
-            uncertain |= option == "!unknown" or (name == "rg" and option == "--json")
+            # A ugrep configuration file can change what a search prints.
+            uncertain |= (
+                option == "!unknown"
+                or (name == "rg" and option == "--json")
+                or (name in _SEARCHERS and option == "--config")
+            )
+            if option in input_options:
+                # --rawfile and --slurpfile name a variable before the file.
+                inputs.extend(values[1:] if option in {"--rawfile", "--slurpfile"} else values)
             if name == "jq":
                 if option in {"-f", "--from-file"}:
                     expression_given = True
-                    operands.extend(values)
-                elif option in {"--rawfile", "--slurpfile"}:
-                    operands.extend(values[1:])
                 elif option in {"--args", "--jsonargs"}:
                     data_arguments = True
-            elif expression_reader and option in {
-                "-e",
-                "--regexp",
-                "--expression",
-                "--source",
-                "-f",
-                "--file",
-            }:
+            elif expression_reader and (
+                option in {"-e", "--regexp", "--expression", "--source", "-f", "--file"}
+                or (name in {"awk", "gawk"} and option in {"-E", "--exec"})
+            ):
                 expression_given = True
-                if option in {"-f", "--file"}:
-                    operands.extend(values)
-                elif name in _PROGRAM_READERS:
+                if option in {"-e", "--regexp", "--expression", "--source"} and (
+                    name in _PROGRAM_READERS
+                ):
                     programs.extend(values)
             if option in {"-g", "--glob", "--include"} and not value.startswith("!"):
                 pattern = value if pattern is None else "*"
@@ -433,7 +501,10 @@ def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None,
                 programs.append(value)
         elif not data_arguments:
             operands.append(value)
-    return operands, pattern, metadata and not uncertain, _program_paths(name, programs)
+            if name == "strings" and value.startswith("@"):
+                # strings reads more options from the file named after @.
+                inputs.append(value[1:])
+    return operands, pattern, metadata and not uncertain, _program_paths(name, programs), inputs
 
 
 def _glob_matches(value: str, pattern: str) -> bool:
@@ -662,7 +733,7 @@ def _heredocs(command: str) -> tuple[str, list[str]]:
     lines = iter(command.splitlines(keepends=True))
     result: list[str] = []
     embedded: list[str] = []
-    delimiter = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([\w]+))")
+    delimiter = _HEREDOC_START
     quote: str | None = None
     for line in lines:
         pending: list[tuple[str, bool, bool]] = []
@@ -713,6 +784,7 @@ def _heredocs(command: str) -> tuple[str, list[str]]:
 def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | None, Path]:
     if not tokens:
         return None, cwd
+    words = tokens
     cleaned: list[str] = []
     index = 0
     while index < len(tokens):
@@ -741,6 +813,9 @@ def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | N
     if index >= len(tokens):
         return None, cwd
     name = Path(_shell_value(tokens[index])).name
+    if _UNRESOLVED in name or (name in _READERS and any(_UNRESOLVED in word for word in words)):
+        # The guard cannot tell which program runs, or which file a reader opens.
+        raise ValueError("dollar quoting the guard cannot read")
     args = [_shell_value(arg) for arg in tokens[index + 1 :]]
     if name == "cd" and len(args) == 1 and not any(c in args[0] for c in "$`*?["):
         return None, _path(args[0], cwd)
@@ -748,12 +823,18 @@ def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | N
         return _enmaas(args), cwd
     if name not in _READERS:
         return None, cwd
-    operands, pattern, metadata, program_paths = _reader_operands(name, args)
+    operands, pattern, metadata, program_paths, inputs = _reader_operands(name, args)
     for value in program_paths:
         # sed and awk open these names as files. A directory yields nothing.
         path = _path(value, cwd)
         if not path.is_dir() and is_protected(path):
             return _denial(path), cwd
+    for value in inputs:
+        if value in {"", "-", "/dev/stdin"}:
+            continue
+        reason = _literal_operand(value, cwd)
+        if reason:
+            return reason, cwd
     if metadata:
         return None, cwd
     if name in _SEARCHERS and not operands:
@@ -773,6 +854,195 @@ def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | N
         if reason:
             return reason, cwd
     return None, cwd
+
+
+def _ansi_c(body: str) -> str | None:
+    """Return the text Bash makes of $'body', or None when the guard cannot know it.
+
+    Bash cuts the string at a NUL, and escapes outside the supported list follow
+    rules the guard does not copy, so both give None. A byte that is not UTF-8
+    becomes the character Python uses for that byte in a file name.
+    """
+    data = bytearray()
+    index = 0
+    try:
+        while index < len(body):
+            end = body.find("\\", index)
+            end = len(body) if end < 0 else end
+            data += body[index:end].encode("utf-8", "surrogateescape")
+            if end == len(body):
+                break
+            index = end + 1
+            if index >= len(body):
+                return None
+            escape = body[index]
+            if escape in _ANSI_C_ESCAPES:
+                data += _ANSI_C_ESCAPES[escape].encode("ascii")
+                index += 1
+                continue
+            octal = _ANSI_C_OCTAL.match(body, index)
+            if octal:
+                # Bash keeps the low eight bits of an octal value above 0o377.
+                data.append(int(octal[0], 8) & 0xFF)
+                index = octal.end()
+                continue
+            pattern = _ANSI_C_HEX.get(escape)
+            digits = pattern.match(body, index + 1) if pattern else None
+            if digits is None:
+                return None
+            value = int(digits[0], 16)
+            index = digits.end()
+            if escape == "x":
+                data.append(value)
+            elif value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+                return None
+            else:
+                data += chr(value).encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if 0 in data:
+        return None
+    return os.fsdecode(bytes(data))
+
+
+def _plain_quoted(text: str | None) -> str:
+    """Write text in single quotes, with each quote and backslash escaped outside them.
+
+    Every later step reads that form already, so a decoded string needs no new
+    rule anywhere else.
+    """
+    if text is None:
+        return f"'{_UNRESOLVED}'"
+    if not text:
+        return "''"
+    return "".join(
+        "\\" + part if part in {"'", "\\"} else f"'{part}'"
+        for part in re.split(r"(['\\])", text)
+        if part
+    )
+
+
+def _dollar_quotes(command: str) -> str:
+    """Rewrite each $'...' as the text Bash makes of it, and each $"..." as "..."."""
+    return _requote(command, 0, "")[0]
+
+
+def _requote(command: str, index: int, closer: str) -> tuple[str, int]:
+    """Copy command from index up to an unquoted closer, rewriting dollar quotes.
+
+    closer is ")" inside $( ), <( ) and >( ), a backquote inside backquotes, and
+    empty for the whole command. Quotes, comments and heredoc bodies are copied
+    as they are, because Bash does not decode $'...' inside them. Returns the
+    copy and the index of the closer.
+    """
+    out: list[str] = []
+    quote = ""
+    depth = 0
+    word = False
+    heredocs: list[tuple[str, bool]] = []
+    while index < len(command):
+        if quote == "'":
+            end = command.find("'", index)
+            end = len(command) if end < 0 else end + 1
+            out.append(command[index:end])
+            quote = "" if command[end - 1] == "'" else quote
+            index = end
+            continue
+        # Copy text that holds nothing this pass acts on in one step.
+        plain = (_QUOTED_PLAIN if quote else _UNQUOTED_PLAIN).match(command, index)
+        if plain:
+            text = plain[0]
+            out.append(text)
+            index = plain.end()
+            word = bool(quote) or not (text[-1].isspace() or text[-1] in ";&|")
+            continue
+        char = command[index]
+        if char == "\\" or command.startswith("$$", index):
+            out.append(command[index : index + 2])
+            index += 2
+            word = True
+            continue
+        if closer == "`" and char == "`":
+            return "".join(out), index
+        opener = ""
+        if command.startswith("$(", index):
+            opener, end_char = "$(", ")"
+        elif char == "`":
+            opener, end_char = "`", "`"
+        elif not quote and command[index : index + 2] in {"<(", ">("}:
+            opener, end_char = command[index : index + 2], ")"
+        if opener:
+            inner, end = _requote(command, index + len(opener), end_char)
+            out.append(opener + inner + command[end : end + 1])
+            index = end + 1
+            word = True
+            continue
+        if quote == '"':
+            out.append(char)
+            quote = "" if char == '"' else quote
+            index += 1
+            continue
+        if closer == ")" and char in "()":
+            if char == ")" and depth == 0:
+                return "".join(out), index
+            depth += 1 if char == "(" else -1
+        if char == "#" and not word:
+            end = command.find("\n", index)
+            end = len(command) if end < 0 else end
+            out.append(command[index:end])
+            index = end
+            continue
+        if command.startswith("$'", index):
+            end = index + 2
+            while end < len(command) and command[end] != "'":
+                end += 2 if command[end] == "\\" else 1
+            if end >= len(command):
+                # Bash refuses an unfinished string. Later steps refuse it too.
+                out.append(command[index:])
+                index = len(command)
+                break
+            out.append(_plain_quoted(_ansi_c(command[index + 2 : end])))
+            index = end + 1
+            word = True
+            continue
+        if command.startswith('$"', index):
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            out.append(char)
+            index += 1
+            word = True
+            continue
+        if command.startswith("<<<", index):
+            out.append("<<<")
+            index += 3
+            word = False
+            continue
+        heredoc = _HEREDOC_START.match(command, index) if char == "<" else None
+        if heredoc:
+            heredocs.append((heredoc[2] or heredoc[3] or heredoc[4], bool(heredoc[1])))
+            out.append(heredoc[0])
+            index = heredoc.end()
+            word = True
+            continue
+        out.append(char)
+        index += 1
+        word = not (char.isspace() or char in ";&|()<>")
+        if char == "\n" and heredocs:
+            # Bash reads each body line by line up to its delimiter.
+            for delimiter, strip_tabs in heredocs:
+                while index < len(command):
+                    end = command.find("\n", index)
+                    end = len(command) if end < 0 else end + 1
+                    line = command[index:end]
+                    out.append(line)
+                    index = end
+                    candidate = line.lstrip("\t") if strip_tabs else line
+                    if candidate.rstrip("\r\n") == delimiter:
+                        break
+            heredocs = []
+    return "".join(out), index
 
 
 def _shell_syntax(command: str) -> str:
@@ -817,7 +1087,7 @@ def _shell_syntax(command: str) -> str:
 
 
 def _shell(command: str, cwd: Path) -> str | None:
-    command, embedded = _heredocs(command)
+    command, embedded = _heredocs(_dollar_quotes(command))
     command, substitutions = _substitutions(command)
     lexer = shlex.shlex(_shell_syntax(command), posix=True, punctuation_chars=";&|()<>\n")
     lexer.whitespace = " \t\r"

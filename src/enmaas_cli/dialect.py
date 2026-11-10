@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from .errors import BadReplyError, CallError, where
+
+# Re-exported so existing importers of these names from this module keep working.
+from .errors import EmptyResponseError as EmptyResponseError
+from .tokens import MAX_TOKEN_COUNT as MAX_TOKEN_COUNT
+from .tokens import Usage as Usage
 
 Dialect = Literal["anthropic", "openai"]
 
@@ -200,43 +208,6 @@ _TRUNCATED_STOPS = frozenset({"length", "max_tokens"})
 
 
 @dataclass(frozen=True)
-class Usage:
-    """Token counts normalised across dialects. None means 'not reported'.
-
-    `input_tokens` is the inclusive total on both dialects and
-    `cached_tokens` the subset of it that was a cache read.
-
-    `output_tokens` is likewise complete: on OpenAI it is
-    `completion_tokens`, which already contains reasoning, and
-    `reasoning_tokens` is a breakdown of it rather than an addition. On
-    Anthropic `reasoning_tokens` is always None because thinking is inside
-    `output_tokens`. Never sum the two.
-    """
-
-    input_tokens: int | None = None
-    cached_tokens: int | None = None
-    output_tokens: int | None = None
-    reasoning_tokens: int | None = None
-
-
-class EmptyResponseError(Exception):
-    """HTTP 200 but no usable text. Treated as a failure, never a success.
-
-    Carries the usage, because these tokens were charged. The gateway bills
-    a run that reasoned itself to death just as it bills a useful one, so a
-    budget that could not see this would be blind to the most expensive
-    failure the README documents.
-
-    Defined below Usage so the annotation resolves without a forward
-    reference.
-    """
-
-    def __init__(self, message: str, usage: Usage | None = None) -> None:
-        super().__init__(message)
-        self.usage = usage if usage is not None else Usage()
-
-
-@dataclass(frozen=True)
 class Completion:
     """A parsed response.
 
@@ -295,15 +266,16 @@ def _utf8_safe(text: str) -> tuple[str, int]:
 
 
 def _count(value: object) -> int | None:
-    """Return a token count only when it is a non-negative integer.
+    """Return a token count only when it is an integer from 0 to MAX_TOKEN_COUNT.
 
     The gateway's usage numbers flow into error messages, receipts, the
     --json object and the usage ledger. A string there was copied through
     unchanged, so a 9,000 character value grew every one of those, and
     "abc" was recorded as an input count. A bool is an int subclass in
-    Python, so it is excluded by name.
+    Python, so it is excluded by name. A value above the cap reads as not
+    reported, the same as a negative one.
     """
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_TOKEN_COUNT:
         return value
     return None
 
@@ -314,37 +286,86 @@ def _object(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _parse_openai(data: dict[str, Any]) -> Completion:
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
+def _string(value: object) -> str:
+    # Optional text fields read as empty when they hold any other type, so
+    # a quirk in a side field never costs the answer itself.
+    return value if isinstance(value, str) else ""
+
+
+def _stop(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _openai_usage(data: dict[str, Any]) -> Usage:
     usage = _object(data.get("usage"))
     details = _object(usage.get("completion_tokens_details"))
     prompt_details = _object(usage.get("prompt_tokens_details"))
-    text, text_replaced = _utf8_safe(message.get("content") or "")
+    return Usage(
+        # prompt_tokens already includes the cached portion.
+        input_tokens=_count(usage.get("prompt_tokens")),
+        cached_tokens=_count(prompt_details.get("cached_tokens")),
+        output_tokens=_count(usage.get("completion_tokens")),
+        reasoning_tokens=_count(details.get("reasoning_tokens")),
+    )
+
+
+def _openai_content(content: object, usage: Usage) -> str:
+    """Return the answer text from a message `content` field.
+
+    Missing, null or an empty list is empty. An empty list must read as empty
+    so that one cut off at the token limit still raises EmptyResponseError,
+    which tells the user to raise --max-tokens. A list of parts gives its
+    text parts joined in order. A non-empty list with no text part, or any
+    other type, is a reply this tool cannot read, so it fails rather than
+    passing as an empty answer.
+    """
+    if isinstance(content, str):
+        return content
+    if content is None or content == []:
+        return ""
+    if isinstance(content, list):
+        parts = [
+            part["text"]
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        ]
+        if parts:
+            return "".join(parts)
+        raise BadReplyError("reply content list holds no text part", usage)
+    raise BadReplyError(f"reply content is a {type(content).__name__}", usage)
+
+
+def _parse_openai(data: dict[str, Any]) -> Completion:
+    usage = _openai_usage(data)
+    choices = data.get("choices")
+    if choices is None or choices == []:
+        choice: dict[str, Any] = {}
+    elif isinstance(choices, list) and isinstance(choices[0], dict):
+        choice = choices[0]
+    else:
+        raise BadReplyError("reply choices is not a list of objects", usage)
+    message = choice.get("message")
+    if message is None:
+        message = {}
+    elif not isinstance(message, dict):
+        raise BadReplyError(f"reply message is a {type(message).__name__}", usage)
+    text, text_replaced = _utf8_safe(_openai_content(message.get("content"), usage))
     reasoning, reasoning_replaced = _utf8_safe(
-        message.get("reasoning_content") or message.get("reasoning") or ""
+        _string(message.get("reasoning_content")) or _string(message.get("reasoning"))
     )
     return Completion(
         text=text,
         reasoning=reasoning,
         replaced=text_replaced + reasoning_replaced,
-        stop=choice.get("finish_reason"),
-        usage=Usage(
-            # prompt_tokens already includes the cached portion.
-            input_tokens=_count(usage.get("prompt_tokens")),
-            cached_tokens=_count(prompt_details.get("cached_tokens")),
-            output_tokens=_count(usage.get("completion_tokens")),
-            reasoning_tokens=_count(details.get("reasoning_tokens")),
-        ),
+        stop=_stop(choice.get("finish_reason")),
+        usage=usage,
     )
 
 
-def _parse_anthropic(data: dict[str, Any]) -> Completion:
-    import json as json_module
-
-    blocks = data.get("content") or []
+def _anthropic_usage(data: dict[str, Any]) -> Usage:
     usage = _object(data.get("usage"))
-
     base = _count(usage.get("input_tokens"))
     cache_read = _count(usage.get("cache_read_input_tokens"))
     cache_write = _count(usage.get("cache_creation_input_tokens"))
@@ -354,19 +375,37 @@ def _parse_anthropic(data: dict[str, Any]) -> Completion:
         total_input = None
     else:
         total_input = (base or 0) + (cache_read or 0) + (cache_write or 0)
+    return Usage(
+        input_tokens=total_input,
+        cached_tokens=cache_read,
+        output_tokens=_count(usage.get("output_tokens")),
+        reasoning_tokens=None,
+    )
+
+
+def _parse_anthropic(data: dict[str, Any]) -> Completion:
+    usage = _anthropic_usage(data)
+    blocks = data.get("content")
+    if blocks is None:
+        blocks = []
+    elif not isinstance(blocks, list) or not all(isinstance(b, dict) for b in blocks):
+        raise BadReplyError("reply content is not a list of objects", usage)
 
     text_parts: list[str] = []
     for b in blocks:
         if b.get("type") == "text":
-            text_parts.append(b.get("text", ""))
+            block_text = b.get("text")
+            if block_text is not None and not isinstance(block_text, str):
+                raise BadReplyError(f"reply text block holds a {type(block_text).__name__}", usage)
+            text_parts.append(block_text or "")
         elif b.get("type") == "tool_use":
             tool_input = b.get("input", {})
-            text_parts.append(json_module.dumps(tool_input))
+            text_parts.append(json.dumps(tool_input))
 
     text, text_replaced = _utf8_safe("".join(text_parts))
     reasoning, reasoning_replaced = _utf8_safe(
         "".join(
-            b.get("thinking", "")
+            _string(b.get("thinking"))
             for b in blocks
             if b.get("type") in ("thinking", "redacted_thinking")
         )
@@ -375,19 +414,26 @@ def _parse_anthropic(data: dict[str, Any]) -> Completion:
         text=text,
         reasoning=reasoning,
         replaced=text_replaced + reasoning_replaced,
-        stop=data.get("stop_reason"),
-        usage=Usage(
-            input_tokens=total_input,
-            cached_tokens=cache_read,
-            output_tokens=_count(usage.get("output_tokens")),
-            reasoning_tokens=None,
-        ),
+        stop=_stop(data.get("stop_reason")),
+        usage=usage,
     )
 
 
 def parse_response(data: dict[str, Any], dialect: Dialect) -> Completion:
-    """Parse a 200 response, raising when it contains nothing usable."""
-    completion = _parse_anthropic(data) if dialect == "anthropic" else _parse_openai(data)
+    """Parse a 200 response, raising when it contains nothing usable.
+
+    Every failure is a CallError that carries the reply's usage, because
+    those tokens were billed. An unexpected error inside a parser becomes a
+    BadReplyError naming only its class and where it was raised, since its
+    text could quote the reply.
+    """
+    try:
+        completion = _parse_anthropic(data) if dialect == "anthropic" else _parse_openai(data)
+    except CallError:
+        raise
+    except Exception as exc:
+        usage = _anthropic_usage(data) if dialect == "anthropic" else _openai_usage(data)
+        raise BadReplyError(f"reply could not be read ({where(exc)})", usage) from None
     if not completion.text and completion.stop in _TRUNCATED_STOPS:
         out = completion.usage.output_tokens
         raise EmptyResponseError(

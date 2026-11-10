@@ -4,37 +4,42 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import enum
 import importlib.metadata
-import ipaddress
 import json
+import math
 import os
+import signal
 import sys
 import time
+import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn, TextIO, cast
 from urllib.parse import urlsplit
 
 import httpx
 
-from .auth import AuthError, redact, resolve_key
+from . import openruns
+from .auth import AuthError, cut_redacted, printable, printable_block, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
-from .client import GatewayError, call
+from .client import _reply_object, call, is_loopback, make_client
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
+    Completion,
     Dialect,
     DialectError,
-    EmptyResponseError,
     Usage,
     build_request,
     default_max_tokens,
     parse_response,
     resolve_dialect,
 )
+from .errors import BadReplyError, CallError, where
 from .outputs import (
     MAX_INSPECT_CHARS,
     allow_read,
@@ -43,17 +48,27 @@ from .outputs import (
     state_root,
     write_output,
 )
-from .receipts import ask_receipt, create_run_dir, map_receipt, prune_runs
+from .receipts import (
+    FAILURE_LIMIT,
+    FAILURE_MESSAGE_CHARS,
+    ask_receipt,
+    create_run_dir,
+    map_receipt,
+    prune_runs,
+)
 from .runner import run_map
 from .schema import ValidationError, load_schema, validate_against_schema
+from .tokens import MAX_TOKEN_COUNT
 from .usage import (
+    LedgerWrite,
     UsageEvent,
-    append_event,
+    can_append,
     format_summary,
     format_summary_json,
-    load_events,
+    load_events_counted,
     load_events_strict,
     summarize_usage,
+    write_event,
 )
 
 BASE_URL_ENV = "ENMAAS_BASE_URL"
@@ -101,6 +116,10 @@ def nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value} is not an integer") from None
     if number < 0:
         raise argparse.ArgumentTypeError(f"{value} is negative")
+    # One count from the command line, held to the same limit as one count
+    # from a reply. Recorded sums are clamped to MAX_RECORDED when written.
+    if number > MAX_TOKEN_COUNT:
+        raise argparse.ArgumentTypeError(f"{value} is above {MAX_TOKEN_COUNT}")
     return number
 
 
@@ -109,6 +128,9 @@ def nonnegative_float(value: str) -> float:
         number = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value} is not a number") from None
+    # The ledger reader refuses nan and inf, so they are never written.
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"{value} is not a finite number")
     if number < 0:
         raise argparse.ArgumentTypeError(f"{value} is negative")
     return number
@@ -303,6 +325,43 @@ class AskResult:
     # Kept apart from completion: an empty answer has no completion, yet
     # its tokens were billed and must count against the budget.
     usage: Usage | None = None
+    # The failure's class name, for the ledger. Taken from the exception
+    # itself, because a message can mention any word.
+    error_kind: str | None = None
+
+
+def _failed_after_reply(
+    model: str,
+    model_mark: str,
+    resolved: Dialect,
+    path: Path,
+    started: float,
+    completion: Completion,
+    *,
+    error: str,
+    error_kind: str,
+) -> AskResult:
+    """The result of an ask that failed after the gateway replied.
+
+    It keeps the reply's usage, because the request was billed. The answer
+    may not have been saved, so the result carries no completion.
+    """
+    return AskResult(
+        receipt=(
+            f"enmaas ask FAILED\n"
+            f"  model     {model}{model_mark}  ({resolved} dialect)\n"
+            f"  error     {printable(error)}"
+        ),
+        path=path,
+        exit_code=ExitCode.ERROR,
+        model=model,
+        dialect=resolved,
+        completion=None,
+        elapsed=time.monotonic() - started,
+        error=error,
+        usage=completion.usage,
+        error_kind=error_kind,
+    )
 
 
 async def run_ask(
@@ -356,14 +415,15 @@ async def run_ask(
     try:
         data = await call(client, base_url, request, timeout=timeout, retries=retries, secret=key)
         completion = parse_response(data, resolved)
-    except (GatewayError, EmptyResponseError) as exc:
+    except CallError as exc:
         elapsed = time.monotonic() - started
         error_msg = redact(str(exc), key)
         return AskResult(
             receipt=(
                 f"enmaas ask FAILED\n"
                 f"  model     {model}{model_mark}  ({resolved} dialect)\n"
-                f"  error     {error_msg}"
+                # Printable on one line: the message can hold gateway text.
+                f"  error     {printable(error_msg)}"
             ),
             path=path,
             exit_code=ExitCode.ERROR,
@@ -372,49 +432,79 @@ async def run_ask(
             completion=None,
             elapsed=elapsed,
             error=error_msg,
-            usage=exc.usage if isinstance(exc, EmptyResponseError) else None,
+            # Usage() means the reply reported nothing, which is not a charge.
+            usage=exc.usage if exc.usage != Usage() else None,
+            error_kind=type(exc).__name__,
         )
 
-    if schema is not None:
-        try:
-            validate_against_schema(completion.text, schema)
-        except ValidationError as exc:
-            elapsed = time.monotonic() - started
-            error_msg = str(exc)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            write_output(path, completion.text)
-            # The altered response is still written to disk above, so the
-            # repair has to be reported even on the failure path. Without
-            # this, a schema error would be the only thing mentioned while
-            # the saved file silently differs from what the model sent.
-            repaired = (
-                f"\n  warning   {completion.replaced} character(s) could not be "
-                f"encoded and became U+FFFD"
-                if completion.replaced
-                else ""
-            )
-            return AskResult(
-                receipt=(
-                    f"enmaas ask FAILED\n"
-                    f"  model     {model}{model_mark}  ({resolved} dialect)\n"
-                    f"  output    {path}\n"
-                    f"  error     {error_msg}{repaired}"
-                ),
-                path=path,
-                exit_code=ExitCode.ERROR,
-                model=model,
-                dialect=resolved,
-                completion=completion,
-                elapsed=elapsed,
-                error=error_msg,
-                usage=completion.usage,
-            )
+    # The gateway billed the request once the reply arrived. A failure from
+    # here on still returns a result that carries the usage, so the ledger
+    # event is written. CancelledError is not an Exception and passes through.
+    try:
+        if schema is not None:
+            try:
+                validate_against_schema(completion.text, schema)
+            except ValidationError as exc:
+                elapsed = time.monotonic() - started
+                error_msg = str(exc)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_output(path, completion.text)
+                # The altered response is still written to disk above, so the
+                # repair has to be reported even on the failure path. Without
+                # this, a schema error would be the only thing mentioned while
+                # the saved file silently differs from what the model sent.
+                repaired = (
+                    f"\n  warning   {completion.replaced} character(s) could not be "
+                    f"encoded and became U+FFFD"
+                    if completion.replaced
+                    else ""
+                )
+                return AskResult(
+                    receipt=(
+                        f"enmaas ask FAILED\n"
+                        f"  model     {model}{model_mark}  ({resolved} dialect)\n"
+                        f"  output    {printable(str(path))}\n"
+                        f"  error     {printable(error_msg)}{repaired}"
+                    ),
+                    path=path,
+                    exit_code=ExitCode.ERROR,
+                    model=model,
+                    dialect=resolved,
+                    completion=completion,
+                    elapsed=elapsed,
+                    error=error_msg,
+                    usage=completion.usage,
+                    error_kind="ValidationError",
+                )
 
-    elapsed = time.monotonic() - started
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_output(path, completion.text)
-    if save_thinking and completion.reasoning:
-        write_output(run_dir / "thinking.md", completion.reasoning)
+        elapsed = time.monotonic() - started
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_output(path, completion.text)
+        if save_thinking and completion.reasoning:
+            write_output(run_dir / "thinking.md", completion.reasoning)
+    except OSError as exc:
+        return _failed_after_reply(
+            model,
+            model_mark,
+            resolved,
+            path,
+            started,
+            completion,
+            error=redact(str(exc), key),
+            error_kind="OSError",
+        )
+    except Exception as exc:
+        # Never the exception text, which could quote the reply or the prompt.
+        return _failed_after_reply(
+            model,
+            model_mark,
+            resolved,
+            path,
+            started,
+            completion,
+            error=f"internal error ({where(exc)})",
+            error_kind=type(exc).__name__,
+        )
 
     return AskResult(
         receipt=ask_receipt(
@@ -423,6 +513,7 @@ async def run_ask(
             completion=completion,
             path=path,
             elapsed=elapsed,
+            key=key,
             model_defaulted=model_defaulted,
         ),
         path=path,
@@ -457,8 +548,18 @@ async def run_models(
         )
         response = await client.get(f"{base_url}/v1/models", headers=headers, timeout=timeout)
         response.raise_for_status()
-        for entry in response.json().get("data", []):
-            found.setdefault(str(entry.get("id")), set()).add(d)
+        # A catalog of the wrong shape is a bad reply. The messages name
+        # the problem only, never the body.
+        body = _reply_object(response, key)
+        entries = body.get("data")
+        if not isinstance(entries, list):
+            raise BadReplyError(f"the {d} model catalog has no list of models")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                raise BadReplyError(
+                    f"the {d} model catalog holds an entry that is not an object with a string id"
+                )
+            found.setdefault(entry["id"], set()).add(d)
     return [
         {"id": model_id, "dialects": sorted(dialects)}
         for model_id, dialects in sorted(found.items())
@@ -475,19 +576,27 @@ def _read_prompt(args: argparse.Namespace) -> str:
     raise ValueError("no prompt: pass -p, --prompt-file, or pipe text on stdin")
 
 
-def _warn_if_untracked(recorded: bool, config: Config) -> None:
-    """Say so when spend a budget depends on was not written down.
+def _warn_if_untracked(written: LedgerWrite, config: Config) -> None:
+    """Say so when a ledger row was not written down.
 
-    An unwritable ledger looks exactly like one showing no spend, so a
-    configured ceiling would quietly stop binding. The work is already
-    paid for, so this warns rather than failing.
+    A write that was tried and failed is always reported, budget or not:
+    otherwise a user whose ledger stopped taking rows, for example because
+    it is a link an older version followed, learns nothing until the
+    totals look wrong. An unwritable ledger also looks exactly like one
+    showing no spend, so a configured ceiling would quietly stop binding.
+    The work is already paid for, so this warns rather than failing.
     """
-    if not recorded and config.budget_tokens is not None:
+    if written.failure is not None:
+        print(f"warning: usage was not recorded: {written.failure}", file=sys.stderr)
+    if not written.recorded and config.budget_tokens is not None:
         print(
             "warning: a token budget is configured but this run's usage was "
             "not recorded, so it will not count against the ceiling",
             file=sys.stderr,
         )
+
+
+MAX_PROBLEMS_SHOWN = 5
 
 
 @dataclass(frozen=True)
@@ -524,29 +633,56 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
             ),
         )
 
-    events, problems = load_events_strict(ledger)
-    if problems:
-        # An unreadable ledger is indistinguishable from one showing zero
-        # spend. Without a budget configured this would only warn.
+    # Runs with a record still present have not written their ledger event
+    # yet. Their spend so far counts, so two runs side by side cannot each
+    # see the whole allowance. Read before the ledger: a run that ends
+    # between the two reads is then counted twice for this one check, never
+    # zero times.
+    opened = openruns.open_charge(ledger.parent)
+    if not opened.complete:
+        # Some spend could not be read. Sending on a guess could pass the
+        # ceiling, so the command refuses.
         return RollingCheck(
             0,
             config.budget_tokens,
             message=(
-                "a token budget is configured but the usage ledger could not "
-                f"be read: {'; '.join(problems[:3])}"
+                f"open-run records in {ledger.parent / openruns.OPEN_RUNS_FILE} could not "
+                "all be read, so the token budget cannot be checked; run the command "
+                "again, or delete that file if you did not create it"
+            ),
+        )
+    live = opened.charge
+    events, problems = load_events_strict(ledger)
+    if problems:
+        # An unreadable ledger is indistinguishable from one showing zero
+        # spend. Without a budget configured this would only warn. A few
+        # problems are enough to find the file, and the count bounds the
+        # message.
+        shown = "; ".join(problems[:MAX_PROBLEMS_SHOWN])
+        if len(problems) > MAX_PROBLEMS_SHOWN:
+            shown += f"; and {len(problems) - MAX_PROBLEMS_SHOWN} more"
+        return RollingCheck(
+            0,
+            config.budget_tokens,
+            message=(
+                f"a token budget is configured but the usage ledger {printable(str(ledger))} "
+                f"could not be read: {shown}"
             ),
         )
 
-    spent = rolling_spend(events, window_days=config.budget_window_days)
+    spent = rolling_spend(events, window_days=config.budget_window_days) + live
     if spent >= config.budget_tokens:
-        return RollingCheck(
-            spent,
-            config.budget_tokens,
-            message=(
-                f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
-                f"{config.budget_window_days} days"
-            ),
+        message = (
+            f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
+            f"{config.budget_window_days} days"
         )
+        if live:
+            # The path lets the user find a record that should not be there.
+            message += (
+                f", including {live:,} in runs still open "
+                f"({ledger.parent / openruns.OPEN_RUNS_FILE})"
+            )
+        return RollingCheck(spent, config.budget_tokens, message=message)
     return RollingCheck(spent, config.budget_tokens, message=None)
 
 
@@ -570,18 +706,6 @@ def resolve_base_url(configured: str | None, env: Mapping[str, str], config_path
     return _validate_gateway_url(url)
 
 
-def _is_loopback(host: str | None) -> bool:
-    if host is None:
-        # A missing host is reported by its own check below.
-        return True
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def _validate_gateway_url(url: str) -> str:
     def invalid(reason: str) -> ValueError:
         return ValueError(f"gateway URL is not valid ({reason}): {url}")
@@ -598,7 +722,7 @@ def _validate_gateway_url(url: str) -> str:
     # The key travels in a header, so cleartext http would send it across
     # the network readable to anyone on the path. A local gateway or
     # tunnel is the only place where that is safe.
-    if parts.scheme.lower() == "http" and not _is_loopback(parts.hostname):
+    if parts.scheme.lower() == "http" and not is_loopback(parts.hostname):
         raise invalid("http is only allowed for localhost, use https")
     # Checked on the raw text: "https://h?" has an empty query, yet the
     # appended request path would still land after the "?".
@@ -622,7 +746,7 @@ def _validate_gateway_url(url: str) -> str:
 
 
 def _setup_error(args: argparse.Namespace, message: str) -> int:
-    """Report a URL or key failure before any request is made.
+    """Report an error that ends the command, as its one result.
 
     A --json caller reads stdout only, so an error there must be JSON too.
     An empty stdout would leave it guessing why the run stopped.
@@ -634,12 +758,203 @@ def _setup_error(args: argparse.Namespace, message: str) -> int:
     return int(ExitCode.ERROR)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _error_text(message: str, key: str) -> str:
+    """The text of an error that ends a command.
+
+    The key is removed first, then the text is made printable on one line,
+    then cut. Redaction comes before the cut, or part of a key could survive.
+    """
+    return cut_redacted(printable(redact(message, key)), FAILURE_MESSAGE_CHARS)
+
+
+def _emit(text: str, stream: TextIO | None = None) -> None:
+    """Print one block and flush it. A reader that went away is not an error.
+
+    The work is done and recorded before anything is printed, so a closed
+    pipe must not turn a finished run into a failure or a traceback. The
+    stream defaults to the current sys.stdout at call time, not at import.
+    """
+    target = sys.stdout if stream is None else stream
+    try:
+        print(text, file=target, flush=True)
+    except BrokenPipeError:
+        # Point the descriptor at /dev/null, so the flush at exit also
+        # succeeds and Python does not report the closed pipe.
+        with contextlib.suppress(OSError, ValueError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, target.fileno())
+            finally:
+                os.close(devnull)
+
+
+@dataclass
+class Interrupt:
+    """The first stop signal this process received, if any."""
+
+    signum: int | None = None
+    # Set once the interrupted error has been printed, so it is printed once.
+    reported: bool = False
+
+
+@dataclass
+class Final:
+    """The exit code of a command that has finished and is printing its result.
+
+    Set by _dispatch just before the final output of every command,
+    refusals and errors included. From then on a stop signal changes
+    nothing: the ledger already says what happened, and the process exits
+    with this code. The one exception is a result that itself reports the
+    interrupt, which ends by the signal.
+    """
+
+    code: int | None = None
+    # True when the printed result is a run stopped by the signal.
+    interrupted: bool = False
+
+    def overrides(self, interrupt: Interrupt) -> bool:
+        """Whether this result decides the exit, so a pending signal is dropped."""
+        if self.code is None or self.interrupted:
+            return False
+        interrupt.signum = None
+        return True
+
+
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+async def _guarded(
+    args: argparse.Namespace,
+    config: Config,
+    base_url: str,
+    key: str,
+    interrupt: Interrupt,
+    final: Final,
+    *,
+    process: bool = False,
+) -> int:
+    """Run the command with SIGINT and SIGTERM handled the way asyncio.Runner handles SIGINT.
+
+    The first signal cancels the command, so an interrupted map writes its
+    ledger event and prints its receipt before the process ends by the same
+    signal. The second signal ends the process at once, even while it waits
+    on a lock or a file, because a Python signal handler runs when a
+    blocking system call is interrupted.
+
+    Installed with signal.signal. A signal that is ignored when the command
+    starts stays ignored. In-process, the previous handlers are put back on
+    the way out, so calling main leaves them as they were. In process mode
+    they are not: both signals are ignored from then on, because a handler
+    put back would let a late signal end a finished run by its default
+    action or print a traceback after main returned.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+
+    def cancel() -> None:
+        # The result may have been reported by the time this runs. A cancel
+        # then changes nothing, so none is sent.
+        if final.code is None and task is not None:
+            task.cancel()
+
+    def on_signal(signum: int, frame: object) -> None:
+        if final.code is not None and not final.interrupted:
+            # The command finished, recorded and is printing its result. A
+            # signal now changes nothing, so it is not even recorded.
+            return
+        if interrupt.signum is None:
+            interrupt.signum = signum
+            if final.code is not None:
+                # The command finished and printed. A cancel now changes
+                # nothing, so none is sent.
+                return
+            # Scheduled, not called here. A Python signal handler can run in
+            # the middle of another callback, and cancelling there can cancel
+            # a future between its done() check and set_result(). This also
+            # wakes the loop, as asyncio.Runner does for SIGINT.
+            loop.call_soon_threadsafe(cancel)
+            return
+        # Second signal. End now by that signal. An open-run record that is
+        # still present is settled by the next command, so the spend is kept.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    previous: dict[int, Any] = {}
+    for signum in STOP_SIGNALS:
+        # ValueError: not the main thread. OSError: the platform refused.
+        with contextlib.suppress(ValueError, OSError):
+            if signal.getsignal(signum) is signal.SIG_IGN:
+                # A background job started with the signal ignored keeps
+                # ignoring it.
+                continue
+            previous[signum] = signal.signal(signum, on_signal)
+    try:
+        code = await _dispatch(args, config, base_url, key, final)
+        # A cancel that arrived after the work was done can be absorbed by
+        # an await on the way out, such as closing the client. The printed
+        # result still decides the exit.
+        final.overrides(interrupt)
+        return code
+    except asyncio.CancelledError:
+        if final.code is not None:
+            # The command had finished and printed before the cancel was
+            # seen. It exits with its own code, or by the signal when the
+            # result reports the interrupt.
+            final.overrides(interrupt)
+            return final.code
+        interrupt.reported = True
+        return _setup_error(args, "interrupted")
+    finally:
+        for number, handler in previous.items():
+            with contextlib.suppress(ValueError, OSError):
+                if process:
+                    signal.signal(number, signal.SIG_IGN)
+                else:
+                    # A previous handler of None was not set from Python and
+                    # cannot be passed back; the default is the nearest.
+                    signal.signal(number, signal.SIG_DFL if handler is None else handler)
+
+
+def _final_error(args: argparse.Namespace, final: Final, interrupt: Interrupt, message: str) -> int:
+    """Print an error that escaped the command, as the command's result.
+
+    The exit code is set before the print, as for every final output, so a
+    stop signal from then on changes nothing. If the command had already
+    printed its result, a second JSON object would break a --json reader,
+    so the error goes to stderr as text and the result's code stands.
+    """
+    if final.code is None:
+        final.code = int(ExitCode.ERROR)
+        _setup_error(args, message)
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    code = final.code
+    final.overrides(interrupt)
+    return code
+
+
+def _flush_quietly() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+
+
+def main(argv: list[str] | None = None, *, process: bool = False) -> int:
+    """Run one command and return its exit code.
+
+    `process` is True only for the console script. Then the stop signals are
+    not put back when the command ends: the process either ends by a signal
+    it recorded, or returns its code with both signals ignored until it
+    exits. In-process callers keep their own handlers.
+    """
     args = build_parser().parse_args(argv)
     if args.command in {"inspect", "allow-read"}:
         try:
             if args.command == "inspect":
-                sys.stdout.write(inspect_file(args.path, max_chars=args.max_chars))
+                # The file can hold an answer, so its text is printed inert.
+                # Its lines and tabs are kept.
+                text = inspect_file(args.path, max_chars=args.max_chars)
+                sys.stdout.write(printable_block(text))
             else:
                 allow_read(args.path)
         except (OSError, ValueError) as exc:
@@ -653,6 +968,8 @@ def main(argv: list[str] | None = None) -> int:
         # A malformed [budget] table is the only fatal config error.
         # Proceeding would run uncapped, which is what it was written to
         # prevent, so refuse rather than warn.
+        if getattr(args, "json", False):
+            return _setup_error(args, _error_text(str(exc), ""))
         print(f"enmaas: {exc}", file=sys.stderr)
         return 1
     for warning in config.warnings:
@@ -681,21 +998,74 @@ def main(argv: list[str] | None = None) -> int:
             print(f"warning: {key.warning}", file=sys.stderr)
         key_value = key.value
 
+    interrupt = Interrupt()
+    final = Final()
     try:
-        return asyncio.run(_dispatch(args, config, base_url, key_value))
-    except (DialectError, ValidationError, ValueError, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return int(ExitCode.ERROR)
+        try:
+            code = asyncio.run(
+                _guarded(args, config, base_url, key_value, interrupt, final, process=process)
+            )
+        except asyncio.CancelledError:
+            # A cancel that was still pending when the command returned
+            # cancels the task itself, outside every handler in _guarded.
+            if final.code is not None:
+                final.overrides(interrupt)
+                code = final.code
+            else:
+                if not interrupt.reported:
+                    interrupt.reported = True
+                    _setup_error(args, "interrupted")
+                code = int(ExitCode.ERROR)
+        except (DialectError, ValidationError, ValueError, OSError) as exc:
+            code = _final_error(args, final, interrupt, _error_text(str(exc), key_value))
+        except Exception as exc:
+            # Never the exception text: an error no handler expected can
+            # carry part of a reply or a prompt. Where it happened is enough
+            # to report it. CancelledError and KeyboardInterrupt are not
+            # Exception subclasses, so they reach the handlers for them.
+            message = f"internal error ({where(exc)})"
+            code = _final_error(args, final, interrupt, _error_text(message, key_value))
+            if os.environ.get("ENMAAS_DEBUG") == "1":
+                print(redact(traceback.format_exc(), key_value), file=sys.stderr, end="")
+        if interrupt.signum is not None:
+            # A further signal while the output is flushed must not raise.
+            for signum in STOP_SIGNALS:
+                signal.signal(signum, signal.SIG_IGN)
+            _flush_quietly()
+    except KeyboardInterrupt:
+        # SIGINT outside the window where _guarded handles it, either before
+        # its handler is installed or after it is removed.
+        if final.overrides(interrupt) and final.code is not None:
+            # The command had finished and printed. Nothing changes.
+            code = final.code
+        else:
+            if interrupt.signum is None:
+                interrupt.signum = signal.SIGINT
+            if not interrupt.reported and final.code is None:
+                # A --json caller still gets one object.
+                interrupt.reported = True
+                _setup_error(args, "interrupted")
+            code = int(ExitCode.ERROR)
+    if interrupt.signum is not None:
+        # End by the same signal, so the parent sees how the process stopped
+        # (130 or 143 in a shell) rather than an ordinary exit code.
+        _flush_quietly()
+        signal.signal(interrupt.signum, signal.SIG_DFL)
+        os.kill(os.getpid(), interrupt.signum)
+        return 128 + interrupt.signum
+    return code
 
 
-async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key: str) -> int:
+async def _dispatch(
+    args: argparse.Namespace, config: Config, base_url: str, key: str, final: Final
+) -> int:
     if args.command == "record":
         # A ledger that only sees this CLI's own calls understates reality:
         # a tool talking to the gateway directly is invisible by
         # construction. Recording is a subcommand rather than a library
         # function so a caller in any language can be counted without
         # taking a dependency on this package.
-        recorded = append_event(
+        written = write_event(
             state_root() / "usage.jsonl",
             UsageEvent(
                 timestamp=datetime.now(UTC),
@@ -725,13 +1095,29 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 ),
             ),
         )
-        _warn_if_untracked(recorded, config)
+        # Set before every final output, here and below, so a stop signal
+        # from then on changes nothing.
+        final.code = int(ExitCode.OK)
+        _warn_if_untracked(written, config)
         return int(ExitCode.OK)
 
     # Handle usage command first (no timeout argument)
     if args.command == "usage":
         ledger = state_root() / "usage.jsonl"
-        events = load_events(ledger)
+        events, skipped, not_regular = load_events_counted(ledger)
+        final.code = int(ExitCode.OK)
+        if not_regular:
+            print(
+                f"warning: {printable(str(ledger))} is not a regular file, "
+                "so no usage was read from it",
+                file=sys.stderr,
+            )
+        if skipped:
+            print(
+                f"warning: {skipped} rows of {printable(str(ledger))} could not be read "
+                "and were skipped",
+                file=sys.stderr,
+            )
 
         if args.since is not None:
             cutoff = datetime.now(UTC) - timedelta(days=args.since)
@@ -740,16 +1126,22 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
         summary = summarize_usage(events)
 
         if args.json:
-            print(format_summary_json(summary, config.prices))
+            print(format_summary_json(summary, config.prices, skipped_rows=skipped))
         else:
             print(format_summary(summary, since_days=args.since, prices=config.prices))
 
         return int(ExitCode.OK)
 
+    if args.command in ("ask", "map"):
+        # Charge any map run that died without writing its ledger event,
+        # before the budget is checked, so the check sees that spend.
+        openruns.settle(state_root(), state_root() / "usage.jsonl")
+
     # Both spending commands pass through here. Checked before the client
     # is opened, so an over-budget invocation costs nothing at all.
     rolling = rolling_check(config, state_root() / "usage.jsonl")
     if rolling.message and args.command in ("ask", "map"):
+        final.code = int(ExitCode.ABORTED)
         if getattr(args, "json", False):
             # Exit 3 already means "stopped early", so a bare exit code
             # cannot distinguish a budget refusal from a breaker abort.
@@ -780,8 +1172,23 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
             )
         return int(ExitCode.ABORTED)
 
+    if (
+        args.command in ("ask", "map")
+        and rolling.ceiling is not None
+        and not can_append(state_root() / "usage.jsonl")
+    ):
+        # A ledger that cannot be written reads as no spend on the next run,
+        # so every run would start from zero and the budget would never bind.
+        final.code = int(ExitCode.ERROR)
+        return _setup_error(
+            args,
+            f"the usage ledger {printable(str(state_root() / 'usage.jsonl'))} cannot be "
+            "written, so the token budget cannot be tracked; fix it or remove the [budget] "
+            "table from the config",
+        )
+
     timeout = args.timeout if args.timeout is not None else config.timeout
-    async with httpx.AsyncClient() as client:
+    async with make_client(base_url) as client:
         if args.command == "models":
             try:
                 rows = await run_models(
@@ -791,14 +1198,24 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                     dialect=args.dialect or "both",
                     timeout=timeout,
                 )
-            except httpx.HTTPError as exc:
-                print(f"error: {redact(str(exc), key)}", file=sys.stderr)
-                return int(ExitCode.ERROR)
+            except (httpx.HTTPError, CallError) as exc:
+                final.code = int(ExitCode.ERROR)
+                return _setup_error(args, _error_text(str(exc), key))
+            final.code = int(ExitCode.OK)
             if args.json:
-                print(json.dumps(rows, indent=2))
+                # The same redaction as the text list. JSON encoding already
+                # escapes control characters, so nothing else is needed.
+                print(
+                    json.dumps(
+                        [{**row, "id": redact(row["id"], key)} for row in rows],
+                        indent=2,
+                    )
+                )
             else:
                 for row in rows:
-                    print(f"{row['id']:<45} {','.join(row['dialects'])}")
+                    # A catalog id is gateway text, so it is printed inert.
+                    model_id = printable(redact(row["id"], key))
+                    print(f"{model_id:<45} {','.join(row['dialects'])}")
             return int(ExitCode.OK)
 
         if args.command == "ask":
@@ -826,20 +1243,8 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 model_defaulted=model_defaulted,
             )
 
-            # Log usage
             usage_obj = result.usage
-            error_kind = None
-            if result.error:
-                # Extract error kind from error message
-                if "GatewayError" in result.error or "gateway" in result.error.lower():
-                    error_kind = "GatewayError"
-                elif "EmptyResponseError" in result.error or "exhausted max_tokens" in result.error:
-                    error_kind = "EmptyResponseError"
-                elif "ValidationError" in result.error or "validation" in result.error.lower():
-                    error_kind = "ValidationError"
-                else:
-                    error_kind = "Error"
-            recorded = append_event(
+            written = write_event(
                 state_root() / "usage.jsonl",
                 UsageEvent(
                     timestamp=datetime.now(UTC),
@@ -853,14 +1258,17 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                     elapsed=result.elapsed,
                     status="ok" if result.exit_code == ExitCode.OK else "error",
                     schema_used=args.schema is not None,
-                    error_kind=error_kind,
+                    error_kind=result.error_kind,
                     items_total=None,
                     items_ok=None,
                     items_failed=None,
                     charge=metered(usage_obj) if usage_obj else 0,
                 ),
             )
-            _warn_if_untracked(recorded, config)
+            _warn_if_untracked(written, config)
+            # Reported before the result is printed. From here a stop signal
+            # changes nothing.
+            final.code = result.exit_code
 
             if args.json:
                 # Machine-readable output
@@ -883,18 +1291,25 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                     "replaced": (result.completion.replaced if result.completion else 0),
                     "error": result.error,
                 }
-                print(json.dumps(ask_obj, indent=2))
+                _emit(json.dumps(ask_obj, indent=2))
             elif args.stdout and result.exit_code == ExitCode.OK:
-                print(result.completion.text if result.completion else "")
-                print(result.receipt, file=sys.stderr)
+                _emit(result.completion.text if result.completion else "")
+                _emit(result.receipt, sys.stderr)
             else:
                 stream = sys.stdout if result.exit_code == ExitCode.OK else sys.stderr
-                print(result.receipt, file=stream)
+                _emit(result.receipt, stream)
             return result.exit_code
 
         model, model_defaulted = _resolve_model(args.model, config)
         dialect = _resolve_dialect_override(model, args.dialect, config)
         batch_defaulted = args.batch is None
+        # Resolved before the run, because the open-run record carries it.
+        resolved_dialect = resolve_dialect(model, dialect)
+        # When run_map raises, the record stays on purpose. The next ask or
+        # map settles it, so spend from a run that died on an error counts.
+        record = openruns.begin(
+            state_root(), outdir=args.outdir, model=model, dialect=resolved_dialect
+        )
 
         outcome = await run_map(
             client=client,
@@ -923,10 +1338,10 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 if rolling.ceiling is not None
                 else None
             ),
+            # Tags the charge rows, so a settle counts only this run's rows.
+            run_id=record.run_id if record is not None else None,
         )
 
-        # Log usage (resolve dialect for logging)
-        resolved_dialect = resolve_dialect(model, dialect)
         error_kind = None
         if outcome.abort_reason is not None or outcome.failed > 0:
             # Was hardcoded to CircuitBreakerError for any abort, which
@@ -934,8 +1349,10 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
             error_kind = {
                 "breaker": "CircuitBreakerError",
                 "budget": "TokenBudgetExceeded",
+                "interrupted": "Interrupted",
+                "index": "IndexWriteError",
             }.get(outcome.abort_reason or "", "PartialFailure")
-        recorded = append_event(
+        written = write_event(
             state_root() / "usage.jsonl",
             UsageEvent(
                 timestamp=datetime.now(UTC),
@@ -958,7 +1375,17 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 charge=outcome.charged,
             ),
         )
-        _warn_if_untracked(recorded, config)
+        _warn_if_untracked(written, config)
+        # Removed after the ledger event, never before. A kill between the two
+        # counts this run twice, which only over-counts. The other order
+        # could lose the spend. When the ledger did not take the event, the
+        # record stays, so a later command settles the run once it can.
+        if written.recorded:
+            openruns.end(state_root(), record)
+        # Reported before the result is printed. From here a stop signal
+        # changes nothing.
+        final.code = outcome.exit_code
+        final.interrupted = outcome.abort_reason == "interrupted"
 
         if args.json:
             status = (
@@ -977,6 +1404,9 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 "total": outcome.total,
                 "ok": outcome.ok,
                 "failed": outcome.failed,
+                # Already inside "failed". Items failed by an error that no
+                # handler expected, which is a fault to report.
+                "internal_errors": outcome.internal_errors,
                 "skipped": outcome.skipped,
                 "attempted": outcome.attempted,
                 "outdir": str(outcome.outdir),
@@ -1019,13 +1449,20 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                     ),
                     "tripped": outcome.tripped_budget,
                 },
+                # Bounded like the receipt; the index keeps every message
+                # whole. Not made printable: JSON encoding escapes control
+                # characters already.
                 "failures": [
-                    {"id": item_id, "error": message} for item_id, message in outcome.failures
+                    {"id": item_id, "error": cut_redacted(message, FAILURE_MESSAGE_CHARS)}
+                    for item_id, message in outcome.failures[:FAILURE_LIMIT]
                 ],
+                "failures_truncated": len(outcome.failures) > FAILURE_LIMIT,
+                # Why the run stopped when the index could not be written.
+                "error": outcome.index_error,
             }
-            print(json.dumps(obj, indent=2))
+            _emit(json.dumps(obj, indent=2))
         else:
-            print(
+            _emit(
                 map_receipt(
                     outcome,
                     model=model,
@@ -1037,3 +1474,8 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 )
             )
         return outcome.exit_code
+
+
+def entry() -> NoReturn:
+    """The console script. Runs main in process mode and exits with its code."""
+    sys.exit(main(process=True))

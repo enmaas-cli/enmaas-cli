@@ -23,8 +23,17 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
+import referencing
+import referencing.exceptions
 
 _MAX_REASON_CHARS = 200
+# Real schemas nest a few dozen objects and lists at most. The limit bounds
+# the reference check below and keeps a hostile file from using it to recurse.
+_MAX_SCHEMA_DEPTH = 100
+_REFERENCE_KEYWORDS = ("$ref", "$dynamicRef", "$recursiveRef")
+# An empty registry holds no documents and retrieves none, so a reference that
+# is not inside the schema fails instead of being fetched.
+_NO_RETRIEVAL: referencing.Registry[Any] = referencing.Registry()
 
 
 class ValidationError(Exception):
@@ -52,6 +61,7 @@ def load_schema(path: Path) -> dict[str, Any]:
             f"schema file must contain a JSON object, found {type(loaded).__name__}: {path}"
         )
     schema: dict[str, Any] = loaded
+    _check_references(schema, path)
     try:
         jsonschema.Draft7Validator.check_schema(schema)
     except jsonschema.SchemaError as exc:
@@ -65,6 +75,39 @@ def load_schema(path: Path) -> dict[str, Any]:
     return schema
 
 
+def _check_references(schema: dict[str, Any], path: Path) -> None:
+    """Refuse a reference that points outside the schema file.
+
+    jsonschema retrieves such a reference over HTTP or from a file while it
+    validates an answer, so a schema from another party could make enmaas
+    contact any host (server-side request forgery). Only references that start
+    with # stay inside the file. The message names the keyword, never the
+    value, which can be a long or private URL.
+    """
+    pending: list[tuple[object, int]] = [(schema, 1)]
+    while pending:
+        node, depth = pending.pop()
+        if depth > _MAX_SCHEMA_DEPTH:
+            raise ValidationError(
+                f"schema file is nested more than {_MAX_SCHEMA_DEPTH} levels deep: {path}"
+            )
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (
+                    key in _REFERENCE_KEYWORDS
+                    and isinstance(value, str)
+                    and not value.startswith("#")
+                ):
+                    raise ValidationError(
+                        f"schema file has a {key} that points outside the file; only references "
+                        f"that start with # are allowed: {path}"
+                    )
+                if isinstance(value, (dict, list)):
+                    pending.append((value, depth + 1))
+        elif isinstance(node, list):
+            pending.extend((item, depth + 1) for item in node if isinstance(item, (dict, list)))
+
+
 def _bounded(reason: str) -> str:
     if len(reason) <= _MAX_REASON_CHARS:
         return reason
@@ -72,13 +115,24 @@ def _bounded(reason: str) -> str:
 
 
 def validate_against_schema(text: str, schema: dict[str, Any]) -> None:
-    """Check model output against the schema. Raises ValidationError if it fails."""
+    """Check model output against the schema. Raises ValidationError if it fails.
+
+    Both the JSON decoder and the schema check recurse once per nesting
+    level, so a deeply nested response raises RecursionError. That is a
+    response the schema cannot accept, not a fault in this tool.
+    """
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValidationError(f"response is not valid JSON: {exc}") from exc
+    except RecursionError:
+        raise ValidationError("response is nested too deeply") from None
     try:
-        jsonschema.validate(payload, schema)
+        jsonschema.validate(payload, schema, registry=_NO_RETRIEVAL)
+    except RecursionError:
+        raise ValidationError("response is nested too deeply") from None
+    except referencing.exceptions.Unresolvable:
+        raise ValidationError("schema has a reference that cannot be resolved") from None
     except jsonschema.ValidationError as exc:
         # jsonschema's message can contain the entire rejected response.
         # Report the rule and a bounded field path without printing its value.

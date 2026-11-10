@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import sys
 import time
 from collections import deque
@@ -16,18 +18,19 @@ import httpx
 from .auth import redact
 from .batching import PER_ITEM_MARKER, build_batch_prompt, split_batch_response, split_template
 from .budget import TokenBudget, charge_from_rows, metered
-from .client import GatewayError, call
+from .client import call
 from .dialect import (
     Dialect,
-    EmptyResponseError,
     build_request,
     default_max_tokens,
     parse_response,
     resolve_dialect,
     thinking_off_payload,
 )
+from .errors import CallError, where
 from .outputs import protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
+from .tokens import MAX_RECORDED
 
 # ValidationError moved to .schema; re-exported so existing importers keep working.
 __all__ = ["ValidationError", "load_schema", "run_map", "validate_against_schema"]
@@ -135,7 +138,12 @@ def validate_all(template: str, items: list[dict[str, Any]]) -> None:
         render(template, item)
 
 
-def _charge_row(charge: int, *, items: int) -> str:
+def _internal_message(exc: BaseException) -> str:
+    """Where an unexpected error happened. Never its text, which is unreviewed."""
+    return f"internal error ({where(exc)})"
+
+
+def _charge_row(charge: int, *, items: int, run: str | None = None) -> str:
     """One JSONL row recording what a single request cost.
 
     Written beside the per-item rows because the budget cannot be rebuilt
@@ -150,8 +158,91 @@ def _charge_row(charge: int, *, items: int) -> str:
     failed in transport is not charged, because a non-200 carries no usage
     body for us to read. That spend is unknowable from the client side
     rather than merely unimplemented.
+
+    `run` names the invocation that wrote the row, when it has an open-run
+    record. Two runs can share one output directory, and an offset alone
+    cannot tell their rows apart.
+
+    The charge is clamped to the range from 0 to MAX_RECORDED, which every
+    reader of the index accepts.
     """
-    return json.dumps({"type": "request", "charge": charge, "items": items})
+    row: dict[str, Any] = {
+        "type": "request",
+        "charge": max(0, min(charge, MAX_RECORDED)),
+        "items": items,
+    }
+    if run is not None:
+        row["run"] = run
+    return json.dumps(row)
+
+
+def _charge_row_parts(run: str) -> tuple[str, str, str]:
+    """The text of this run's charge row around its two numbers.
+
+    A row _charge_row writes for `run` is head + charge + middle + items +
+    tail. Taken from the row it writes with both numbers 0, split at the
+    first two zeros: no text before the two numbers holds a digit, and the
+    run id comes after them. A reader builds its pattern from these parts,
+    so the reader and the writer cannot drift apart.
+    """
+    head, rest = _charge_row(0, items=0, run=run).split("0", 1)
+    middle, tail = rest.split("0", 1)
+    return head, middle, tail
+
+
+def _require_own_regular(fd: int, index: Path) -> None:
+    """Refuse an open index that is not a regular file owned by this user.
+
+    Checked on the descriptor, never by path. A FIFO would let another
+    process hold the write, and a file someone else owns could be read or
+    changed by them. A hard link is accepted: a backup tool can make one.
+    """
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"{index} is not a regular file; enmaas writes its index only to one")
+    if info.st_uid != os.getuid():
+        raise OSError(f"{index} is owned by another user; enmaas writes its index only to yours")
+
+
+def _append_index(index: Path, text: str) -> None:
+    """Append rows to the index, never through a symbolic link.
+
+    A new index is mode 0o600: it names every item and what each request
+    cost. An existing one keeps its mode. O_NOFOLLOW makes a link swapped in
+    during the run fail the write instead of sending the rows to the link's
+    target. O_NONBLOCK keeps a FIFO swapped in from blocking the open, so
+    the check after it can refuse it.
+    """
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(index, flags, 0o600)
+    try:
+        _require_own_regular(fd, index)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _check_index(index: Path) -> None:
+    """Refuse an index that cannot be written safely, before anything is sent.
+
+    A link, a path that is not a regular file and a file another user owns
+    are all refused.
+    """
+    try:
+        info = os.lstat(index)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(
+            f"{index} is not a regular file; enmaas does not write its index through a link"
+        )
+    fd = os.open(index, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        _require_own_regular(fd, index)
+    finally:
+        os.close(fd)
 
 
 def spent_tokens(outdir: Path) -> int:
@@ -220,7 +311,8 @@ class MapOutcome:
     total: int
     # Not a bool. A second way to abort arrived with token budgets, and a
     # receipt saying only "ABORTED" sends people hunting for failures that
-    # never happened. One of None, "breaker", "budget".
+    # never happened. One of None, "breaker", "budget", "interrupted",
+    # "index".
     abort_reason: str | None
     input_tokens: int
     output_tokens: int
@@ -255,9 +347,17 @@ class MapOutcome:
     # The group size the run used, after defaulting. Carried so the
     # receipt can say what was chosen when the caller did not choose.
     batch: int = 1
+    # Items failed by an error no handler expected. Already counted in
+    # `failed`; kept apart so the user can see it is a fault to report.
+    internal_errors: int = 0
+    # Why the index could not be written, when abort_reason is "index".
+    index_error: str | None = None
 
     @property
     def exit_code(self) -> int:
+        # The run could not record its work, which is an error, not a stop.
+        if self.abort_reason == "index":
+            return 1
         if self.abort_reason is not None:
             return 3
         if self.failed:
@@ -286,6 +386,7 @@ async def run_map(
     batch: int | None = None,
     token_budget: int | None = None,
     rolling_budget: TokenBudget | None = None,
+    run_id: str | None = None,
 ) -> MapOutcome:
     items = load_items(items_path)
     template = template_path.read_text(encoding="utf-8")
@@ -302,6 +403,9 @@ async def run_map(
     schema = load_schema(schema_file) if schema_file is not None else None
 
     outdir.mkdir(parents=True, exist_ok=True)
+    index = outdir / "results.jsonl"
+    # Before resume reads the index and before any request is sent.
+    _check_index(index)
     skips = resume_skips(outdir) if resume else set()
     pending = [i for i in items if str(i["id"]) not in skips]
     for item in pending:
@@ -323,8 +427,6 @@ async def run_map(
     tokens = max_tokens or default_max_tokens(thinking=thinking)
     breaker = CircuitBreaker()
     semaphore = asyncio.Semaphore(concurrency)
-    index = outdir / "results.jsonl"
-    lock = asyncio.Lock()
     abort_reason: str | None = None
     # Seeded from the charge rows of earlier invocations, so the ceiling
     # belongs to the job rather than to one command. Resetting it per run
@@ -361,8 +463,28 @@ async def run_map(
         "cached": 0,
         "reasoning": 0,
         "charge": 0,
+        "internal": 0,
     }
     failures: list[tuple[str, str]] = []
+    index_error: str | None = None
+
+    def index_failed(exc: OSError, charge: int) -> None:
+        """End the run in order after the index could not be written.
+
+        The request was billed, so its charge counts toward the ledger event
+        and both budgets. Tasks still waiting for the semaphore see the
+        abort reason and return without sending, because a request that
+        cannot be recorded must not be sent.
+        """
+        nonlocal abort_reason, tripped_budget, index_error
+        abort_reason = "index"
+        tripped_budget = None
+        if index_error is None:
+            index_error = redact(str(exc), key)
+        counts["charge"] += charge
+        for limit in (budget, rolling_budget):
+            if limit is not None:
+                limit.record(charge)
 
     async def process(item: dict[str, Any]) -> None:
         nonlocal abort_reason, tripped_budget
@@ -419,10 +541,11 @@ async def run_map(
                 }
                 counts["ok"] += 1
                 ok = True
-            except (GatewayError, EmptyResponseError, ValidationError, OSError) as exc:
-                if isinstance(exc, EmptyResponseError):
-                    # Reasoning ate the budget and returned nothing. The
-                    # gateway charged for it regardless.
+            except (CallError, ValidationError, OSError) as exc:
+                if isinstance(exc, CallError):
+                    # A failed request can still have been billed, for
+                    # example reasoning that ate the budget and returned
+                    # nothing. Charge what the reply reported.
                     charge = metered(exc.usage)
                 message = redact(str(exc), key)
                 row = {
@@ -435,36 +558,59 @@ async def run_map(
                 failures.append((item_id, message))
                 counts["failed"] += 1
                 ok = False
+            except Exception as exc:
+                # One unexpected error fails this item only, so the rest of
+                # the run and its charge rows survive. `charge` keeps what it
+                # held when the error was raised.
+                message = _internal_message(exc)
+                row = {
+                    "id": item_id,
+                    "status": "error",
+                    "path": None,
+                    "tokens": None,
+                    "error": message,
+                }
+                failures.append((item_id, message))
+                counts["failed"] += 1
+                counts["internal"] += 1
+                ok = False
 
-            async with lock:
-                with index.open("a", encoding="utf-8") as handle:
-                    # Charge first. If the process dies mid-write, the
-                    # asymmetry matters: an orphaned charge row over-counts,
-                    # which is safe, while an item row whose charge never
-                    # landed lets a resumed run spend that budget twice.
-                    handle.write(_charge_row(charge, items=1) + "\n")
-                    handle.write(json.dumps(row) + "\n")
-                counts["charge"] += charge
-                breaker.record(ok=ok)
-                if breaker.should_abort() and abort_reason is None:
-                    abort_reason = "breaker"
-                # Both budgets, one block, written identically in both
-                # execution paths so they cannot drift. Either is
-                # sufficient to stop the run, the way the breaker carries
-                # two independent signals.
-                #
-                # The `abort_reason is None` guard makes first cause win.
-                # Without it a run that tripped the breaker and then went
-                # over budget would report "budget", hiding the more
-                # actionable failure. This is not a data race: asyncio
-                # coroutines do not interleave between these statements,
-                # and the lock is already held. It is overwrite policy.
-                for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
-                    if limit is not None:
-                        limit.record(charge)
-                        if limit.should_abort() and abort_reason is None:
-                            abort_reason = "budget"
-                            tripped_budget = name
+            # Nothing awaits between the reply arriving and these rows being
+            # written, so a cancel cannot separate an answer file from its
+            # rows. An await added here would break that.
+            try:
+                # Charge first. If the process dies mid-write, the asymmetry
+                # matters: an orphaned charge row over-counts, which is safe,
+                # while an item row whose charge never landed lets a resumed
+                # run spend that budget twice.
+                _append_index(
+                    index,
+                    _charge_row(charge, items=1, run=run_id) + "\n" + json.dumps(row) + "\n",
+                )
+            except OSError as exc:
+                index_failed(exc, charge)
+                return
+            counts["charge"] += charge
+            breaker.record(ok=ok)
+            if breaker.should_abort() and abort_reason is None:
+                abort_reason = "breaker"
+            # Both budgets, one block, written identically in both
+            # execution paths so they cannot drift. Either is
+            # sufficient to stop the run, the way the breaker carries
+            # two independent signals.
+            #
+            # The `abort_reason is None` guard makes first cause win.
+            # Without it a run that tripped the breaker and then went
+            # over budget would report "budget", hiding the more
+            # actionable failure. This is not a data race: asyncio
+            # coroutines do not interleave between these statements,
+            # because nothing here awaits. It is overwrite policy.
+            for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
+                if limit is not None:
+                    limit.record(charge)
+                    if limit.should_abort() and abort_reason is None:
+                        abort_reason = "budget"
+                        tripped_budget = name
 
     async def process_batch(group: list[dict[str, Any]]) -> None:
         """One call covering several items, answers matched back by id."""
@@ -500,10 +646,10 @@ async def run_map(
                 counts["out"] += completion.usage.output_tokens or 0
                 counts["cached"] += completion.usage.cached_tokens or 0
                 counts["reasoning"] += completion.usage.reasoning_tokens or 0
-            except (GatewayError, EmptyResponseError, ValidationError, OSError) as exc:
+            except (CallError, ValidationError, OSError) as exc:
                 # The call failed, so every item in it failed. Attributing
                 # the error to each one keeps the breaker counting items.
-                if isinstance(exc, EmptyResponseError):
+                if isinstance(exc, CallError):
                     charge = metered(exc.usage)
                 message = redact(str(exc), key)
                 answers = {}
@@ -519,6 +665,24 @@ async def run_map(
                     )
                     failures.append((item_id, message))
                     counts["failed"] += 1
+            except Exception as exc:
+                # An unexpected error fails this group only. `charge` keeps
+                # what it held when the error was raised.
+                message = _internal_message(exc)
+                answers = {}
+                for item_id in ids:
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "status": "error",
+                            "path": None,
+                            "tokens": None,
+                            "error": message,
+                        }
+                    )
+                    failures.append((item_id, message))
+                    counts["failed"] += 1
+                    counts["internal"] += 1
 
             for item_id in ids:
                 if any(r["id"] == item_id for r in rows):
@@ -559,6 +723,21 @@ async def run_map(
                     failures.append((item_id, message))
                     counts["failed"] += 1
                     continue
+                except Exception as exc:
+                    message = _internal_message(exc)
+                    rows.append(
+                        {
+                            "id": item_id,
+                            "status": "error",
+                            "path": None,
+                            "tokens": None,
+                            "error": message,
+                        }
+                    )
+                    failures.append((item_id, message))
+                    counts["failed"] += 1
+                    counts["internal"] += 1
+                    continue
                 rows.append(
                     {
                         "id": item_id,
@@ -580,44 +759,61 @@ async def run_map(
                 )
                 counts["ok"] += 1
 
-            async with lock:
-                with index.open("a", encoding="utf-8") as handle:
-                    # One charge row per request, not per item: the group
-                    # was one call. Per-item rows carry "tokens": None here,
-                    # which is why the budget cannot be rebuilt from them.
-                    # Written first, so a crash over-counts rather than
-                    # letting a resumed run respend the group's budget.
-                    handle.write(_charge_row(charge, items=len(group)) + "\n")
-                    for row in rows:
-                        handle.write(json.dumps(row) + "\n")
-                counts["charge"] += charge
-                for row in rows:
-                    breaker.record(ok=row["status"] == "ok")
-                if breaker.should_abort() and abort_reason is None:
-                    abort_reason = "breaker"
-                # Both budgets, one block, written identically in both
-                # execution paths so they cannot drift. Either is
-                # sufficient to stop the run, the way the breaker carries
-                # two independent signals.
-                #
-                # The `abort_reason is None` guard makes first cause win.
-                # Without it a run that tripped the breaker and then went
-                # over budget would report "budget", hiding the more
-                # actionable failure. This is not a data race: asyncio
-                # coroutines do not interleave between these statements,
-                # and the lock is already held. It is overwrite policy.
-                for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
-                    if limit is not None:
-                        limit.record(charge)
-                        if limit.should_abort() and abort_reason is None:
-                            abort_reason = "budget"
-                            tripped_budget = name
+            # Nothing awaits between the reply arriving and these rows being
+            # written, so a cancel cannot separate an answer file from its
+            # rows. An await added here would break that.
+            try:
+                # One charge row per request, not per item: the group was one
+                # call. Per-item rows carry "tokens": None here, which is why
+                # the budget cannot be rebuilt from them. Written first, so a
+                # crash over-counts rather than letting a resumed run respend
+                # the group's budget.
+                _append_index(
+                    index,
+                    _charge_row(charge, items=len(group), run=run_id)
+                    + "\n"
+                    + "".join(json.dumps(row) + "\n" for row in rows),
+                )
+            except OSError as exc:
+                index_failed(exc, charge)
+                return
+            counts["charge"] += charge
+            for row in rows:
+                breaker.record(ok=row["status"] == "ok")
+            if breaker.should_abort() and abort_reason is None:
+                abort_reason = "breaker"
+            # Both budgets, one block, written identically in both
+            # execution paths so they cannot drift. Either is
+            # sufficient to stop the run, the way the breaker carries
+            # two independent signals.
+            #
+            # The `abort_reason is None` guard makes first cause win.
+            # Without it a run that tripped the breaker and then went
+            # over budget would report "budget", hiding the more
+            # actionable failure. This is not a data race: asyncio
+            # coroutines do not interleave between these statements,
+            # because nothing here awaits. It is overwrite policy.
+            for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
+                if limit is not None:
+                    limit.record(charge)
+                    if limit.should_abort() and abort_reason is None:
+                        abort_reason = "budget"
+                        tripped_budget = name
 
-    if batch > 1:
-        groups = [pending[n : n + batch] for n in range(0, len(pending), batch)]
-        await asyncio.gather(*(process_batch(g) for g in groups))
-    else:
-        await asyncio.gather(*(process(item) for item in pending))
+    try:
+        if batch > 1:
+            groups = [pending[n : n + batch] for n in range(0, len(pending), batch)]
+            await asyncio.gather(*(process_batch(g) for g in groups))
+        else:
+            await asyncio.gather(*(process(item) for item in pending))
+    except asyncio.CancelledError:
+        # The stop arrived by signal. Rows already written are complete,
+        # because recording never awaits, so the counts are final here.
+        # Requests still in flight are dropped and not recorded. This
+        # reason replaces any earlier one, because the process is about
+        # to end by the signal.
+        abort_reason = "interrupted"
+        tripped_budget = None
 
     return MapOutcome(
         ok=counts["ok"],
@@ -641,4 +837,6 @@ async def run_map(
         outdir=outdir,
         failures=failures,
         batch=batch,
+        internal_errors=counts["internal"],
+        index_error=index_error if abort_reason == "index" else None,
     )

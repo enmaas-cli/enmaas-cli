@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .auth import cut_redacted, printable, redact
 from .dialect import Completion, Dialect
 from .outputs import state_root as state_root
 
@@ -21,6 +22,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from .runner import MapOutcome
 
 PREVIEW_LIMIT = 160
+# A run with many failures would otherwise print a receipt or a --json
+# object as long as its index. The index keeps every message whole.
+FAILURE_LIMIT = 20
+FAILURE_MESSAGE_CHARS = 200
 _RUN_NAME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{4}")
 
 
@@ -29,12 +34,16 @@ def create_run_dir(root: Path) -> Path:
 
     The suffix is random rather than derived from the prompt: prompt text is
     arbitrary, and building filenames from it is a path traversal risk.
+
+    The root is the state directory. When this creates it, it is mode 0o700,
+    because it holds every answer and the usage ledger.
     """
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S")
     path = root / f"{stamp}-{secrets.token_hex(2)}"
     while path.exists():
         path = root / f"{stamp}-{secrets.token_hex(2)}"
-    path.mkdir(parents=True)
+    path.mkdir()
     return path
 
 
@@ -61,9 +70,25 @@ def prune_runs(root: Path, *, max_age_days: int = 30) -> None:
                     shutil.rmtree(child)
 
 
-def preview(text: str, *, limit: int = PREVIEW_LIMIT) -> str:
-    """Deterministic head of the response. Not a generated summary."""
-    return " ".join(text.split())[:limit]
+def preview(text: str, *, key: str, limit: int = PREVIEW_LIMIT) -> str:
+    """Deterministic head of the response. Not a generated summary.
+
+    The reply is not trusted. A reply that echoes the key would print it, so
+    the key is removed first. An escape sequence in it, such as one that sets
+    the terminal's clipboard, is made inert before the cut, so the cut counts
+    what is shown. The cut never splits the placeholder, and a cut made
+    before redaction could leave part of the key that no longer matches.
+    """
+    return cut_redacted(printable(" ".join(redact(text, key).split())), limit)
+
+
+def failure_line_text(message: str) -> str:
+    """A redacted failure message made printable on one line, then cut to length.
+
+    Printable comes before the cut, so the cut counts what is shown. The cut
+    never splits the redaction placeholder.
+    """
+    return cut_redacted(printable(message), FAILURE_MESSAGE_CHARS)
 
 
 def _count(value: int | None) -> str:
@@ -88,6 +113,7 @@ def ask_receipt(
     completion: Completion,
     path: Path,
     elapsed: float,
+    key: str,
     model_defaulted: bool = False,
 ) -> str:
     size = path.stat().st_size if path.exists() else 0
@@ -95,7 +121,8 @@ def ask_receipt(
     lines = [
         "enmaas ask ok",
         f"  model     {model}{model_mark}  ({dialect} dialect)",
-        f"  output    {path}  ({size:,} B)",
+        # A path is printed inert: a file name can hold an escape sequence.
+        f"  output    {printable(str(path))}  ({size:,} B)",
         _token_line(completion),
         f"  elapsed   {elapsed:.1f}s",
     ]
@@ -109,7 +136,7 @@ def ask_receipt(
             f"  warning   {completion.replaced} character{plural} the model emitted "
             f"could not be encoded and became U+FFFD"
         )
-    head = preview(completion.text)
+    head = preview(completion.text, key=key)
     if head:
         lines.append(f"  preview   {head}")
     return "\n".join(lines)
@@ -135,6 +162,10 @@ def map_receipt(
         header = "enmaas map stopped on budget"
     elif outcome.abort_reason == "breaker":
         header = "enmaas map ABORTED (too many failures)"
+    elif outcome.abort_reason == "interrupted":
+        header = "enmaas map interrupted"
+    elif outcome.abort_reason == "index":
+        header = "enmaas map stopped: the index could not be written"
     else:
         header = "enmaas map ok"
 
@@ -145,17 +176,24 @@ def map_receipt(
         batch_mark = f"  (default: template {has} ===PER ITEM===)"
     else:
         batch_mark = ""
-    lines = [
-        header,
+    lines = [header]
+    if outcome.abort_reason == "index":
+        lines.append(f"  error     {printable(outcome.index_error or 'unknown')}")
+    lines += [
         f"  model     {model}{model_mark}",
         f"  batch     {outcome.batch}{batch_mark}",
         f"  items     {outcome.total} total: {outcome.attempted} attempted, "
         f"{outcome.ok} ok, {outcome.failed} failed, {outcome.skipped} skipped",
     ]
+    if outcome.internal_errors > 0:
+        lines.append(
+            f"  internal  {outcome.internal_errors} failed on an error inside enmaas; "
+            f"please report it"
+        )
     if not_attempted > 0:
         lines.append(f"            {not_attempted} not attempted")
-    lines.append(f"  outdir    {outcome.outdir}")
-    lines.append(f"  index     {outcome.outdir / 'results.jsonl'}")
+    lines.append(f"  outdir    {printable(str(outcome.outdir))}")
+    lines.append(f"  index     {printable(str(outcome.outdir / 'results.jsonl'))}")
     lines.append(f"  tokens    in {outcome.input_tokens:,}   out {outcome.output_tokens:,}")
     if token_budget:
         # outcome.spent, not a figure derived from the token counts above:
@@ -176,8 +214,12 @@ def map_receipt(
             total = rolling_spent + outcome.charged
         lines.append(f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}")
     lines.append(f"  elapsed   {outcome.elapsed:.1f}s")
-    for item_id, message in outcome.failures[:20]:
-        lines.append(f"  failure   {item_id}  {message}")
+    for item_id, message in outcome.failures[:FAILURE_LIMIT]:
+        # Gateway text is not trusted. A newline in it would forge a receipt
+        # line, and an escape sequence would reach the terminal.
+        lines.append(f"  failure   {printable(item_id)}  {failure_line_text(message)}")
+    if len(outcome.failures) > FAILURE_LIMIT:
+        lines.append(f"            {len(outcome.failures) - FAILURE_LIMIT} more in the index")
     if outcome.tripped_budget == "rolling":
         # Raising --token-budget would not help: the standing ceiling in
         # config.toml is what stopped this, and only it can release it.

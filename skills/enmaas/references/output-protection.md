@@ -31,10 +31,14 @@ The hook checks Claude `Read`, content-returning `Grep`, and common literal
 shell reads in Claude Code and Codex. Shell coverage includes `cat`, `head`,
 `tail`, `sed`, `awk`, `grep`, `rg`, `jq`, and `diff`, and the file commands
 inside `sed` (`r`, `R`, `w`, `W`) and `awk` (`getline <`) programs. It handles
-quoted paths, globs, home paths, brace alternatives, simple directory changes,
-pipelines, heredocs, and input redirection. Common shell keywords and execution wrappers
+quoted paths, Bash `$'...'` and `$"..."` quoting, globs, home paths, brace
+alternatives, simple directory changes, pipelines, heredocs, and input
+redirection. A reader command with a `$'...'` string the hook cannot decode
+the way Bash does, such as one with an unknown escape or a NUL, is denied. Common shell keywords and execution wrappers
 are checked, along with command substitutions.
-Filename-only searches and counts are allowed as metadata.
+Filename-only searches and counts are allowed as metadata. A file that a
+reader loads as input, such as a pattern file (`-f`), a script file, or an
+ignore or exclude file, is checked first, in every output mode.
 
 Use absolute paths from receipts. The hook does not evaluate environment
 variables or arbitrary programs to discover file paths. Reader commands fed

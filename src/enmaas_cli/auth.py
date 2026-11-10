@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from collections.abc import Mapping
@@ -94,9 +95,22 @@ def _permission_warning(path: Path) -> str | None:
     return None
 
 
+def _require_sendable(value: str, source: str) -> str:
+    """Return the key when it can be sent in a header, or raise AuthError.
+
+    A key goes in an HTTP header, which takes ASCII only. A key with any
+    other character, whitespace or a control character raised inside every
+    request instead of once here. The message never holds the key or the
+    character, because either is part of the secret.
+    """
+    if value.isascii() and value.isprintable() and not any(ch.isspace() for ch in value):
+        return value
+    raise AuthError(f"the key from {source} holds a character that cannot be sent in a header")
+
+
 def _from_file(path: Path) -> Key:
     return Key(
-        value=_read_key_file(path),
+        value=_require_sendable(_read_key_file(path), str(path)),
         source=str(path),
         warning=_permission_warning(path),
     )
@@ -132,7 +146,7 @@ def resolve_key(
 
     from_env = env.get(ENV_VAR, "").strip()
     if from_env:
-        return Key(value=from_env, source=ENV_VAR, warning=None)
+        return Key(value=_require_sendable(from_env, ENV_VAR), source=ENV_VAR, warning=None)
 
     if config_key_file is not None:
         return _from_file(_expand_configured(config_key_file))
@@ -146,7 +160,64 @@ def resolve_key(
 
 
 def redact(text: str, key: str) -> str:
-    """Replace every occurrence of the key with a placeholder."""
+    """Replace every occurrence of the key with a placeholder.
+
+    The JSON-escaped form is replaced too. A gateway that echoes a key
+    holding a quote or a backslash in a JSON error body writes it escaped,
+    and the plain form would not match there.
+    """
     if not key:
         return text
-    return text.replace(key, REDACTION)
+    text = text.replace(key, REDACTION)
+    escaped = json.dumps(key)[1:-1]
+    if escaped != key:
+        text = text.replace(escaped, REDACTION)
+    return text
+
+
+def cut_redacted(text: str, limit: int) -> str:
+    """Cut already-redacted text to `limit` characters without splitting the placeholder.
+
+    A placeholder that straddles the limit is kept whole, so a reader can
+    still see that a key was removed. Redact before calling this: a cut made
+    first can leave part of a key that redaction no longer matches.
+    """
+    cut = limit
+    start = text.find(REDACTION, max(0, cut - len(REDACTION) + 1))
+    if 0 <= start < cut:
+        cut = start + len(REDACTION)
+    return text[:cut]
+
+
+_LINE_BREAKS = frozenset("\n\r\t")
+
+
+def printable(text: str) -> str:
+    """Make text safe to print on one terminal line.
+
+    Text from the gateway can hold a newline that forges a receipt line, or
+    an escape sequence that the terminal acts on. Every character that
+    `str.isprintable()` rejects is replaced: a newline, carriage return or
+    tab becomes a space, and any other becomes "?". Printable characters,
+    including non-ASCII letters, pass through unchanged.
+    """
+    if text.isprintable():
+        return text
+    return "".join(ch if ch.isprintable() else (" " if ch in _LINE_BREAKS else "?") for ch in text)
+
+
+_KEPT_IN_BLOCKS = frozenset("\n\t")
+
+
+def printable_block(text: str) -> str:
+    """Make text that spans lines safe to print.
+
+    Like printable, but a newline and a tab are kept, for output that is
+    meant to keep its lines, such as `inspect`. A carriage return becomes a
+    space, because it can move the cursor back over a line already shown.
+    Every other character that `str.isprintable()` rejects becomes "?".
+    """
+    return "".join(
+        ch if ch.isprintable() or ch in _KEPT_IN_BLOCKS else (" " if ch in _LINE_BREAKS else "?")
+        for ch in text
+    )

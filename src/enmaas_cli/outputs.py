@@ -97,16 +97,30 @@ def write_output(path: Path, text: str) -> None:
     A plain write follows a link, so a pre-existing output name that points
     at another writable file truncated that file. The mode applies only when
     the file is created; an existing file keeps the mode its owner chose.
+
+    Only a regular file is written. Another process could read an answer
+    sent to a FIFO and stop this one before its spend is recorded. The open
+    is nonblocking, so a FIFO cannot hold it, and the type is checked on the
+    open descriptor.
     """
     if path.is_symlink():
         raise _link_refusal(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        descriptor = os.open(path, flags, 0o600)
     except OSError as exc:
         # The link can appear between the check above and the open.
         if exc.errno == errno.ELOOP:
             raise _link_refusal(path) from None
         raise
+    try:
+        regular = stat.S_ISREG(os.fstat(descriptor).st_mode)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if not regular:
+        os.close(descriptor)
+        raise OSError(f"refusing to write an answer to a path that is not a regular file: {path}")
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(text.encode("utf-8"))
 

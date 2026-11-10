@@ -191,3 +191,191 @@ async def test_fast_timeout_is_retried() -> None:
         )
     assert data == {"ok": True}
     assert attempts == 2
+
+
+SECRET_BODY_MARK = "MODEL-OUTPUT-SECRET"
+
+
+def _counting(response: httpx.Response) -> tuple[httpx.MockTransport, list[int]]:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return response
+
+    return httpx.MockTransport(handler), calls
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(
+            200,
+            content=f"<html><body>{SECRET_BODY_MARK}</body></html>".encode(),
+            headers={"content-type": "text/html"},
+        ),
+        httpx.Response(200, json=[SECRET_BODY_MARK, 1]),
+        httpx.Response(200, json=SECRET_BODY_MARK),
+        httpx.Response(
+            200,
+            content=b'{"text": "' + SECRET_BODY_MARK.encode() + b'\xff\xfe"}',
+            headers={"content-type": "application/json"},
+        ),
+    ],
+    ids=["html", "json-list", "json-string", "invalid-utf8"],
+)
+async def test_unusable_200_body_is_a_bad_reply_and_never_retried(
+    response: httpx.Response,
+) -> None:
+    from enmaas_cli.errors import BadReplyError
+
+    transport, calls = _counting(response)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    assert len(calls) == 1
+    message = str(exc.value)
+    assert SECRET_BODY_MARK not in message
+    assert "html" not in message.replace("text/html", "")
+    assert "bytes" in message
+
+
+async def test_bad_reply_message_names_content_type_cut_to_80_chars() -> None:
+    from enmaas_cli.errors import BadReplyError
+
+    long_type = "text/plain; " + "x" * 200
+    body = b"not json at all"
+    transport, _ = _counting(httpx.Response(200, content=body, headers={"content-type": long_type}))
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    message = str(exc.value)
+    assert long_type[:80] in message
+    assert long_type[:81] not in message
+    assert f"{len(body)} bytes" in message
+    assert "not json" not in message
+
+
+async def test_decoding_error_is_terminal_gateway_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.DecodingError("bad gzip stream")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GatewayError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    assert calls == 1
+    assert exc.value.status is None
+    assert exc.value.attempts == 1
+    assert "DecodingError" in str(exc.value)
+
+
+async def test_http_error_message_is_redacted() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.DecodingError("failed near sk-live-key-123")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GatewayError) as exc:
+            await call(
+                client,
+                BASE,
+                REQ,
+                timeout=5,
+                retries=3,
+                sleep=_no_sleep,
+                secret="sk-live-key-123",
+            )
+    assert "sk-live-key-123" not in str(exc.value)
+
+
+async def test_bad_reply_content_type_is_redacted_before_it_is_cut() -> None:
+    from enmaas_cli.auth import REDACTION
+    from enmaas_cli.errors import BadReplyError
+
+    secret = "sk-oai-ABCDEFGHIJKLMNOP"
+    prefix = "text/plain; " + "x" * 58
+    content_type = prefix + secret + "; charset=utf-8"
+    # The key starts at character 70 and ends past character 80.
+    assert len(prefix) < 80 < len(prefix) + len(secret)
+    transport, calls = _counting(
+        httpx.Response(200, content=b"not json", headers={"content-type": content_type})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep, secret=secret)
+    assert len(calls) == 1
+    message = str(exc.value)
+    for start in range(len(secret) - 3):
+        assert secret[start : start + 4] not in message
+    assert f"content type {prefix}{REDACTION}, " in message
+
+
+async def test_bad_reply_content_type_is_printable() -> None:
+    from enmaas_cli.errors import BadReplyError
+
+    transport, _ = _counting(
+        httpx.Response(
+            200,
+            content=b"not json",
+            headers=[(b"content-type", b"text/plain\xc2\x9b31m\x1b]0;t\x07")],
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    message = str(exc.value)
+    assert all(ch.isprintable() for ch in message)
+    assert "text/plain?31m" in message
+
+
+async def test_reply_nested_too_deeply_is_a_bad_reply_and_never_retried() -> None:
+    from enmaas_cli.errors import BadReplyError
+
+    body = b"[" * 200_000 + b"]" * 200_000
+    transport, calls = _counting(
+        httpx.Response(200, content=body, headers={"content-type": "application/json"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    assert len(calls) == 1
+    assert "JSON nested too deeply" in str(exc.value)
+
+
+async def test_invalid_url_from_the_transport_is_terminal_gateway_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.InvalidURL("bad url")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GatewayError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    assert calls == 1
+    assert exc.value.status is None
+    assert exc.value.attempts == 1
+    assert "InvalidURL" in str(exc.value)
+
+
+async def test_a_key_echoed_json_escaped_in_an_error_body_is_redacted() -> None:
+    import json
+
+    key = 'sk-a"b\\c-123'
+    echoed = json.dumps({"error": {"message": f"invalid key {key}"}})
+    assert key not in echoed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, content=echoed.encode(), headers={"content-type": "json"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GatewayError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=0, sleep=_no_sleep, secret=key)
+    message = str(exc.value)
+    assert json.dumps(key)[1:-1] not in message
+    assert key not in message
+    assert "REDACTED" in message

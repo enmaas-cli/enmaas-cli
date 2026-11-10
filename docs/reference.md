@@ -11,7 +11,7 @@ Every command, flag and configuration key. For installation read
 enmaas models
 ```
 
-Lists the merged catalog from both the anthropic and openai dialect endpoints. `--dialect {anthropic,openai,both}` narrows it; `both` is the default. `--json` prints it as JSON. `--timeout SECONDS` bounds each catalog request. A gateway that serves only one dialect rejects the other probe, so pass `--dialect openai` or `--dialect anthropic` there.
+Lists the merged catalog from both the anthropic and openai dialect endpoints. `--dialect {anthropic,openai,both}` narrows it; `both` is the default. `--json` prints it as a JSON list, described in [JSON output](#json-output). `--timeout SECONDS` bounds each catalog request. A gateway that serves only one dialect rejects the other probe, so pass `--dialect openai` or `--dialect anthropic` there. The text list prints each id with every character that cannot be printed replaced by `?`, so a catalog id cannot act on the terminal. `--json` keeps the id as sent, escaped by JSON.
 
 ### Ask a single question
 
@@ -30,9 +30,9 @@ enmaas ask ok
   preview   Paris
 ```
 
-The full response is written to the file shown in the `output` line. The receipt includes a preview of at most 160 characters. Run directories under `$XDG_STATE_HOME/enmaas/runs/` (default `~/.local/state/enmaas/runs/`) are removed once they are 30 days old, at the start of the next `ask`. Only directories with a run name (timestamp plus four hex characters) are removed, and nothing is removed when the runs directory is a symbolic link. Pass `-o PATH` for an answer that must persist.
+The full response is written to the file shown in the `output` line. The receipt includes a preview of at most 160 characters. A key the reply echoes, as typed or in its JSON escaped form, is replaced by `***REDACTED***` first. A placeholder at the cut is kept whole, so the preview can then run up to 13 characters past 160. Runs of whitespace are collapsed to one space, and every other character that cannot be printed is replaced by `?`. A reply that holds a terminal escape sequence, such as one that sets the clipboard, therefore prints inert. Paths in a receipt are printed the same way. The answer file keeps the bytes the model sent. Run directories under `$XDG_STATE_HOME/enmaas/runs/` (default `~/.local/state/enmaas/runs/`) are removed once they are 30 days old, at the start of the next `ask`. Only directories with a run name (timestamp plus four hex characters) are removed, and nothing is removed when the runs directory is a symbolic link. Pass `-o PATH` for an answer that must persist.
 
-An answer is never written through a symbolic link. If the output path already exists as a link, `ask` fails and `map` marks that item failed with `refusing to write through a symbolic link`.
+An answer is never written through a symbolic link, and only to a regular file. If the output path already exists as a link, `ask` fails and `map` marks that item failed with `refusing to write through a symbolic link`. A FIFO, a device or anything else that is not a regular file at the output path is refused too, without blocking: `ask` fails and `map` marks that item failed. The reply's charge is still recorded.
 
 On an ordinary request failure the receipt goes to stderr and the exit code is 1, so a shell script can branch on it. With `--json` the error object goes to stdout. A refusal under a rolling `[budget]` exits 3.
 
@@ -73,7 +73,10 @@ enmaas inspect out/f001.md --max-chars 500
 
 The default and maximum output is 2,000 characters, including the truncation
 notice and final newline. It prints a prefix of the file. The command reads one
-regular file and has no pagination or full-output option.
+regular file and has no pagination or full-output option. Newlines and tabs are
+printed as they are. A carriage return is printed as a space and every other
+character that cannot be printed as `?`, so the file cannot act on the terminal.
+The file itself is not changed.
 
 ### Allow a deliberate full read
 
@@ -102,9 +105,9 @@ These go before the subcommand: `enmaas --key-file PATH models`.
 ### Common flags (`ask` and `map`)
 
 - `-m, --model MODEL`: The model to use. Optional; without it the configured `default_model` applies and the receipt says `(default)`.
-- `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
+- `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. Every `$ref`, `$dynamicRef` and `$recursiveRef` must point inside the file, so it starts with `#`; enmaas never fetches a schema. A file nested more than 100 levels deep is refused. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
 - `--schema-name NAME`: The name sent with the schema. Defaults to `StructuredOutput`. `ask` and unbatched `map` send the schema and its name with the request; batched `map` keeps the schema local and validates each answer after the reply is split.
-- `--json`: Emit machine-readable JSON instead of plain-text receipts. For `ask`, prints an object with `status`, `model`, `dialect`, `path`, `tokens`, `elapsed`, and `error`. For `map`, prints an object with `status`, `total`, `ok`, `failed`, `skipped`, `attempted`, `outdir`, `index`, `tokens`, `elapsed`, and `failures`.
+- `--json`: Print exactly one JSON object on stdout in place of the receipt, on every exit: a result, a refusal or an error. See [JSON output](#json-output).
 - `--dialect {anthropic,openai}`: Override dialect selection. By default, the dialect is inferred from the model name.
 - `--max-tokens N`: Maximum output tokens. Must be positive.
 - `--timeout SECONDS`: Request timeout. Must be positive. Defaults to 280 seconds.
@@ -184,13 +187,137 @@ costs a request, which `--token-budget` can bound.
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Error (includes usage errors like invalid flags) |
+| 1 | Error (includes usage errors like invalid flags, and a `map` whose `results.jsonl` could not be written) |
 | 2 | Partial failure (some items failed in a map run) |
 | 3 | Run stopped early: circuit breaker tripped, or token budget spent |
+| 130 | Stopped by SIGINT (Ctrl-C), as a shell reports it |
+| 143 | Stopped by SIGTERM, as a shell reports it |
 
 Usage errors (invalid flags, missing required arguments) exit 1, so exit code 2 unambiguously means partial failure.
 
+An interrupted `ask` or `map` ends by the signal that stopped it, after it has
+printed its receipt or error, so the caller sees how it stopped. A shell shows
+128 plus the signal number; a program that starts enmaas sees the signal itself.
+See [Runs that stop early](#runs-that-stop-early).
+
 On exit code 3 from `map`, re-run with `--resume` to skip completed items. If the stop was a per-run `--token-budget`, raise it on the resumed command. If it was the rolling `[budget]` in the config, which can also stop `ask`, raise the ceiling in the config or wait for the window to move; `--resume` alone will stop again immediately.
+
+## JSON output
+
+With `--json`, `ask` and `map` print exactly one JSON object on stdout, whatever
+happens: the command's result, a budget refusal, or an error. Warnings still go
+to stderr. No traceback is printed unless `ENMAAS_DEBUG=1` is set (see
+[Errors](#errors)).
+
+### The `ask` object
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `ok`, or `error` when the request or the answer failed |
+| `model` | string | The model called |
+| `dialect` | string | `openai` or `anthropic` |
+| `path` | string or null | The answer file, or null when no answer was saved |
+| `tokens` | object | Token counts the reply reported |
+| `tokens.input` | integer or null | Input tokens, cached ones included; null when not reported |
+| `tokens.cached` | integer or null | Input tokens read from a cache |
+| `tokens.output` | integer or null | Output tokens, reasoning included |
+| `tokens.reasoning` | integer or null | Reasoning tokens, when the reply reports them |
+| `elapsed` | number | Seconds from the request to the result |
+| `replaced` | integer | Characters that could not be encoded and became U+FFFD |
+| `error` | string or null | Why it failed, with the key removed; null on success |
+
+### The `map` object
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `ok`, `partial` when some items failed, or `aborted` when the run stopped early |
+| `model` | string | The model called |
+| `batch` | integer | Items per request, after the default was applied |
+| `defaulted` | object | Which choices the CLI made for you |
+| `defaulted.model` | boolean | The model came from `default_model` in the config |
+| `defaulted.batch` | boolean | The batch size came from the template |
+| `abort_reason` | string or null | `breaker`, `budget`, `interrupted` or `index` when the run stopped early |
+| `total` | integer | Items in the items file |
+| `ok` | integer | Items answered |
+| `failed` | integer | Items that failed |
+| `internal_errors` | integer | Failed items that hit an error inside enmaas, already in `failed`; please report them |
+| `skipped` | integer | Items `--resume` skipped |
+| `attempted` | integer | Items sent in this run |
+| `outdir` | string | The output directory |
+| `index` | string | The path of `results.jsonl` |
+| `tokens` | object | Token counts from the replies of this run |
+| `tokens.input` | integer | Input tokens |
+| `tokens.output` | integer | Output tokens |
+| `elapsed` | number | Seconds the run took |
+| `budget` | object | Both token ceilings and which one stopped the run |
+| `budget.per_run` | object or null | The `--token-budget` ceiling; null without the flag |
+| `budget.per_run.ceiling` | integer | The `--token-budget` value |
+| `budget.per_run.spent` | integer | Metered tokens of the whole job, resumes included |
+| `budget.rolling` | object or null | The `[budget]` ceiling in the config; null without it |
+| `budget.rolling.ceiling` | integer | The `tokens` value |
+| `budget.rolling.spent` | integer | Metered tokens in the window, this run included |
+| `budget.tripped` | string or null | `per_run` or `rolling` when a ceiling stopped the run |
+| `failures` | list | The first 20 failed items |
+| `failures[].id` | string | The item id |
+| `failures[].error` | string | The first 200 characters of the error, with the key removed |
+| `failures_truncated` | boolean | True when more than 20 items failed |
+| `error` | string or null | Why the index could not be written, when `abort_reason` is `index` |
+
+`results.jsonl` keeps every failure message whole. The skill gives commands
+that count the failures and list them from it.
+
+### The refusal object
+
+`ask` and `map` print this when a rolling `[budget]` refuses the command before
+any request, and exit 3.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `refused` |
+| `abort_reason` | string | `budget` |
+| `budget` | object | The ceiling that refused the command |
+| `budget.per_run` | null | Always null: no run started |
+| `budget.rolling` | object | The `[budget]` ceiling in the config |
+| `budget.rolling.ceiling` | integer | The `tokens` value |
+| `budget.rolling.spent` | integer | Metered tokens in the window, open runs included |
+| `budget.tripped` | string | `rolling` |
+| `error` | string | Why the command refused |
+
+### The error object
+
+`ask`, `map` and `models` print this when the command ends on an error before it
+has a result, and exit 1: a missing gateway URL or key, a malformed `[budget]`
+table, a bad items file, template, attachment, prompt or schema, a model whose
+dialect is unknown, an index that is refused, a failed or malformed model
+catalog, an interrupt before the result, or an error inside enmaas.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `error` |
+| `error` | string | What went wrong |
+
+### The `models` list
+
+`models --json` prints a list, one entry per model, sorted by id.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `[].id` | string | The model id, with any copy of the key replaced by `***REDACTED***`, as in the text list |
+| `[].dialects` | list of strings | The catalogs that list it: `anthropic`, `openai` or both |
+
+### Errors
+
+Without `--json`, an error is one line on stderr starting `error: `. With
+`--json` it is the error object above. The text has the key removed and is
+printed on one line; an error that escaped the command is also cut to 200
+characters. A catalog that is not a JSON object with a `data` list of objects
+with a string `id` is reported by what is wrong, never by its content.
+
+An error inside enmaas that no handler expected is reported as
+`internal error (<class> at <file>:<line>)`. It never shows the error's text,
+which could quote a reply or a prompt. Set `ENMAAS_DEBUG=1` to also print the
+traceback to stderr, with the key removed. The traceback can hold the error's
+text, so share it with care.
 
 ## Circuit breaker
 
@@ -220,9 +347,14 @@ are N-1 further groups, which can be a lot of tokens. There is no fixed token
 bound without bounding request size.
 
 **The ceiling belongs to the whole job across resumes.** Every request appends a
-`{"type": "request", "charge": N}` row to `results.jsonl`, and a resumed run adds
-those up before spending anything. So `--resume` on its own re-trips immediately.
-To carry on, raise the ceiling deliberately:
+`{"type": "request", "charge": N, "items": K, "run": "<run id>"}` row to
+`results.jsonl`, and a resumed run adds up every charge row, whichever run wrote
+it, before spending anything. So `--resume` on its own re-trips immediately.
+The `run` field is the id of the run's open-run record (see
+[Runs that stop early](#runs-that-stop-early)). It is absent when no record was
+written, for example with `ENMAAS_NO_USAGE_LOG` set. A charge is written capped
+at 10^18 tokens, and a row with a larger charge is not counted. To carry on,
+raise the ceiling deliberately:
 
 ```bash
 enmaas map --items items.jsonl --template template.txt --outdir out --token-budget 2000000 --resume
@@ -251,6 +383,12 @@ timeout = 280
 ```
 
 `base_url` has no default: it must be set here or in `ENMAAS_BASE_URL`, which wins when both are set. It must use `https://`; `http://` is accepted only for `localhost`, `127.0.0.0/8` and `::1`. `models`, `ask` and `map` exit 1 with a message naming the fix when neither is set; the local commands do not need it. `key_file` may name the key file when it is somewhere other than `~/.secrets/enmaas`. The other fields shown are the defaults except `dialect_overrides`.
+
+A gateway on `localhost` or a loopback address is always reached directly. enmaas
+ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms for it,
+because a proxy would receive the key, and plain `http://` is allowed only for
+such a host. TLS settings such as `SSL_CERT_FILE` and `SSL_CERT_DIR` still apply.
+Any other gateway uses the proxy variables as usual.
 
 The `dialect_overrides` table maps model names to dialect strings (`"anthropic"` or `"openai"`). An explicit `--dialect` flag on the command line takes precedence. Invalid dialect values are ignored with a warning.
 
@@ -308,7 +446,31 @@ reason: falling back to defaults would drop a configured `[budget]` along with
 everything else, so a stray typo anywhere in the file would run uncapped.
 
 For the same reason the command refuses to start when a budget is configured and
-the ledger cannot be read, or when `ENMAAS_NO_USAGE_LOG` disables recording. A
+the ledger cannot be read, when the open-run records cannot all be read, or when
+`ENMAAS_NO_USAGE_LOG` disables recording. A refusal over the ledger names it and
+lists at most five problems, each as a line number and a fixed reason such as
+`bad count` or `not JSON`, then how many more there are. It never shows a value
+from the ledger. A ledger path that is a link, a FIFO or anything else that is
+not a regular file is one problem, `<path> is not a regular file`, and nothing
+waits on it.
+
+With a budget configured, `ask` and `map` also prove the ledger can be written
+before they send anything. They prove three things: the ledger opens for append
+(it and the state directory are created when missing), the state directory has
+room for a row, and the process file size limit lets the ledger grow by one.
+For the room, they write 64 KiB to a new hidden file in the state directory and
+remove it again. When any of that fails, for example because the state
+directory or the ledger is read-only, the disk is full, or the ledger is at the
+size limit, the command sends no request and exits 1 with `the usage ledger <path> cannot be written, so the token budget
+cannot be tracked; fix it or remove the [budget] table from the config`, or with
+`--json` the error object. Without that check, each run would spend, fail to
+record it, and let the next run start from zero again. The check cannot see
+the future: room can still run out while the request is in flight, and then the
+write fails and the command warns. With
+`ENMAAS_NO_USAGE_LOG` set the earlier refusal applies: the command exits 3 and
+says the ledger is disabled. Without a budget, a ledger that cannot be written
+never stops a command. A refusal over the open-run records names `open-runs.jsonl`:
+run the command again, or delete that file if you did not create it. A
 write failure after the run has finished is different: the tokens are already
 spent, so the command prints a warning and that spend goes uncounted. An unreadable ledger looks exactly like one showing zero spend. With no
 budget configured the ledger is never consulted for enforcement at all, so a
@@ -316,16 +478,24 @@ damaged one does not stop work; `enmaas usage` keeps reporting what it can from
 the rows it understands.
 
 If a run finishes but its usage cannot be written back, and a budget is
-configured, it prints a warning. That spend will not count against the ceiling, so
-the ceiling has quietly stopped tracking.
+configured, it prints a second warning after the one every failed write prints
+(see [Usage ledger](#usage-ledger)). That spend will not count against the
+ceiling, so the ceiling has quietly stopped tracking.
 
-**Single process only.** Each run reads the ledger at startup and writes its event
-at the end. Two runs started together against 9,000,000 spent of a 10,000,000
-ceiling will each believe 1,000,000 remains, and together spend 2,000,000. A run
-killed partway writes no event, so its spend goes unrecorded. This is a guard
-against your own drift over time. It is no enforcement boundary against concurrent
-use. Enforcing that properly needs a server-side budget, which a client cannot
-provide.
+**Not an enforcement boundary for runs side by side.** Each run reads the ledger
+at startup and writes its event at the end. The check also adds what every `map`
+run with an open-run record still present has charged so far, read from its
+index (see [Runs that stop early](#runs-that-stop-early)). That covers runs in
+progress and dead runs the command could not settle, for example because another
+process held the record lock. The records are read before the
+ledger, so a run that ends between the two reads is counted twice for that one
+check, never zero times. When open runs add to the spend, the refusal says how
+much and names `open-runs.jsonl`, so you can find a record that should not be
+there. That narrows the gap but does not close it. Two runs started together against 9,000,000 spent of a 10,000,000
+ceiling each see the other at zero, each believe 1,000,000 remains, and together
+can spend 2,000,000. This is a guard against your own drift over time.
+Enforcing a ceiling across concurrent use needs a server-side budget, which a
+client cannot provide.
 
 ## Usage ledger
 
@@ -347,11 +517,165 @@ The summary shows totals and breakdowns by model and by command. Models with a
 `[prices.*]` entry in the config are priced; `rits/*` models are known to be free;
 anything else is reported as unpriced.
 
-Set `ENMAAS_NO_USAGE_LOG=1` to turn recording off. A ledger that cannot be
-written never stops your command. With a `[budget]` configured you also get a
-warning that the run will not count against the ceiling, and the command refuses
-to start when the ledger cannot be read or recording is disabled, because it
-cannot know what has been spent.
+Every row is checked field by field. A count or charge must be an integer from 0
+to 10^18, the elapsed time a finite number of zero or more, and the model,
+command, dialect, status and error kind text of at most 1,024 characters.
+`enmaas` writes its own rows inside those limits: counts and charges are capped at 10^18
+and text is cut to 1,024 characters. A row that fails a check is treated as
+damaged: `enmaas usage` skips it and warns how many rows it skipped (with `--json`
+the count is also in `skipped_rows`), and a budget check refuses until it is
+fixed. Model and command names from the ledger are printed on one line, with
+characters that cannot be printed replaced.
+
+Set `ENMAAS_NO_USAGE_LOG=1` to turn recording off. Without a `[budget]`, a
+ledger that cannot be written never stops your command. With a `[budget]`
+configured, the command refuses to start when the ledger cannot be read or
+written or recording is disabled, because it cannot know what has been spent.
+Whenever `ask`, `map` or `enmaas record` tries to write a row and fails, it
+prints one line on stderr, budget or not: `warning: usage was not recorded:
+<reason>`. For a path that is not a regular file the reason is `<path> is not a
+regular file`; for any other failure it is the error class name, such as
+`PermissionError`. The exit code does not change, and `--json` output on stdout
+does not change. With a budget configured, a second line says the run will not
+count against the ceiling. With `ENMAAS_NO_USAGE_LOG` set no write is tried, so
+nothing is printed.
+
+**The ledger file.** When any command creates the state directory, it gets mode
+0700, and a new ledger gets mode 0600. A directory or a ledger that already
+exists keeps its mode. The ledger is opened without following a symbolic link
+and without blocking, and only a regular file is read or written. A link or a
+FIFO at the ledger path is never written through: the command prints
+`warning: usage was not recorded: <path> is not a regular file` and goes on. `enmaas usage` over such a path prints `warning: <path> is not a
+regular file, so no usage was read from it`, reports no calls, and exits 0.
+
+### Runs that stop early
+
+A `map` run writes its ledger event when it ends. So that a run which never
+reaches its end is still counted, it also keeps an open-run record.
+
+**The open-run record.** When `map` starts, it adds one line to
+`open-runs.jsonl` in the same directory as `usage.jsonl`. The line holds a random
+run id, the absolute path of the output directory, the size in bytes of its
+`results.jsonl` at the start, the start time, the process id, the model and the
+dialect. It holds no prompt, answer or key. When any command creates that
+directory, it gets mode 0700; a directory that already exists keeps its mode. The
+file is created with mode 0600, and every change to it
+holds a lock on `open-runs.lock` beside it; the lock file stays there. The line
+is removed after the run's ledger event is written, and the file is removed when
+no line is left. When the ledger event could not be written, the line stays, and
+a later command charges the run once the ledger can be written. The record is
+kept apart from the ledger because it must be removed once the run ends, and the
+ledger only grows. `ENMAAS_NO_USAGE_LOG` turns the records off with the ledger.
+If the record cannot be written, `map` warns that a kill would leave its spend
+uncounted, and runs anyway.
+
+**Every record is checked before it is used.** The record file and the lock file
+must belong to you. A line is skipped when a field has the wrong type, when the
+model is not 1 to 1,024 printable characters, or when the start time is more
+than five minutes in the future. A file larger than 1 MiB or holding more than
+256 records is ignored as a whole, with a warning that names it; delete it if you
+did not create it. A new `map` that cannot add its record to such a file warns
+with the file's name and the reason. With a `[budget]` configured, a record file
+that cannot be read makes the budget check refuse. A record that cannot be
+handled is dropped with a warning that names only the kind of error, and its
+spend is not counted. The lock is held only to load and rewrite the record file,
+never while an index is read, and is waited for at most five seconds. After that
+the command goes on without it: no record is settled, a new `map` warns that its
+record could not be written, and a run that is ending leaves its record for the
+next command. The budget check still counts every record it finds. Nothing read
+from a record or an index is printed; only the model and dialect of a record
+reach the ledger.
+
+**Killed.** A run that is killed (for example by SIGKILL, a crash or a lost
+machine) leaves its record behind. So does a run that stops on an error before
+it writes its event. The next `ask` or `map` checks each record. When its process
+is gone, or the record is more than 48 hours old, it adds up the charge rows in
+`results.jsonl` that carry that run's id in their `run` field and come after its
+starting size, writes one ledger event with `error_kind` `Killed` and that
+charge, and removes the record. Rows of other runs on the same directory, such
+as the run a `--resume` continues or a run started beside it, are not counted.
+The token counts of that event are empty, because only the charge rows survive.
+The event carries the time it was settled, not the time of the run, so its
+charge falls in the rolling window as of that later command. The age limit
+exists because a process id can be reused, which would keep a record alive
+forever.
+
+The indexes are read as a stream, at most 64 MiB in each pass for all records
+together. A command makes two passes, one to settle dead runs and one for the
+budget check, so it reads at most 128 MiB. Records are read smallest index
+first. A line counts only when it is a whole charge row exactly as `map`
+writes it, with the record's run id in its `run` field. No line is parsed as
+JSON, so a line of any other shape costs nothing beyond the read, and a planted
+line can only add spend. When a record's index does not fit
+in what is left of the 64 MiB, settling it waits for the next command, and with
+a `[budget]` configured the budget check refuses for that command. A record that
+has the whole 64 MiB and still does not reach the end is settled, and counted by
+the budget check, with what was read. Settle also removes temporary record files left in the state
+directory for more than an hour.
+
+**Interrupted.** The first SIGINT (Ctrl-C) or SIGTERM stops a `map` run. Rows
+already written are complete, and the run writes its ledger event with
+`error_kind` `Interrupted` and the charge of those rows. It removes its record
+and prints its receipt, headed `enmaas map interrupted`, or with `--json` an
+object with `status` `aborted` and `abort_reason` `interrupted`. Then it ends by
+the same signal: 130 or 143 in a shell. Re-run with `--resume` to finish.
+
+A second SIGINT or SIGTERM ends the process at once, even while it waits on a
+file or a lock. A `map` record that is still there is then charged by the next
+command from its rows, as `Killed`. A signal that is ignored when enmaas starts,
+as in a background job started with SIGINT ignored, stays ignored.
+
+An `ask` stopped while its request is in flight records nothing: no reply had
+arrived, so there is no usage to record. It prints `error: interrupted`, or with
+`--json` an object with `status` `error` and `error` `interrupted`, and ends by
+the signal. A reply that had arrived is recorded: the ledger event is written
+before the result is printed, and from then on the signal changes nothing.
+
+A signal that arrives after a command has written its ledger event and started
+to print its result changes nothing, including the exit status. The output and
+the ledger stay as they are, and the command exits with its own code. The
+installed `enmaas` command ignores SIGINT and SIGTERM from the moment the command
+ends until the process exits, so a late signal cannot end it by its default
+action or print a traceback.
+
+**Index write failures.** `map` refuses to start when `results.jsonl` is a link,
+is not a regular file, or belongs to another user. It exits 1 with an error, or
+with `--json` the error object. When a write to it fails
+during the run, for example because a FIFO was put in its place, the run sends
+no further requests and ends in order. It exits 1, writes its ledger event with
+`error_kind` `IndexWriteError` and every charge that was billed, removes its
+record, and prints a receipt headed `enmaas map stopped: the index could not be
+written` with an `error` line, or with `--json` an object with `status`
+`aborted`, `abort_reason` `index` and the error in `error`.
+
+**When spend is counted twice.** Each of these counts a run twice, once:
+
+- A stop that lands between the ledger write and the record removal, either in
+  the run itself or while a later command settles the record.
+- A run that ends while another process holds the record lock for more than
+  five seconds. Its record stays after its own event, and the next command
+  settles it as `Killed`.
+- A run still alive after 48 hours. The next command settles it as `Killed`, and
+  the run writes its own event when it ends.
+- A run in another container or on another host that shares the state
+  directory. Its process cannot be seen from here, so it looks dead and is
+  settled while it runs.
+
+Counting too much is the safe side for a budget. The other order of the ledger
+write and the record removal could lose the spend instead.
+
+**When spend is undercounted.**
+
+- A killed run whose `results.jsonl` grew by more than 64 MiB after it started.
+  The rest is not read.
+- An output directory that was deleted or replaced, or whose `results.jsonl` was,
+  before the next command. Its rows are gone.
+- A request in flight when the run stopped. No reply arrived, so its cost is not
+  known, though the gateway may still bill it.
+- A dead run whose `results.jsonl` cannot be opened, for example because of its
+  permissions. Its record is kept and each command tries again, and with a
+  `[budget]` configured the budget check refuses meanwhile. Once the record is
+  48 hours old it is dropped with a warning, and that spend is not counted.
 
 ### Counting work this CLI did not do
 
@@ -363,7 +687,10 @@ enmaas record --model rits/zai-org/glm-5-3 --command bug-hunt \
   --input 1067793 --output 49242 --elapsed 612
 ```
 
-`--command` names whatever did the work. Add `--cached` and `--reasoning` when
+`--command` names whatever did the work. `record` refuses a negative count, a
+count above 10^12, and an `--elapsed` that is negative or not a finite number.
+The ledger caps what it stores at 10^18 per count and cuts text to 1,024
+characters. Add `--cached` and `--reasoning` when
 you have them, `--dialect anthropic` when the call used that API shape (the
 default is `openai`), and `--status error --error-kind GatewayError` for a run
 that failed.
@@ -382,3 +709,9 @@ an assistant that writes its own program to open the file is outside its scope. 
 preview and `enmaas allow-read PATH`, run by a person, is the sanctioned
 exception. Full coverage rules, resume behaviour and troubleshooting are in
 [output protection](../skills/enmaas/references/output-protection.md).
+
+`map` never writes `results.jsonl` through a symbolic link. When that path in
+the output directory is a link or anything other than a regular file, `map`
+stops with an error before it sends any request. A new `results.jsonl` gets
+mode 0600, because it names every item and what each request cost; one that
+already exists keeps its mode.

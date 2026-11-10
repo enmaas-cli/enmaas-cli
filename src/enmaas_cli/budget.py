@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from enmaas_cli.dialect import Usage
+from enmaas_cli.tokens import MAX_RECORDED
 from enmaas_cli.usage import UsageEvent
 
 
@@ -73,14 +74,16 @@ def charge_from_rows(rows: Iterable[dict[str, Any]]) -> int:
     place: max(0, sum_in - sum_cached) is not sum of the per-call clamps.
 
     Hostile to malformed rows. A negative or non-integer charge is skipped
-    rather than trusted, since a negative one would hand budget back.
+    rather than trusted, since a negative one would hand budget back. A
+    charge above MAX_RECORDED is skipped too, because no writer of this
+    tool writes one, and it keeps each term small enough to print.
     """
     total = 0
     for row in rows:
         if row.get("type") != "request":
             continue
         charge = row.get("charge")
-        if isinstance(charge, int) and not isinstance(charge, bool) and charge >= 0:
+        if isinstance(charge, int) and not isinstance(charge, bool) and 0 <= charge <= MAX_RECORDED:
             total += charge
     return total
 
@@ -90,7 +93,8 @@ class TokenBudget:
 
     The breaker answers "is this run broken". This answers "has this run
     spent what it was given". Both are consulted after each completed
-    request, inside the same lock, and either can stop the run.
+    request, and either can stop the run. Nothing awaits between a reply
+    arriving and its rows being written, so a cancel cannot separate them.
 
     Holds no I/O, so it is testable without a gateway.
 

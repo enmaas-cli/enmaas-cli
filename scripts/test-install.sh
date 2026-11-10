@@ -273,7 +273,7 @@ hook = entry["hooks"][0]
 need(hook["type"] == "command" and hook["timeout"] == 5)
 need(hook["onFailure"] == "block", hook)
 need(set(hook) == {"type", "command", "timeout", "onFailure"}, hook)
-need(hook["command"] == "python3 -S " + shlex.quote(sys.argv[3]), hook["command"])
+need(hook["command"] == "python3 -I -S " + shlex.quote(sys.argv[3]), hook["command"])
 ' "$CLAUDE/settings.json" "$REPO/hooks/hooks.json" "$GUARD/hooks/pre-tool-use.py"
 
 check "config.toml keeps the seeded lines" py '
@@ -391,6 +391,30 @@ out="$(run_guard "$COMMAND" '{invalid')" || out="guard exited non-zero"
 check "guard denies invalid JSON with an enmaas containment reason" \
   is_deny "$out" "enmaas containment:"
 
+# Both registered commands run Python in isolated mode, so a PYTHONPATH that
+# names the working directory cannot load a json.py planted there.
+HOSTILE="$TMP/hostile"
+mkdir -p "$HOSTILE"
+printf '%s\n' 'open("planted-module-ran.txt", "w").write("ran")' 'raise SystemExit(0)' \
+  >"$HOSTILE/json.py"
+CODEX_COMMAND="$(py '
+import tomllib
+config = tomllib.load(open(sys.argv[1], "rb"))
+for group in config["hooks"]["PreToolUse"]:
+    for hook in group["hooks"]:
+        if sys.argv[2] in hook["command"]:
+            print(hook["command"])
+' "$CODEX/config.toml" "$GUARD_ID")"
+hostile_guard() { (cd "$HOSTILE" && printf '%s' "$2" | PYTHONPATH=. bash -c "$1"); }
+out="$(hostile_guard "$COMMAND" "$(read_event "$ANSWER")")" || out="guard exited non-zero"
+check "settings.json guard denies a protected read with PYTHONPATH=. and a planted json.py" \
+  is_deny "$out" "enmaas containment: full answer"
+out="$(hostile_guard "$CODEX_COMMAND" "$(read_event "$ANSWER")")" || out="guard exited non-zero"
+check "config.toml guard denies a protected read with PYTHONPATH=. and a planted json.py" \
+  is_deny "$out" "enmaas containment: full answer"
+check "neither registered guard ran the planted json.py" \
+  test ! -e "$HOSTILE/planted-module-ran.txt"
+
 # --- Dry runs change nothing -----------------------------------------------
 
 snapshot "$HOME" >"$TMP/before"
@@ -496,7 +520,8 @@ import json, shlex
 matcher = json.load(open(sys.argv[2], encoding="utf-8"))["hooks"]["PreToolUse"][0]["matcher"]
 command = "python3 -S " + shlex.quote(sys.argv[3])
 old = {"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": 5}]}
-new = {"matcher": matcher, "hooks": [dict(old["hooks"][0], onFailure="block")]}
+current = dict(old["hooks"][0], command="python3 -I -S " + shlex.quote(sys.argv[3]))
+new = {"matcher": matcher, "hooks": [dict(current, onFailure="block")]}
 first = {"matcher": "Write", "hooks": [{"type": "command", "command": "echo before"}]}
 last = {"matcher": "Read", "hooks": [{"type": "command", "command": "echo after"}]}
 with open(sys.argv[1] + "/settings.json", "w", encoding="utf-8") as handle:
@@ -515,6 +540,65 @@ check "no onFailure: a second run says already up to date" \
   log_says "$fx/claude/settings.json: already up to date"
 check "no onFailure: a second run leaves settings.json byte-identical" \
   cmp -s "$fx/claude/settings.json" "$TMP/no-on-failure.after-first"
+
+# An earlier version registered the guard as python3 -S, without isolated
+# mode. That registration is the installer's own, so a new install replaces it
+# in place in both hosts and changes nothing else.
+fx="$FIXTURES/old-launcher"
+mkdir -p "$fx/claude" "$fx/codex"
+py '
+import json, shlex
+root, hooks_json, guard = sys.argv[1:4]
+matcher = json.load(open(hooks_json, encoding="utf-8"))["hooks"]["PreToolUse"][0]["matcher"]
+def entry(command):
+    return {"matcher": matcher, "hooks": [
+        {"type": "command", "command": command, "timeout": 5, "onFailure": "block"}]}
+first = {"matcher": "Write", "hooks": [{"type": "command", "command": "echo before"}]}
+old_command = "python3 -S " + shlex.quote(guard)
+new_command = "python3 -I -S " + shlex.quote(guard)
+for name, command in (("settings.json", old_command), ("expected.json", new_command)):
+    with open(f"{root}/claude/{name}", "w", encoding="utf-8") as handle:
+        json.dump({"model": "opus", "hooks": {"PreToolUse": [first, entry(command)]}}, handle,
+                  indent=2)
+def config(command):
+    return (
+        "model = \"gpt-5\"\n\n"
+        "# >>> enmaas guard (managed by enmaas-cli install.sh)\n"
+        "[[hooks.PreToolUse]]\n"
+        f"matcher = {json.dumps(matcher)}\n"
+        f"hooks = [{{ type = \"command\", command = {json.dumps(command)}, timeout = 5 }}]\n"
+        "# <<< enmaas guard\n\n"
+        "[tui]\nnotifications = true\n"
+    )
+with open(f"{root}/codex/config.toml", "w", encoding="utf-8") as handle:
+    handle.write(config(old_command))
+with open(f"{root}/codex/expected.toml", "w", encoding="utf-8") as handle:
+    handle.write(config(new_command))
+' "$fx" "$REPO/hooks/hooks.json" "$fx/data/enmaas/guard/hooks/pre-tool-use.py"
+fx_run old-launcher 0 --skill-only
+check "old launcher: settings.json says it registered the guard" \
+  log_says "$fx/claude/settings.json: registered the enmaas guard"
+check "old launcher: config.toml says it registered the guard" \
+  log_says "$fx/codex/config.toml: registered the enmaas guard"
+check "old launcher: settings.json holds the isolated command in place, nothing else changed" \
+  same_json "$fx/claude/settings.json" "$(cat "$fx/claude/expected.json")"
+check "old launcher: config.toml holds the isolated command in place, nothing else changed" \
+  cmp -s "$fx/codex/config.toml" "$fx/codex/expected.toml"
+OLD_LAUNCHER_COMMAND="$(registered_command "$fx/claude/settings.json")" \
+  || OLD_LAUNCHER_COMMAND="none registered"
+out="$(run_guard "$OLD_LAUNCHER_COMMAND" "$(read_event "$ANSWER")")" || out="guard exited non-zero"
+check "old launcher: the replaced command denies a protected read" is_deny "$out"
+cp "$fx/claude/settings.json" "$TMP/old-launcher.settings"
+cp "$fx/codex/config.toml" "$TMP/old-launcher.config"
+fx_run old-launcher 0 --skill-only
+check "old launcher: a second run says settings.json is up to date" \
+  log_says "$fx/claude/settings.json: already up to date"
+check "old launcher: a second run says config.toml is up to date" \
+  log_says "$fx/codex/config.toml: already up to date"
+# shellcheck disable=SC2016 # the inner shell expands these
+check "old launcher: a second run leaves both files byte-identical" bash -c \
+  'cmp -s "$1" "$2" && cmp -s "$3" "$4"' _ "$fx/claude/settings.json" "$TMP/old-launcher.settings" \
+  "$fx/codex/config.toml" "$TMP/old-launcher.config"
 
 # An empty hooks object comes back with an empty PreToolUse list. The
 # installer never deletes the hooks object or the list, so this is the
@@ -567,6 +651,78 @@ refuse_fixture duplicate-key '{"a": 1, "a": 2}' "" "duplicate key"
 # An unpaired surrogate parses but cannot be written back as UTF-8.
 refuse_fixture lone-surrogate '{"note":"\ud800"}' "" \
   "holds an unpaired surrogate escape"
+
+# A dry run names each file and the change it would make, and prints none of
+# what the files already hold: host settings can carry tokens and headers.
+CLAUDE_PLANTED="PLANTED_CLAUDE_VALUE"
+CODEX_PLANTED="PLANTED_CODEX_VALUE"
+ENMAAS_PLANTED="PLANTED_ENMAAS_VALUE"
+log_lacks_planted() {
+  ! grep -qF -e "$CLAUDE_PLANTED" -e "$CODEX_PLANTED" -e "$ENMAAS_PLANTED" "$FX_LOG"
+}
+fx="$FIXTURES/dry-planted"
+mkdir -p "$fx/claude" "$fx/codex" "$fx/home/.config/enmaas"
+printf '{"env": {"ANTHROPIC_AUTH_TOKEN": "%s"}, "model": "opus"}\n' "$CLAUDE_PLANTED" \
+  >"$fx/claude/settings.json"
+printf '[model_providers.fixture.http_headers]\nX-Token = "%s"\n' "$CODEX_PLANTED" \
+  >"$fx/codex/config.toml"
+printf '# %s\ndefault_model = "m"\n' "$ENMAAS_PLANTED" >"$fx/home/.config/enmaas/config.toml"
+snapshot "$fx" >"$TMP/dry-planted.before"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only --dry-run --gateway https://gw.example.test
+check "dry planted: an install dry run prints no settings content" log_lacks_planted
+check "dry planted: an install dry run names settings.json and the change" \
+  log_says "$fx/claude/settings.json: would add the enmaas guard registration"
+check "dry planted: an install dry run names config.toml and the change" \
+  log_says "$fx/codex/config.toml: would add the enmaas guard registration"
+check "dry planted: an install dry run names the setting it would set" \
+  log_says "$fx/home/.config/enmaas/config.toml: would set base_url"
+snapshot "$fx" >"$TMP/dry-planted.after"
+check "dry planted: the install dry run changed nothing" \
+  cmp -s "$TMP/dry-planted.before" "$TMP/dry-planted.after"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only
+py '
+for name in sys.argv[1:]:
+    text = open(name, encoding="utf-8").read()
+    need("python3 -I -S " in text, name)
+    open(name, "w", encoding="utf-8").write(text.replace("python3 -I -S ", "python3 -S "))
+' "$fx/claude/settings.json" "$fx/codex/config.toml"
+snapshot "$fx" >"$TMP/dry-planted.before"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only --dry-run
+check "dry planted: an update dry run prints no settings content" log_lacks_planted
+check "dry planted: an update dry run says settings.json would be replaced" \
+  log_says "$fx/claude/settings.json: would replace the enmaas guard registration"
+check "dry planted: an update dry run says config.toml would be replaced" \
+  log_says "$fx/codex/config.toml: would replace the enmaas guard registration"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only --dry-run --uninstall
+check "dry planted: an uninstall dry run prints no settings content" log_lacks_planted
+check "dry planted: an uninstall dry run says settings.json would lose the guard" \
+  log_says "$fx/claude/settings.json: would remove the enmaas guard registration"
+check "dry planted: an uninstall dry run says config.toml would lose the guard" \
+  log_says "$fx/codex/config.toml: would remove the enmaas guard registration"
+snapshot "$fx" >"$TMP/dry-planted.after"
+check "dry planted: the update and uninstall dry runs changed nothing" \
+  cmp -s "$TMP/dry-planted.before" "$TMP/dry-planted.after"
+
+# A file that does not parse is named with the place it stops parsing, and
+# none of its text, even when a key in it is the problem.
+for broken in json-unclosed json-duplicate toml-duplicate; do
+  fx="$FIXTURES/dry-broken-$broken"
+  mkdir -p "$fx/claude" "$fx/codex"
+  case "$broken" in
+    json-unclosed)
+      printf '{"env": {"TOKEN": "%s"' "$CLAUDE_PLANTED" >"$fx/claude/settings.json" ;;
+    json-duplicate)
+      printf '{"%s": 1, "%s": 2}' "$CLAUDE_PLANTED" "$CLAUDE_PLANTED" >"$fx/claude/settings.json" ;;
+    toml-duplicate)
+      printf '[%s]\nx = 1\n[%s]\n' "$CODEX_PLANTED" "$CODEX_PLANTED" >"$fx/codex/config.toml" ;;
+  esac
+  snapshot "$fx" >"$TMP/dry-broken.before"
+  fx_run "dry-broken-$broken" 1 --skill-only --dry-run
+  check "dry broken $broken: the refusal says the file is not valid" log_says "is not valid"
+  check "dry broken $broken: the refusal prints none of the file" log_lacks_planted
+  snapshot "$fx" >"$TMP/dry-broken.after"
+  check "dry broken $broken: nothing changed" cmp -s "$TMP/dry-broken.before" "$TMP/dry-broken.after"
+done
 # A dangling symlink is an error.
 fx="$FIXTURES/dangling-link"
 mkdir -p "$fx/claude"
@@ -712,7 +868,7 @@ mkdir -p "$fx/claude" "$TMP/broken-python"
 fx_run staged 0 --skill-only
 snapshot "$fx/data/enmaas/guard" >"$TMP/staged.before"
 # shellcheck disable=SC2016 # the shim expands these itself
-printf '#!/bin/sh\ncase "$1 $2 $3" in "-S -B "*/pre-tool-use.py) exit 1 ;; esac\nexec "%s" "$@"\n' \
+printf '#!/bin/sh\ncase "$1 $2 $3 $4" in "-I -S -B "*/pre-tool-use.py) exit 1 ;; esac\nexec "%s" "$@"\n' \
   "$REAL_PYTHON" >"$TMP/broken-python/python3"
 chmod +x "$TMP/broken-python/python3"
 FX_PATH="$TMP/broken-python" fx_run staged 1 --skill-only
