@@ -744,6 +744,33 @@ class Interrupt:
     """The first stop signal this process received, if any."""
 
     signum: int | None = None
+    # Set once the interrupted error has been printed, so it is printed once.
+    reported: bool = False
+
+
+@dataclass
+class Final:
+    """The exit code of a command that has finished and is printing its result.
+
+    Set by _dispatch just before the final receipt or JSON object of ask and
+    map. From then on a stop signal changes nothing: the ledger already says
+    what happened, and the process exits with this code. The one exception
+    is a result that itself reports the interrupt, which ends by the signal.
+    """
+
+    code: int | None = None
+    # True when the printed result is a run stopped by the signal.
+    interrupted: bool = False
+
+    def overrides(self, interrupt: Interrupt) -> bool:
+        """Whether this result decides the exit, so a pending signal is dropped."""
+        if self.code is None or self.interrupted:
+            return False
+        interrupt.signum = None
+        return True
+
+
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 async def _guarded(
@@ -752,29 +779,78 @@ async def _guarded(
     base_url: str,
     key: str,
     interrupt: Interrupt,
+    final: Final,
 ) -> int:
-    """Run the command with SIGINT and SIGTERM turned into a cancel.
+    """Run the command with SIGINT and SIGTERM handled the way asyncio.Runner handles SIGINT.
 
-    The cancel lets an interrupted map write its ledger event and print its
-    receipt before the process ends by the same signal.
+    The first signal cancels the command, so an interrupted map writes its
+    ledger event and prints its receipt before the process ends by the same
+    signal. The second signal ends the process at once, even while it waits
+    on a lock or a file, because a Python signal handler runs when a
+    blocking system call is interrupted.
+
+    Installed with signal.signal and restored on the way out, so calling
+    main in-process leaves the handlers as they were. A signal that is
+    ignored when the command starts stays ignored.
     """
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
 
-    def on_signal(signum: int) -> None:
-        # Only the first signal acts. Later ones are ignored so the ledger
-        # line is always written.
-        if interrupt.signum is None and task is not None:
-            interrupt.signum = signum
+    def cancel() -> None:
+        # The result may have been reported by the time this runs. A cancel
+        # then changes nothing, so none is sent.
+        if final.code is None and task is not None:
             task.cancel()
 
-    with contextlib.suppress(NotImplementedError, ValueError, RuntimeError):
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(signum, on_signal, signum)
+    def on_signal(signum: int, frame: object) -> None:
+        if interrupt.signum is None:
+            interrupt.signum = signum
+            if final.code is not None:
+                # The command finished and printed. A cancel now changes
+                # nothing, so none is sent.
+                return
+            # Scheduled, not called here. A Python signal handler can run in
+            # the middle of another callback, and cancelling there can cancel
+            # a future between its done() check and set_result(). This also
+            # wakes the loop, as asyncio.Runner does for SIGINT.
+            loop.call_soon_threadsafe(cancel)
+            return
+        # Second signal. End now by that signal. An open-run record that is
+        # still present is settled by the next command, so the spend is kept.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    previous: dict[int, Any] = {}
+    for signum in STOP_SIGNALS:
+        # ValueError: not the main thread. OSError: the platform refused.
+        with contextlib.suppress(ValueError, OSError):
+            if signal.getsignal(signum) is signal.SIG_IGN:
+                # A background job started with the signal ignored keeps
+                # ignoring it.
+                continue
+            previous[signum] = signal.signal(signum, on_signal)
     try:
-        return await _dispatch(args, config, base_url, key)
+        code = await _dispatch(args, config, base_url, key, final)
+        # A cancel that arrived after the work was done can be absorbed by
+        # an await on the way out, such as closing the client. The printed
+        # result still decides the exit.
+        final.overrides(interrupt)
+        return code
     except asyncio.CancelledError:
+        if final.code is not None:
+            # The command had finished and printed before the cancel was
+            # seen. It exits with its own code, or by the signal when the
+            # result reports the interrupt.
+            final.overrides(interrupt)
+            return final.code
+        interrupt.reported = True
         return _setup_error(args, "interrupted")
+    finally:
+        for number, handler in previous.items():
+            # TypeError: a previous handler of None was not set from Python
+            # and cannot be put back.
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(number, handler)
 
 
 def _flush_quietly() -> None:
@@ -831,20 +907,43 @@ def main(argv: list[str] | None = None) -> int:
         key_value = key.value
 
     interrupt = Interrupt()
+    final = Final()
     try:
         try:
-            code = asyncio.run(_guarded(args, config, base_url, key_value, interrupt))
+            code = asyncio.run(_guarded(args, config, base_url, key_value, interrupt, final))
+        except asyncio.CancelledError:
+            # A cancel that was still pending when the command returned
+            # cancels the task itself, outside every handler in _guarded.
+            if final.code is not None:
+                final.overrides(interrupt)
+                code = final.code
+            else:
+                if not interrupt.reported:
+                    interrupt.reported = True
+                    _setup_error(args, "interrupted")
+                code = int(ExitCode.ERROR)
         except (DialectError, ValidationError, ValueError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             code = int(ExitCode.ERROR)
         if interrupt.signum is not None:
+            # A further signal while the output is flushed must not raise.
+            for signum in STOP_SIGNALS:
+                signal.signal(signum, signal.SIG_IGN)
             _flush_quietly()
     except KeyboardInterrupt:
-        # SIGINT outside the window where the loop handles it, either
-        # before the handler is installed or after it is removed.
-        if interrupt.signum is None:
-            interrupt.signum = signal.SIGINT
-        code = int(ExitCode.ERROR)
+        # SIGINT outside the window where _guarded handles it, either before
+        # its handler is installed or after it is removed.
+        if final.overrides(interrupt) and final.code is not None:
+            # The command had finished and printed. Nothing changes.
+            code = final.code
+        else:
+            if interrupt.signum is None:
+                interrupt.signum = signal.SIGINT
+            if not interrupt.reported and final.code is None:
+                # A --json caller still gets one object.
+                interrupt.reported = True
+                _setup_error(args, "interrupted")
+            code = int(ExitCode.ERROR)
     if interrupt.signum is not None:
         # End by the same signal, so the parent sees how the process stopped
         # (130 or 143 in a shell) rather than an ordinary exit code.
@@ -855,7 +954,9 @@ def main(argv: list[str] | None = None) -> int:
     return code
 
 
-async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key: str) -> int:
+async def _dispatch(
+    args: argparse.Namespace, config: Config, base_url: str, key: str, final: Final
+) -> int:
     if args.command == "record":
         # A ledger that only sees this CLI's own calls understates reality:
         # a tool talking to the gateway directly is invisible by
@@ -1021,6 +1122,9 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 ),
             )
             _warn_if_untracked(recorded, config)
+            # Reported before the result is printed. From here a stop signal
+            # changes nothing.
+            final.code = result.exit_code
 
             if args.json:
                 # Machine-readable output
@@ -1133,6 +1237,10 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
         # record stays, so a later command settles the run once it can.
         if recorded:
             openruns.end(state_root(), record)
+        # Reported before the result is printed. From here a stop signal
+        # changes nothing.
+        final.code = outcome.exit_code
+        final.interrupted = outcome.abort_reason == "interrupted"
 
         if args.json:
             status = (
