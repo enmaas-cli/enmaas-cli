@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from enmaas_cli.cli import run_ask
+from enmaas_cli.ask import run_ask
 from enmaas_cli.dialect import build_request
 from enmaas_cli.schema import ValidationError
 

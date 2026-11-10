@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from enmaas_cli.cli import run_ask
+from enmaas_cli.ask import run_ask
 
 
 def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:

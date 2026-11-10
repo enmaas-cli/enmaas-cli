@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from enmaas_cli import cli
+from enmaas_cli import ask, cli
 from enmaas_cli.auth import AuthError, resolve_key
 from enmaas_cli.client import MAX_RETRY_AFTER_SECONDS, GatewayError, call
 from enmaas_cli.dialect import EmptyResponseError, Request, parse_response
@@ -169,7 +169,7 @@ def test_bad_usage_counts_reach_the_ledger_and_json_as_none(
     async def fake_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
         return _empty_openai({"prompt_tokens": "abc", "completion_tokens": "Z" * 9000})
 
-    monkeypatch.setattr(cli, "call", fake_call)
+    monkeypatch.setattr(ask, "call", fake_call)
     argv = ["--config", str(tmp_path / "none.toml"), "ask", "-p", "x", "-m", "gpt-4o", "--json"]
     code = cli.main(argv)
     captured = capsys.readouterr()
@@ -314,7 +314,7 @@ def test_ask_refuses_an_output_that_is_a_symbolic_link(
         calls += 1
         return OK
 
-    monkeypatch.setattr(cli, "call", fake_call)
+    monkeypatch.setattr(ask, "call", fake_call)
     victim = tmp_path / "victim.txt"
     victim.write_text("keep me")
     link = tmp_path / "answer.md"
@@ -339,7 +339,7 @@ def test_ask_writes_a_new_output_with_mode_600(
     async def fake_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
         return OK
 
-    monkeypatch.setattr(cli, "call", fake_call)
+    monkeypatch.setattr(ask, "call", fake_call)
     output = tmp_path / "answer.md"
     argv = ["--config", str(tmp_path / "none.toml"), "ask", "-p", "x", "-m", "gpt-4o"]
     code = cli.main([*argv, "-o", str(output)])
@@ -361,7 +361,7 @@ def test_ask_passes_the_key_to_call_for_redaction(
         seen.append(kwargs.get("secret", ""))
         return OK
 
-    monkeypatch.setattr(cli, "call", fake_call)
+    monkeypatch.setattr(ask, "call", fake_call)
     argv = ["--config", str(tmp_path / "none.toml"), "ask", "-p", "x", "-m", "gpt-4o"]
     assert cli.main(argv) == 0, capsys.readouterr().err
     assert seen == ["local-fixture-key"]

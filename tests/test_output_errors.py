@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from enmaas_cli import cli
+from enmaas_cli import ask, cli
 from enmaas_cli.outputs import is_protected
 from enmaas_cli.schema import ValidationError, validate_against_schema
 
@@ -52,7 +52,7 @@ def test_schema_failure_reports_saved_path_without_response_body(
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         }
 
-    monkeypatch.setattr(cli, "call", fake_call)
+    monkeypatch.setattr(ask, "call", fake_call)
     args = [
         "--config",
         str(tmp_path / "no-config.toml"),

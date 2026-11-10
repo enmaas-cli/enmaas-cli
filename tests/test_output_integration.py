@@ -6,7 +6,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from enmaas_cli.cli import main, run_ask
+from enmaas_cli.ask import run_ask
+from enmaas_cli.cli import main
 from enmaas_cli.outputs import allow_read, is_protected, marker_path, protect
 from enmaas_cli.runner import run_map
 

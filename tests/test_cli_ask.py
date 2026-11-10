@@ -5,13 +5,13 @@ from pathlib import Path
 import pytest
 
 from enmaas_cli.cli import (
-    ExitCode,
     assemble_prompt,
     build_parser,
     resolve_thinking,
     rolling_check,
 )
 from enmaas_cli.config import Config
+from enmaas_cli.errors import ExitCode
 
 
 def test_files_are_wrapped_in_labelled_blocks(tmp_path: Path) -> None:

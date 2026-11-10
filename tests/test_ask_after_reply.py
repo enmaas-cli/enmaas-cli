@@ -14,7 +14,8 @@ from typing import Any
 import httpx
 import pytest
 
-from enmaas_cli.cli import main, run_ask
+from enmaas_cli.ask import run_ask
+from enmaas_cli.cli import main
 
 REPLY = {
     "choices": [{"finish_reason": "stop", "message": {"content": '{"a": 1}'}}],
@@ -60,7 +61,7 @@ def test_a_write_that_fails_keeps_the_charge(
     def write(path: Path, text: str) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr("enmaas_cli.cli.write_output", write)
+    monkeypatch.setattr("enmaas_cli.ask.write_output", write)
     assert _ask(tmp_path, monkeypatch) == 1
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out + captured.err
@@ -78,7 +79,7 @@ def test_a_write_that_fails_after_a_schema_failure_keeps_the_charge(
     def write(path: Path, text: str) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr("enmaas_cli.cli.write_output", write)
+    monkeypatch.setattr("enmaas_cli.ask.write_output", write)
     schema = tmp_path / "schema.json"
     schema.write_text(json.dumps({"type": "array"}), encoding="utf-8")
     assert _ask(tmp_path, monkeypatch, "--schema", str(schema)) == 1
@@ -99,7 +100,7 @@ def test_an_unexpected_error_keeps_the_charge_and_never_its_text(
     def validate(text: str, schema: dict[str, Any]) -> None:
         raise RuntimeError("secret text")
 
-    monkeypatch.setattr("enmaas_cli.cli.validate_against_schema", validate)
+    monkeypatch.setattr("enmaas_cli.ask.validate_against_schema", validate)
     extra = ["--schema", str(_schema(tmp_path))] + (["--json"] if as_json else [])
     assert _ask(tmp_path, monkeypatch, *extra) == 1
     captured = capsys.readouterr()
@@ -119,7 +120,7 @@ async def test_a_cancel_after_the_reply_passes_through(
     def write(path: Path, text: str) -> None:
         raise asyncio.CancelledError
 
-    monkeypatch.setattr("enmaas_cli.cli.write_output", write)
+    monkeypatch.setattr("enmaas_cli.ask.write_output", write)
     async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
         with pytest.raises(asyncio.CancelledError):
             await run_ask(
