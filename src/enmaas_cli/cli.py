@@ -13,6 +13,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -25,7 +26,7 @@ import httpx
 from . import openruns
 from .auth import AuthError, cut_redacted, printable, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
-from .client import call, is_loopback, make_client
+from .client import _reply_object, call, is_loopback, make_client
 from .config import Config, ConfigError, default_config_path, load_config
 from .dialect import (
     ANTHROPIC_VERSION,
@@ -38,7 +39,7 @@ from .dialect import (
     parse_response,
     resolve_dialect,
 )
-from .errors import CallError, where
+from .errors import BadReplyError, CallError, where
 from .outputs import (
     MAX_INSPECT_CHARS,
     allow_read,
@@ -544,8 +545,18 @@ async def run_models(
         )
         response = await client.get(f"{base_url}/v1/models", headers=headers, timeout=timeout)
         response.raise_for_status()
-        for entry in response.json().get("data", []):
-            found.setdefault(str(entry.get("id")), set()).add(d)
+        # A catalog of the wrong shape is a bad reply. The messages name
+        # the problem only, never the body.
+        body = _reply_object(response, key)
+        entries = body.get("data")
+        if not isinstance(entries, list):
+            raise BadReplyError(f"the {d} model catalog has no list of models")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                raise BadReplyError(
+                    f"the {d} model catalog holds an entry that is not an object with a string id"
+                )
+            found.setdefault(entry["id"], set()).add(d)
     return [
         {"id": model_id, "dialects": sorted(dialects)}
         for model_id, dialects in sorted(found.items())
@@ -727,7 +738,7 @@ def _validate_gateway_url(url: str) -> str:
 
 
 def _setup_error(args: argparse.Namespace, message: str) -> int:
-    """Report a URL or key failure before any request is made.
+    """Report an error that ends the command, as its one result.
 
     A --json caller reads stdout only, so an error there must be JSON too.
     An empty stdout would leave it guessing why the run stopped.
@@ -737,6 +748,15 @@ def _setup_error(args: argparse.Namespace, message: str) -> int:
     else:
         print(f"error: {message}", file=sys.stderr)
     return int(ExitCode.ERROR)
+
+
+def _error_text(message: str, key: str) -> str:
+    """The text of an error that ends a command.
+
+    The key is removed first, then the text is made printable on one line,
+    then cut. Redaction comes before the cut, or part of a key could survive.
+    """
+    return cut_redacted(printable(redact(message, key)), FAILURE_MESSAGE_CHARS)
 
 
 def _emit(text: str, stream: TextIO | None = None) -> None:
@@ -887,6 +907,24 @@ async def _guarded(
                     signal.signal(number, signal.SIG_DFL if handler is None else handler)
 
 
+def _final_error(args: argparse.Namespace, final: Final, interrupt: Interrupt, message: str) -> int:
+    """Print an error that escaped the command, as the command's result.
+
+    The exit code is set before the print, as for every final output, so a
+    stop signal from then on changes nothing. If the command had already
+    printed its result, a second JSON object would break a --json reader,
+    so the error goes to stderr as text and the result's code stands.
+    """
+    if final.code is None:
+        final.code = int(ExitCode.ERROR)
+        _setup_error(args, message)
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    code = final.code
+    final.overrides(interrupt)
+    return code
+
+
 def _flush_quietly() -> None:
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
@@ -919,6 +957,8 @@ def main(argv: list[str] | None = None, *, process: bool = False) -> int:
         # A malformed [budget] table is the only fatal config error.
         # Proceeding would run uncapped, which is what it was written to
         # prevent, so refuse rather than warn.
+        if getattr(args, "json", False):
+            return _setup_error(args, _error_text(str(exc), ""))
         print(f"enmaas: {exc}", file=sys.stderr)
         return 1
     for warning in config.warnings:
@@ -966,8 +1006,16 @@ def main(argv: list[str] | None = None, *, process: bool = False) -> int:
                     _setup_error(args, "interrupted")
                 code = int(ExitCode.ERROR)
         except (DialectError, ValidationError, ValueError, OSError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            code = int(ExitCode.ERROR)
+            code = _final_error(args, final, interrupt, _error_text(str(exc), key_value))
+        except Exception as exc:
+            # Never the exception text: an error no handler expected can
+            # carry part of a reply or a prompt. Where it happened is enough
+            # to report it. CancelledError and KeyboardInterrupt are not
+            # Exception subclasses, so they reach the handlers for them.
+            message = f"internal error ({where(exc)})"
+            code = _final_error(args, final, interrupt, _error_text(message, key_value))
+            if os.environ.get("ENMAAS_DEBUG") == "1":
+                print(redact(traceback.format_exc(), key_value), file=sys.stderr, end="")
         if interrupt.signum is not None:
             # A further signal while the output is flushed must not raise.
             for signum in STOP_SIGNALS:
@@ -1118,10 +1166,9 @@ async def _dispatch(
                     dialect=args.dialect or "both",
                     timeout=timeout,
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, CallError) as exc:
                 final.code = int(ExitCode.ERROR)
-                print(f"error: {redact(str(exc), key)}", file=sys.stderr)
-                return int(ExitCode.ERROR)
+                return _setup_error(args, _error_text(str(exc), key))
             final.code = int(ExitCode.OK)
             if args.json:
                 print(json.dumps(rows, indent=2))
