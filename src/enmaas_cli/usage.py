@@ -118,6 +118,20 @@ def _open_for_append(ledger: Path) -> int:
     return fd
 
 
+def can_append(ledger: Path) -> bool:
+    """Whether one row could be appended now, by the same rules append_event uses.
+
+    Creates the ledger and its directory when they are missing, and writes
+    nothing. A budget can only bind when its spend is written down, so a
+    budgeted command proves this before it sends a request.
+    """
+    try:
+        os.close(_open_for_append(ledger))
+    except OSError:
+        return False
+    return True
+
+
 def append_event(ledger: Path, event: UsageEvent) -> bool:
     """Write one event as a JSON line. Returns whether it was recorded.
 

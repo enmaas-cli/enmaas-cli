@@ -62,6 +62,7 @@ from .tokens import MAX_TOKEN_COUNT
 from .usage import (
     UsageEvent,
     append_event,
+    can_append,
     format_summary,
     format_summary_json,
     load_events_counted,
@@ -1160,6 +1161,21 @@ async def _dispatch(
                 file=sys.stderr,
             )
         return int(ExitCode.ABORTED)
+
+    if (
+        args.command in ("ask", "map")
+        and rolling.ceiling is not None
+        and not can_append(state_root() / "usage.jsonl")
+    ):
+        # A ledger that cannot be written reads as no spend on the next run,
+        # so every run would start from zero and the budget would never bind.
+        final.code = int(ExitCode.ERROR)
+        return _setup_error(
+            args,
+            f"the usage ledger {printable(str(state_root() / 'usage.jsonl'))} cannot be "
+            "written, so the token budget cannot be tracked; fix it or remove the [budget] "
+            "table from the config",
+        )
 
     timeout = args.timeout if args.timeout is not None else config.timeout
     async with make_client(base_url) as client:
