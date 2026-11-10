@@ -56,12 +56,22 @@ and versions follow [Semantic Versioning](https://semver.org/).
   "validation" was filed as `ValidationError` and a schema failure as `Error`.
 - A `map` run that is killed no longer loses its spend. Each run keeps an
   open-run record in `open-runs.jsonl` beside the ledger, and the next `ask` or
-  `map` charges a dead run's rows to the ledger as `Killed`. Only rows written
-  after the run started count, so a resumed directory is not charged twice.
+  `map` charges a dead run's rows to the ledger as `Killed`. Only the charge
+  rows that run wrote itself count, so a resumed directory or a second run on
+  the same directory is not charged twice. A run whose ledger event could not
+  be written keeps its record, so a later command charges it. Every record is
+  checked before it is used: the files must belong to you, the start time
+  cannot be in the future, and a record that cannot be handled is dropped
+  with a warning in place of stopping the command. The lock on the records is
+  waited for at most five seconds. A `Killed` event is written only when the
+  record file can also be rewritten, so a damaged state directory cannot
+  charge the same run on every command.
 - SIGINT and SIGTERM no longer end a `map` run before it records anything. The
   run writes its ledger event as `Interrupted`, prints its receipt, and then
-  ends by the same signal. A second signal is ignored. An interrupted `ask`
-  prints `error: interrupted` in place of a traceback and records nothing.
+  ends by the same signal. An interrupted `ask` prints `error: interrupted` in
+  place of a traceback and records nothing. A signal that is ignored when
+  enmaas starts stays ignored, and calling `main` in-process leaves the signal
+  handlers as they were.
 - A reader that closes stdout before the receipt is printed no longer makes a
   finished `ask` or `map` exit 120 with a `BrokenPipeError`.
 
@@ -72,7 +82,27 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `failed`. Please report them.
 - The usage ledger can record `BadReplyError` as the `error_kind` of an `ask`.
 - The rolling budget check now adds what `map` runs still in progress have
-  charged so far.
+  charged so far. It reads them before the ledger, so a run that ends during
+  the check is counted, and its refusal says how much came from open runs and
+  names `open-runs.jsonl`.
+- A second SIGINT or SIGTERM ends the process at once, even while it waits on
+  a file or a lock. The next command charges a `map` run stopped this way from
+  its open-run record. A signal that arrives after a command has printed its
+  result changes neither the ledger nor the output.
+- Each charge row in `results.jsonl` now names the run that wrote it in a `run`
+  field, when the run has an open-run record.
+- `map` refuses to start when `results.jsonl` in the output directory is a
+  symbolic link or not a regular file, and it never writes the index through a
+  link.
+- Reading open runs is bounded: one command reads at most 64 MiB of index for
+  all records together and skips lines over 64 KiB. A killed run whose index
+  grew by more than that is undercounted. An `open-runs.jsonl` over 1 MiB or
+  with more than 256 records is ignored with a warning that names it.
+- A token count or charge above 10**12 is refused by `enmaas record`, skipped
+  in a charge row, and treated as a damaged row in the usage ledger.
+- `enmaas usage` prints model and command names from the ledger on one line,
+  with characters that cannot be printed replaced. An open-run record is used
+  only when its model name has the characters a model id needs.
 - `map` has a new `abort_reason`, `interrupted`, with the receipt header
   `enmaas map interrupted`. The ledger can record `Killed` and `Interrupted` as
   the `error_kind` of a `map`.

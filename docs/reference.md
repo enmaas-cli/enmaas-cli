@@ -193,9 +193,9 @@ costs a request, which `--token-budget` can bound.
 Usage errors (invalid flags, missing required arguments) exit 1, so exit code 2 unambiguously means partial failure.
 
 An interrupted `ask` or `map` ends by the signal that stopped it, after it has
-printed its receipt, so the caller sees how it stopped. A shell shows 128 plus
-the signal number; a program that starts enmaas sees the signal itself. See
-[Runs that stop early](#runs-that-stop-early).
+printed its receipt or error, so the caller sees how it stopped. A shell shows
+128 plus the signal number; a program that starts enmaas sees the signal itself.
+See [Runs that stop early](#runs-that-stop-early).
 
 On exit code 3 from `map`, re-run with `--resume` to skip completed items. If the stop was a per-run `--token-budget`, raise it on the resumed command. If it was the rolling `[budget]` in the config, which can also stop `ask`, raise the ceiling in the config or wait for the window to move; `--resume` alone will stop again immediately.
 
@@ -230,9 +230,10 @@ bound without bounding request size.
 `{"type": "request", "charge": N, "items": K, "run": "<run id>"}` row to
 `results.jsonl`, and a resumed run adds up every charge row, whichever run wrote
 it, before spending anything. So `--resume` on its own re-trips immediately.
-The `run` field is the id of the run's open-run record (see below). It is absent
-when no record was written, for example with `ENMAAS_NO_USAGE_LOG` set.
-To carry on, raise the ceiling deliberately:
+The `run` field is the id of the run's open-run record (see
+[Runs that stop early](#runs-that-stop-early)). It is absent when no record was
+written, for example with `ENMAAS_NO_USAGE_LOG` set. A charge above 10^12 tokens
+in a row is not counted. To carry on, raise the ceiling deliberately:
 
 ```bash
 enmaas map --items items.jsonl --template template.txt --outdir out --token-budget 2000000 --resume
@@ -332,8 +333,11 @@ the ceiling has quietly stopped tracking.
 **Not an enforcement boundary for runs side by side.** Each run reads the ledger
 at startup and writes its event at the end. The check also adds what `map` runs
 still in progress have charged so far, read from their open-run records (see
-[Runs that stop early](#runs-that-stop-early)). That narrows the gap but does not
-close it. Two runs started together against 9,000,000 spent of a 10,000,000
+[Runs that stop early](#runs-that-stop-early)). The records are read before the
+ledger, so a run that ends between the two reads is counted twice for that one
+check, never zero times. When open runs add to the spend, the refusal says how
+much and names `open-runs.jsonl`, so you can find a record that should not be
+there. That narrows the gap but does not close it. Two runs started together against 9,000,000 spent of a 10,000,000
 ceiling each see the other at zero, each believe 1,000,000 remains, and together
 can spend 2,000,000. This is a guard against your own drift over time.
 Enforcing a ceiling across concurrent use needs a server-side budget, which a
@@ -359,6 +363,11 @@ The summary shows totals and breakdowns by model and by command. Models with a
 `[prices.*]` entry in the config are priced; `rits/*` models are known to be free;
 anything else is reported as unpriced.
 
+A row with a count or charge above 10^12 is treated like a damaged row: `enmaas
+usage` skips it, and a budget check refuses until it is fixed. Model and command
+names from the ledger are printed on one line, with characters that cannot be
+printed replaced.
+
 Set `ENMAAS_NO_USAGE_LOG=1` to turn recording off. A ledger that cannot be
 written never stops your command. With a `[budget]` configured you also get a
 warning that the run will not count against the ceiling, and the command refuses
@@ -374,43 +383,99 @@ reaches its end is still counted, it also keeps an open-run record.
 `open-runs.jsonl` in the same directory as `usage.jsonl`. The line holds a random
 run id, the absolute path of the output directory, the size in bytes of its
 `results.jsonl` at the start, the start time, the process id, the model and the
-dialect. It holds no prompt, answer or key. The file is created with mode 0600,
-and every change to it holds a lock on `open-runs.lock` beside it. The line is
-removed after the run's ledger event is written, and the file is removed when no
-line is left. The record is kept apart from the ledger because it must be
-removed once the run ends, and the ledger only grows. `ENMAAS_NO_USAGE_LOG`
-turns the records off with the ledger. If the record cannot be written, `map`
-warns that a kill would leave its spend uncounted, and runs anyway.
+dialect. It holds no prompt, answer or key. When `ask` or `map` creates that
+directory, it gets mode 0700; a directory that already exists keeps its mode. The
+file is created with mode 0600, and every change to it
+holds a lock on `open-runs.lock` beside it; the lock file stays there. The line
+is removed after the run's ledger event is written, and the file is removed when
+no line is left. When the ledger event could not be written, the line stays, and
+a later command charges the run once the ledger can be written. The record is
+kept apart from the ledger because it must be removed once the run ends, and the
+ledger only grows. `ENMAAS_NO_USAGE_LOG` turns the records off with the ledger.
+If the record cannot be written, `map` warns that a kill would leave its spend
+uncounted, and runs anyway.
+
+**Every record is checked before it is used.** The record file and the lock file
+must belong to you. A line is skipped when a field has the wrong type, when the
+model name holds a character other than a letter, a digit or `._:/@+-`, or when
+the start time is more than five minutes in the future. A file larger than 1 MiB
+or holding more than 256 records is ignored as a whole, with a warning that names
+it; delete it if you did not create it. A record that cannot be handled is
+dropped with a warning that names only the kind of error, and its spend is not
+counted. The lock is waited for at most five seconds. After that the command
+goes on without it: no record is settled, a new `map` warns that its record
+could not be written, and a run that is ending leaves its record for the next
+command. Nothing read from a record or an index is printed; only the model and
+dialect of a record reach the ledger.
 
 **Killed.** A run that is killed (for example by SIGKILL, a crash or a lost
 machine) leaves its record behind. So does a run that stops on an error before
 it writes its event. The next `ask` or `map` checks each record. When its process
-is gone, or the record is more than 48 hours old, it adds up the charge rows that
-run wrote to `results.jsonl` after its starting size, writes one ledger event
-with `error_kind` `Killed` and that charge, and removes the record. The token
-counts of that event are empty, because only the charge rows survive. Rows from
-before the start belong to earlier runs on the same directory, such as the run a
-`--resume` continues, so they are not counted twice. The age limit exists because
-a process id can be reused, which would keep a record alive forever.
+is gone, or the record is more than 48 hours old, it adds up the charge rows in
+`results.jsonl` that carry that run's id in their `run` field and come after its
+starting size, writes one ledger event with `error_kind` `Killed` and that
+charge, and removes the record. Rows of other runs on the same directory, such
+as the run a `--resume` continues or a run started beside it, are not counted.
+The token counts of that event are empty, because only the charge rows survive.
+The event carries the time it was settled, not the time of the run, so its
+charge falls in the rolling window as of that later command. The age limit
+exists because a process id can be reused, which would keep a record alive
+forever.
 
-**Interrupted.** SIGINT (Ctrl-C) or SIGTERM stops a `map` run at once. Rows
+The indexes are read as a stream, at most 64 MiB in total in one command for
+all records together. A line longer than 64 KiB is skipped. When a record's
+index does not fit in what is left of the 64 MiB, it waits for the next command,
+which starts with it. A record that has the whole 64 MiB and still does not
+reach the end is settled with what was read.
+
+**Interrupted.** The first SIGINT (Ctrl-C) or SIGTERM stops a `map` run. Rows
 already written are complete, and the run writes its ledger event with
 `error_kind` `Interrupted` and the charge of those rows. It removes its record
 and prints its receipt, headed `enmaas map interrupted`, or with `--json` an
 object with `status` `aborted` and `abort_reason` `interrupted`. Then it ends by
-the same signal: 130 or 143 in a shell. Re-run with `--resume` to finish. Requests
-in flight at the interrupt are dropped and not recorded: no reply arrived, so
-their cost is not known, though the gateway may still bill them. Only the first
-signal acts; a second one is ignored so the ledger event is always written.
+the same signal: 130 or 143 in a shell. Re-run with `--resume` to finish.
+
+A second SIGINT or SIGTERM ends the process at once, even while it waits on a
+file or a lock. A `map` record that is still there is then charged by the next
+command from its rows, as `Killed`. A signal that is ignored when enmaas starts,
+as in a background job started with SIGINT ignored, stays ignored.
 
 An interrupted `ask` records nothing. Its one request had not returned, so there
 is no usage to record. It prints `error: interrupted`, or with `--json` an object
 with `status` `error` and `error` `interrupted`, and ends by the signal.
 
-**Counted twice, in one case.** The ledger event is written before the record is
-removed. A kill that lands between the two leaves the record, so the next run
-charges that run a second time. The other order could lose the spend instead,
-and counting too much is the safe side for a budget.
+A signal that arrives after `ask` or `map` has written its ledger event and
+started to print its result changes nothing. The output and the ledger stay as
+they are, and the command exits with its own code. One short window remains:
+once the command has put back the previous signal handlers on its way out, a
+signal takes its default action, so the process can still end by it, and a
+SIGINT there can print Python's `KeyboardInterrupt` traceback. The ledger and
+the output are complete by then.
+
+**When spend is counted twice.** Each of these counts a run twice, once:
+
+- A stop that lands between the ledger write and the record removal, either in
+  the run itself or while a later command settles the record.
+- A run that ends while another process holds the record lock for more than
+  five seconds. Its record stays after its own event, and the next command
+  settles it as `Killed`.
+- A run still alive after 48 hours. The next command settles it as `Killed`, and
+  the run writes its own event when it ends.
+- A run in another container or on another host that shares the state
+  directory. Its process cannot be seen from here, so it looks dead and is
+  settled while it runs.
+
+Counting too much is the safe side for a budget. The other order of the ledger
+write and the record removal could lose the spend instead.
+
+**When spend is undercounted.**
+
+- A killed run whose `results.jsonl` grew by more than 64 MiB after it started.
+  The rest is not read.
+- An output directory that was deleted or replaced, or whose `results.jsonl` was,
+  before the next command. Its rows are gone.
+- A request in flight when the run stopped. No reply arrived, so its cost is not
+  known, though the gateway may still bill it.
 
 ### Counting work this CLI did not do
 
@@ -422,7 +487,7 @@ enmaas record --model rits/zai-org/glm-5-3 --command bug-hunt \
   --input 1067793 --output 49242 --elapsed 612
 ```
 
-`--command` names whatever did the work. Add `--cached` and `--reasoning` when
+`--command` names whatever did the work. A count above 10^12 is refused. Add `--cached` and `--reasoning` when
 you have them, `--dialect anthropic` when the call used that API shape (the
 default is `openai`), and `--status error --error-kind GatewayError` for a run
 that failed.
@@ -441,3 +506,7 @@ an assistant that writes its own program to open the file is outside its scope. 
 preview and `enmaas allow-read PATH`, run by a person, is the sanctioned
 exception. Full coverage rules, resume behaviour and troubleshooting are in
 [output protection](../skills/enmaas/references/output-protection.md).
+
+`map` never writes `results.jsonl` through a symbolic link. When that path in
+the output directory is a link or anything other than a regular file, `map`
+stops with an error before it sends any request.
