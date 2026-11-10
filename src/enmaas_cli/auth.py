@@ -94,9 +94,22 @@ def _permission_warning(path: Path) -> str | None:
     return None
 
 
+def _require_sendable(value: str, source: str) -> str:
+    """Return the key when it can be sent in a header, or raise AuthError.
+
+    A key goes in an HTTP header, which takes ASCII only. A key with any
+    other character, whitespace or a control character raised inside every
+    request instead of once here. The message never holds the key or the
+    character, because either is part of the secret.
+    """
+    if value.isascii() and value.isprintable() and not any(ch.isspace() for ch in value):
+        return value
+    raise AuthError(f"the key from {source} holds a character that cannot be sent in a header")
+
+
 def _from_file(path: Path) -> Key:
     return Key(
-        value=_read_key_file(path),
+        value=_require_sendable(_read_key_file(path), str(path)),
         source=str(path),
         warning=_permission_warning(path),
     )
@@ -132,7 +145,7 @@ def resolve_key(
 
     from_env = env.get(ENV_VAR, "").strip()
     if from_env:
-        return Key(value=from_env, source=ENV_VAR, warning=None)
+        return Key(value=_require_sendable(from_env, ENV_VAR), source=ENV_VAR, warning=None)
 
     if config_key_file is not None:
         return _from_file(_expand_configured(config_key_file))

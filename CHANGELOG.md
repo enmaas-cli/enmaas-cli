@@ -30,6 +30,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `internal error (<class> at <file>:<line>)` and never shows its text.
 - A `map` run whose `results.jsonl` cannot be written now sends no further
   requests. It still ends with the write error.
+- An API key that holds a character a header cannot carry, such as a non-ASCII
+  letter, an inner space or a control character, is now refused once at the
+  start with an error naming where the key came from. It used to fail every
+  request as an internal error. The error never shows the key.
 - A client error during a request, such as a reply that cannot be decoded, now
   fails that request at once with `GatewayError` in place of a traceback. It is
   not retried, for the same reason.

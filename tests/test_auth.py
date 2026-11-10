@@ -149,3 +149,51 @@ def test_redact_handles_empty_key() -> None:
 def test_key_repr_does_not_leak() -> None:
     key = Key(value=KEY, source="test", warning=None)
     assert KEY not in repr(key)
+
+
+BAD_KEYS = {
+    "non-ascii": "sk-oai-" + "Q" * 20 + "é" + "Z" * 20,
+    "inner-space": "sk-oai-" + "Q" * 20 + " " + "Z" * 20,
+    "control": "sk-oai-" + "Q" * 20 + "\x07" + "Z" * 20,
+}
+
+
+def _resolve_from(source: str, tmp_path: Path, value: str) -> Key:
+    path = tmp_path / "keyfile"
+    path.write_text(value + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    if source == "env":
+        return resolve_key(key_file=None, env={"ENMAAS_KEY": value}, home=tmp_path)
+    if source == "flag":
+        return resolve_key(key_file=path, env={}, home=tmp_path)
+    if source == "config":
+        return resolve_key(key_file=None, env={}, home=tmp_path, config_key_file=path)
+    default = tmp_path / ".secrets" / "enmaas"
+    default.parent.mkdir(parents=True, exist_ok=True)
+    path.rename(default)
+    return resolve_key(key_file=None, env={}, home=tmp_path)
+
+
+SOURCES = ["env", "flag", "config", "default"]
+
+
+@pytest.mark.parametrize("source", SOURCES)
+@pytest.mark.parametrize("kind", list(BAD_KEYS))
+def test_a_key_that_cannot_be_sent_in_a_header_is_refused(
+    tmp_path: Path, source: str, kind: str
+) -> None:
+    value = BAD_KEYS[kind]
+    with pytest.raises(AuthError) as exc:
+        _resolve_from(source, tmp_path, value)
+    message = str(exc.value)
+    assert "holds a character that cannot be sent in a header" in message
+    assert message.startswith("the key from ")
+    for start in range(len(value) - 3):
+        assert value[start : start + 4] not in message
+    if kind != "inner-space":
+        assert value[27] not in message
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_sendable_key_passes_from_every_source(tmp_path: Path, source: str) -> None:
+    assert _resolve_from(source, tmp_path, KEY).value == KEY
