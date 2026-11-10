@@ -29,6 +29,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
   opened, so an assistant could read a protected answer in full through either
   host. A reader command with a `$'...'` string the guard cannot decode, such as
   one with an unknown escape or a NUL, is now denied.
+- The output guard now checks a file that a reader loads as input before it
+  allows a search that prints only file names or counts. Before,
+  `rg -l -f answer.md other.txt` was allowed, and ripgrep printed the text of
+  the protected answer in its error when that text was not a valid pattern.
+  The check covers pattern files (`grep` and `rg -f`), ignore and exclude
+  files, `sed` and `awk` script files, `jq --rawfile` and `--slurpfile`,
+  `diff --from-file` and `--to-file`, `sort --files0-from`, `less` key and tag
+  files, and `strings @file`.
 
 ### Fixed
 

@@ -64,7 +64,7 @@ _RG_VALUES = _words(
 _GREP_VALUES = _words(
     """
 -d -D --label --binary-files --directories --devices --include --exclude --exclude-from
---exclude-dir --group-separator
+--exclude-dir --group-separator --include-from --from
 """
 )
 _SEARCH_SWITCHES = _words(
@@ -92,17 +92,19 @@ _GREP_SWITCHES = _words(
     """
 --extended-regexp --basic-regexp --perl-regexp --no-ignore-case --null-data
 --no-messages --byte-offset --line-buffered --silent --recursive --dereference-recursive
---initial-tab --no-group-separator --color --colour --binary
+--initial-tab --no-group-separator --color --colour --binary --ignore-files --config
 """
 ) | {"-" + char for char in "EFGPiwxzsvVbnHhoqaIrRLTZUlc"}
 _VALUE_OPTIONS = {
     "head": {"-n", "-c", "--lines", "--bytes"},
     "tail": {"-n", "-c", "--lines", "--bytes", "--sleep-interval"},
     "sed": {"-e", "-f", "--expression", "--file"},
-    "awk": {"-F", "-v", "-f", "-e", "--file", "--source"},
-    "gawk": {"-F", "-v", "-f", "-e", "--file", "--source"},
+    "awk": _words("-F -v -f -e --file --source -E --exec -i --include -l --load"),
+    "gawk": _words("-F -v -f -e --file --source -E --exec -i --include -l --load"),
     "cut": {"-b", "-c", "-f", "-d", "--bytes", "--characters", "--fields", "--delimiter"},
-    "sort": {"-k", "-t", "-S", "-o", "--key", "--field-separator", "--output"},
+    "sort": _words("-k -t -S -o --key --field-separator --output --files0-from --random-source"),
+    "diff": {"-X", "--exclude-from", "--from-file", "--to-file"},
+    "less": {"-k", "--lesskey-file", "--lesskey-src", "-T", "--tag-file"},
     "jq": {
         "-f",
         "--from-file",
@@ -115,6 +117,27 @@ _VALUE_OPTIONS = {
         "--slurpfile",
     },
 }
+# Options whose value names a file the reader opens and reads: a pattern,
+# script, ignore, key or name-list file. A tool can quote such a file in an
+# error, so it is checked even when the output holds only names or counts.
+# The grep set also names ugrep options, because some hosts run ugrep as grep.
+_GREP_INPUTS = _words("-f --file --exclude-from --include-from --from --ignore-files --config")
+_AWK_INPUTS = _words("-f --file -E --exec -i --include -l --load -D --debug")
+_INPUT_FILE_OPTIONS = {
+    "grep": _GREP_INPUTS,
+    "egrep": _GREP_INPUTS,
+    "fgrep": _GREP_INPUTS,
+    "rg": {"-f", "--file", "--ignore-file"},
+    "sed": {"-f", "--file"},
+    "awk": _AWK_INPUTS,
+    "gawk": _AWK_INPUTS,
+    "jq": {"-f", "--from-file", "--rawfile", "--slurpfile"},
+    "diff": {"-X", "--exclude-from", "--from-file", "--to-file"},
+    "sort": {"--files0-from", "--random-source"},
+    "less": {"-k", "--lesskey-file", "--lesskey-src", "-T", "--tag-file"},
+}
+# Short options whose value is optional and, when given, attached: gawk -Dfile.
+_ATTACHED_VALUE_OPTIONS = {"awk": {"-D"}, "gawk": {"-D"}}
 _PREFIX = "enmaas containment: "
 # Preserve quoted and escaped punctuation until command boundaries are checked.
 _QUOTED_PUNCTUATION = str.maketrans({char: chr(0xE000 + i) for i, char in enumerate(";&|()<>\n~")})
@@ -380,6 +403,10 @@ def _reader_arguments(name: str, args: list[str]) -> Iterator[tuple[str | None, 
                         yield "!unknown", []
                         break
                     values = []
+                    if option in _ATTACHED_VALUE_OPTIONS.get(name, set()):
+                        attached = token[position + 1 :]
+                        yield option, [attached] if attached else []
+                        break
                     if _option_arity(name, option):
                         value = token[position + 1 :]
                         if not value:
@@ -408,10 +435,19 @@ def _program_paths(name: str, programs: list[str]) -> list[str]:
     return paths
 
 
-def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None, bool, list[str]]:
-    """Return file operands, a search glob, metadata-only output, and program file names."""
+def _reader_operands(
+    name: str, args: list[str]
+) -> tuple[list[str], str | None, bool, list[str], list[str]]:
+    """Return file operands, a search glob, metadata-only output, program file names
+    and input files.
+
+    Input files are the values of options that name a file the reader opens as
+    input, kept apart from the files it searches or prints.
+    """
     operands: list[str] = []
     programs: list[str] = []
+    inputs: list[str] = []
+    input_options = _INPUT_FILE_OPTIONS.get(name, set())
     pattern: str | None = None
     expression_given = False
     metadata = False
@@ -432,27 +468,28 @@ def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None,
     for option, values in _reader_arguments(name, args):
         value = values[0] if values else ""
         if option is not None:
-            uncertain |= option == "!unknown" or (name == "rg" and option == "--json")
+            # A ugrep configuration file can change what a search prints.
+            uncertain |= (
+                option == "!unknown"
+                or (name == "rg" and option == "--json")
+                or (name in _SEARCHERS and option == "--config")
+            )
+            if option in input_options:
+                # --rawfile and --slurpfile name a variable before the file.
+                inputs.extend(values[1:] if option in {"--rawfile", "--slurpfile"} else values)
             if name == "jq":
                 if option in {"-f", "--from-file"}:
                     expression_given = True
-                    operands.extend(values)
-                elif option in {"--rawfile", "--slurpfile"}:
-                    operands.extend(values[1:])
                 elif option in {"--args", "--jsonargs"}:
                     data_arguments = True
-            elif expression_reader and option in {
-                "-e",
-                "--regexp",
-                "--expression",
-                "--source",
-                "-f",
-                "--file",
-            }:
+            elif expression_reader and (
+                option in {"-e", "--regexp", "--expression", "--source", "-f", "--file"}
+                or (name in {"awk", "gawk"} and option in {"-E", "--exec"})
+            ):
                 expression_given = True
-                if option in {"-f", "--file"}:
-                    operands.extend(values)
-                elif name in _PROGRAM_READERS:
+                if option in {"-e", "--regexp", "--expression", "--source"} and (
+                    name in _PROGRAM_READERS
+                ):
                     programs.extend(values)
             if option in {"-g", "--glob", "--include"} and not value.startswith("!"):
                 pattern = value if pattern is None else "*"
@@ -464,7 +501,10 @@ def _reader_operands(name: str, args: list[str]) -> tuple[list[str], str | None,
                 programs.append(value)
         elif not data_arguments:
             operands.append(value)
-    return operands, pattern, metadata and not uncertain, _program_paths(name, programs)
+            if name == "strings" and value.startswith("@"):
+                # strings reads more options from the file named after @.
+                inputs.append(value[1:])
+    return operands, pattern, metadata and not uncertain, _program_paths(name, programs), inputs
 
 
 def _glob_matches(value: str, pattern: str) -> bool:
@@ -783,12 +823,18 @@ def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | N
         return _enmaas(args), cwd
     if name not in _READERS:
         return None, cwd
-    operands, pattern, metadata, program_paths = _reader_operands(name, args)
+    operands, pattern, metadata, program_paths, inputs = _reader_operands(name, args)
     for value in program_paths:
         # sed and awk open these names as files. A directory yields nothing.
         path = _path(value, cwd)
         if not path.is_dir() and is_protected(path):
             return _denial(path), cwd
+    for value in inputs:
+        if value in {"", "-", "/dev/stdin"}:
+            continue
+        reason = _literal_operand(value, cwd)
+        if reason:
+            return reason, cwd
     if metadata:
         return None, cwd
     if name in _SEARCHERS and not operands:
