@@ -600,6 +600,11 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
             ),
         )
 
+    # Runs still in progress have not written their ledger event yet. Their
+    # spend so far counts, so two runs side by side cannot each see the
+    # whole allowance. Read before the ledger: a run that ends between the
+    # two reads is then counted twice for this one check, never zero times.
+    live = openruns.live_charge(ledger.parent)
     events, problems = load_events_strict(ledger)
     if problems:
         # An unreadable ledger is indistinguishable from one showing zero
@@ -613,12 +618,7 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
             ),
         )
 
-    # Runs still in progress have not written their ledger event yet. Their
-    # spend so far counts, so two runs side by side cannot each see the
-    # whole allowance.
-    spent = rolling_spend(events, window_days=config.budget_window_days)
-    live = openruns.live_charge(ledger.parent)
-    spent += live
+    spent = rolling_spend(events, window_days=config.budget_window_days) + live
     if spent >= config.budget_tokens:
         message = (
             f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "

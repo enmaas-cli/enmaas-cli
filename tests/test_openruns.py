@@ -1277,3 +1277,34 @@ def test_settle_keeps_only_the_records_whose_event_was_not_taken(
     assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
     assert _run_ids(state) == ["a"]
     assert [p.name for p in state.iterdir() if p.name.endswith(".tmp")] == []
+
+
+@pytest.mark.parametrize("ends", ["before the ledger read", "after the ledger read"])
+def test_a_run_that_ends_during_the_budget_check_is_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ends: str
+) -> None:
+    from enmaas_cli import cli as cli_module
+
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(60)])
+    record_file = _write_records(state, [_record(outdir=str(outdir), pid=os.getppid())])
+    ledger = state / "usage.jsonl"
+    real_load = usage_module.load_events_strict
+
+    def finish_the_run() -> None:
+        _ledger_with(ledger, 60)
+        record_file.unlink()
+
+    def load(path: Path) -> Any:
+        if ends == "before the ledger read":
+            finish_the_run()
+            return real_load(path)
+        result = real_load(path)
+        finish_the_run()
+        return result
+
+    monkeypatch.setattr(cli_module, "load_events_strict", load)
+    check = rolling_check(Config(budget_tokens=1000, budget_window_days=7), ledger)
+    # Counted once or, for this one check, twice. Never zero.
+    assert check.spent in (60, 120)
