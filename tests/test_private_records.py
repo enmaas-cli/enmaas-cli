@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 import pytest
 
+import enmaas_cli
 from enmaas_cli import openruns
 from enmaas_cli.cli import main
 from enmaas_cli.runner import _append_index
@@ -370,6 +371,9 @@ def _cli(tmp_path: Path, *argv: str) -> subprocess.CompletedProcess[str]:
         # No request may be sent, so the gateway is never reached.
         "ENMAAS_BASE_URL": "https://gw.example.test",
         "PATH": "/usr/bin:/bin",
+        # The tree under test, not whatever copy of the package the
+        # interpreter would find on its own.
+        "PYTHONPATH": str(Path(enmaas_cli.__file__).resolve().parents[1]),
     }
     return subprocess.run(
         [sys.executable, "-c", "from enmaas_cli.cli import entry; entry()", *argv],
