@@ -594,88 +594,112 @@ def _is_stale(run: OpenRun, now: datetime) -> bool:
 
 
 def _settle(state_dir: Path, ledger: Path) -> None:
-    """Settle under the lock. The order makes a failed write never charge a run twice.
+    """Settle the dead runs. The lock is never held while an index is read.
 
-    1. Decide which records are dead and what each owes. Nothing is written.
-    2. Prepare the record file as it will be once every event is taken. If
-       that fails, return before anything is appended.
-    3. Append the events.
-    4. All taken: commit the prepared file. Otherwise discard it and store
-       the list with the records whose event was not taken.
+    Reading an index can take far longer than another command waits for the
+    lock, and a map that gave up waiting would run with no record. So:
 
-    The window that remains: a stop between step 3 and the commit counts
-    those runs twice, once.
+    1. Under the lock, load the records and pick the dead ones.
+    2. With no lock held, read their indexes.
+    3. Under the lock, load again. For each picked record still present,
+       prepare the record file as it will be once every event is taken,
+       append the events, then commit. A record another command settled in
+       between is no longer present and is skipped, so it is charged once.
+
+    The prepared file is written before any append. If that fails, nothing
+    is appended. If an append is refused, the prepared file is discarded and
+    the records whose event was not taken are kept.
+
+    The window that remains: a stop between the appends and the commit
+    counts those runs twice, once.
     """
+    warned = False
     with _locked(state_dir):
         runs = _load(state_dir)
-        now = datetime.now(UTC)
-        # Records to remove, by identity: two forged records can be equal.
-        settled: list[OpenRun] = []
-        owed: list[tuple[OpenRun, int]] = []
-        warned = False
-        dead: list[OpenRun] = []
-        for run in runs:
-            # One record that cannot be handled must not stop the command or
-            # come back on every later one, so it is dropped with a warning.
-            try:
-                if _is_dead(run, now):
-                    dead.append(run)
-            except Exception as exc:
-                warned = _warn_dropped(type(exc).__name__, warned)
-                settled.append(run)
-        budget = MAX_READ_BYTES
-        remaining = budget
-        for run in _smallest_first(dead):
-            if remaining <= 0:
-                # Out of budget: the next command reads it.
-                break
-            try:
-                read = charge_since(run, remaining)
-                fresh = remaining == budget
-                remaining -= read.used
-                if read.failed is not None:
-                    # The spend may be real, so the record waits for a later
-                    # command. A record that never becomes readable is
-                    # dropped once it is stale, so it cannot stay for good.
-                    if _is_stale(run, now):
-                        warned = _warn_dropped(read.failed, warned)
-                        settled.append(run)
-                    continue
-                if not read.complete and not fresh:
-                    # Cut short by what earlier records used. The next command
-                    # reads it with a full budget, so the charge is counted
-                    # whole. Nothing more is read now.
-                    remaining = 0
-                    continue
-                # A record that had the full budget and still did not finish
-                # is settled with what was read. Keeping it would block every
-                # later command on the same read.
-                settled.append(run)
-                if read.charge > 0:
-                    owed.append((run, read.charge))
-            except Exception as exc:
-                warned = _warn_dropped(type(exc).__name__, warned)
-                settled.append(run)
-        if not settled:
-            return
-        gone = {id(run) for run in settled}
-        kept = [run for run in runs if id(run) not in gone]
-        temporary = _prepare(state_dir, kept)
+    now = datetime.now(UTC)
+    # Records to remove, each with what it owes. 0 means remove with no event.
+    decided: list[tuple[OpenRun, int]] = []
+    dead: list[OpenRun] = []
+    for run in runs:
+        # One record that cannot be handled must not stop the command or
+        # come back on every later one, so it is dropped with a warning.
         try:
-            refused = [
-                run
-                for run, charge in owed
-                if not append_event(ledger, _killed_event(run, charge, now))
-            ]
-        except BaseException:
-            _discard(temporary)
-            raise
-        if not refused:
-            _commit(state_dir, temporary)
-            return
+            if _is_dead(run, now):
+                dead.append(run)
+        except Exception as exc:
+            warned = _warn_dropped(type(exc).__name__, warned)
+            decided.append((run, 0))
+    budget = MAX_READ_BYTES
+    remaining = budget
+    for run in _smallest_first(dead):
+        if remaining <= 0:
+            # Out of budget: the next command reads it.
+            break
+        try:
+            read = charge_since(run, remaining)
+            fresh = remaining == budget
+            remaining -= read.used
+            if read.failed is not None:
+                # The spend may be real, so the record waits for a later
+                # command. A record that never becomes readable is dropped
+                # once it is stale, so it cannot stay for good.
+                if _is_stale(run, now):
+                    warned = _warn_dropped(read.failed, warned)
+                    decided.append((run, 0))
+                continue
+            if not read.complete and not fresh:
+                # Cut short by what earlier records used. The next command
+                # reads it with a full budget, so the charge is counted
+                # whole. Nothing more is read now.
+                remaining = 0
+                continue
+            # A record that had the full budget and still did not finish is
+            # settled with what was read. Keeping it would block every later
+            # command on the same read.
+            decided.append((run, read.charge))
+        except Exception as exc:
+            warned = _warn_dropped(type(exc).__name__, warned)
+            decided.append((run, 0))
+    if not decided:
+        return
+    with _locked(state_dir):
+        _apply(state_dir, ledger, decided, now)
+
+
+def _apply(
+    state_dir: Path, ledger: Path, decided: list[tuple[OpenRun, int]], now: datetime
+) -> None:
+    """Remove the decided records still present and append their events. Holds the lock."""
+    current = _load(state_dir)
+    pending = list(decided)
+    # By identity: two forged records can be equal, and each is matched once.
+    gone: set[int] = set()
+    owed: list[tuple[OpenRun, int]] = []
+    for entry in current:
+        for position, (run, charge) in enumerate(pending):
+            if run == entry:
+                gone.add(id(entry))
+                if charge > 0:
+                    owed.append((entry, charge))
+                del pending[position]
+                break
+    if not gone:
+        return
+    temporary = _prepare(state_dir, [run for run in current if id(run) not in gone])
+    try:
+        refused = {
+            id(run)
+            for run, charge in owed
+            if not append_event(ledger, _killed_event(run, charge, now))
+        }
+    except BaseException:
         _discard(temporary)
-        back = gone - {id(run) for run in refused}
-        _store(state_dir, [run for run in runs if id(run) not in back])
+        raise
+    if not refused:
+        _commit(state_dir, temporary)
+        return
+    _discard(temporary)
+    _store(state_dir, [run for run in current if id(run) not in gone or id(run) in refused])
 
 
 def _warn_dropped(kind: str, warned: bool) -> bool:

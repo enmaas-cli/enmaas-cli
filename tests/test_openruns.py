@@ -204,11 +204,14 @@ def test_every_change_holds_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyP
     _write_records(state, [dead])
     openruns.settle(state, state / "usage.jsonl")
     lock = f"flock {fcntl.LOCK_EX | fcntl.LOCK_NB}"
-    # settle proves the directory is writable (an empty temporary file is
-    # made and removed) before it appends, then removes the data file.
+    # settle loads and picks under the lock, reads the index with no lock
+    # held, then loads again under the lock. It proves the directory is
+    # writable (an empty temporary file is made and removed) before it
+    # appends, then removes the data file.
     assert events == [
         *[lock, "load", "replace", "close"],
         *[lock, "load", "unlink", "close"],
+        *[lock, "load", "close"],
         *[lock, "load", "unlink", "unlink", "close"],
     ]
 
@@ -823,7 +826,8 @@ def test_one_read_budget_is_shared_by_every_record_in_a_settle(
 
     openruns.settle(state, ledger)
     first = [row["charge"] for row in _ledger_rows(ledger)]
-    assert sum(reads) - record_bytes <= budget
+    # The record file is loaded twice: to pick the dead runs, then to settle them.
+    assert sum(reads) - 2 * record_bytes <= budget
     assert 1 <= len(first) <= 2
     assert 1 <= len(_run_ids(state)) <= 2
 
@@ -1591,3 +1595,87 @@ def test_begin_names_the_file_and_the_reason_when_it_is_full(
             handle.write(b"x" * (openruns.MAX_FILE_BYTES + 1 - path.stat().st_size))
     assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
     assert capsys.readouterr().err == _full_line(state, reason)
+
+
+def _blocking_first_read(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+    """Make the first charge_since call wait on an event. Returns (entered, release)."""
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    real = openruns.charge_since
+    calls = 0
+    guard = threading.Lock()
+
+    def charge_since(run: OpenRun, budget: int | None = None) -> openruns.IndexRead:
+        nonlocal calls
+        with guard:
+            calls += 1
+            first = calls == 1
+        if first:
+            entered.set()
+            assert release.wait(10)
+        return real(run, budget)
+
+    monkeypatch.setattr(openruns, "charge_since", charge_since)
+    return entered, release
+
+
+def test_begin_does_not_wait_while_settle_reads_an_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(5)])
+    _write_records(state, [_record(outdir=str(outdir))])
+    entered, release = _blocking_first_read(monkeypatch)
+    settler = threading.Thread(target=openruns.settle, args=(state, state / "usage.jsonl"))
+    settler.start()
+    began: list[OpenRun | None] = []
+    try:
+        assert entered.wait(10)
+        beginner = threading.Thread(
+            target=lambda: began.append(
+                openruns.begin(state, outdir=tmp_path / "new", model="m", dialect="openai")
+            )
+        )
+        beginner.start()
+        beginner.join(1.0)
+        assert not beginner.is_alive()
+    finally:
+        release.set()
+        settler.join(10)
+    (run,) = began
+    assert run is not None
+    # The new record survives the settle that was in progress.
+    assert _run_ids(state) == [run.run_id]
+    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
+
+
+def test_two_settles_racing_on_one_dead_record_charge_it_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(5)])
+    _write_records(state, [_record(outdir=str(outdir))])
+    ledger = state / "usage.jsonl"
+    entered, release = _blocking_first_read(monkeypatch)
+    first = threading.Thread(target=openruns.settle, args=(state, ledger))
+    first.start()
+    try:
+        assert entered.wait(10)
+        second = threading.Thread(target=openruns.settle, args=(state, ledger))
+        second.start()
+        # No lock is held while the first one reads, so the second does not wait.
+        second.join(2.0)
+        assert not second.is_alive()
+    finally:
+        release.set()
+        first.join(10)
+    assert [(row["error_kind"], row["charge"]) for row in _ledger_rows(ledger)] == [("Killed", 5)]
+    assert _run_ids(state) == []
