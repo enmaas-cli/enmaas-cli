@@ -204,15 +204,16 @@ can be counted without importing this package.
 | Code | Meaning | What to do |
 |---|---|---|
 | 0 | all succeeded | continue |
-| 1 | config, auth, or validation error | read the message, it names the fix |
+| 1 | config, auth, or validation error, or a `map` whose `results.jsonl` could not be written | read the message, it names the fix |
 | 2 | partial failure | check `results.jsonl` in the outdir |
 | 3 | circuit breaker or token budget stopped the run | read the receipt; raise a spent budget before using `--resume` |
-| 130 or 143 | stopped by SIGINT or SIGTERM; after one signal a `map` recorded its spend and printed its receipt first | re-run the `map` with `--resume` to finish; re-run an `ask` |
+| 130 or 143 | stopped by SIGINT or SIGTERM; after one signal a `map` recorded its spend and printed its receipt first | re-run the `map` with `--resume` to finish; for an `ask`, check whether the answer file exists before running it again |
 
 One signal stops a run cleanly. A second one ends the process at once; the next
 `ask` or `map` then charges the run's spend from its open-run record. Send one
-signal and wait. A signal that arrives after the result was printed changes
-neither the ledger nor the output.
+signal and wait. An `ask` stopped before its reply arrived records nothing; a
+reply that had arrived is recorded. A signal that arrives after the result was
+printed changes nothing, including the exit status.
 
 The breaker aborts a bulk run on 6 consecutive failures, or more than 50% of a
 full 20-item window. `--resume` skips items already recorded `ok` with an
