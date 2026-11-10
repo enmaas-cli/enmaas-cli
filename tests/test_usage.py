@@ -784,3 +784,21 @@ def test_usage_and_the_rolling_check_survive_huge_ledger_rows(
     check = rolling_check(Config(budget_tokens=100, budget_window_days=7), ledger)
     assert check.message is not None
     assert len(check.message) < 1000
+
+
+def test_text_from_a_ledger_row_prints_on_one_line(tmp_path: Path) -> None:
+    from enmaas_cli.usage import format_summary
+
+    ledger = tmp_path / "usage.jsonl"
+    rows = [
+        _ok_row(model="evil\n  forged line\x1b]0;title\x07", command="ask\x1b[2J\nx"),
+    ]
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    text = format_summary(summarize_usage(load_events(ledger)))
+    assert "\x1b" not in text
+    assert "\x07" not in text
+    forged = [line for line in text.splitlines() if "forged line" in line]
+    # Once in the unpriced list and once in the by-model table, never alone.
+    assert len(forged) == 2
+    assert all("calls" in line or "unpriced" in line for line in forged)
+    assert not any(line.startswith("x") for line in text.splitlines())

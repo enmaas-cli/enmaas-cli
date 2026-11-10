@@ -11,8 +11,11 @@ it is settled, and while its run is alive its spend is only an estimate read
 from the index.
 
 Every record is treated as untrusted. A forged one can add spend, because
-that only makes a budget stricter. It can never lower spend, and nothing read
-from a record or an index is ever printed or returned.
+that only makes a budget stricter. It can never lower spend, print file
+content, block a later command for good, or cost more than a bounded amount
+of time and memory. The model and dialect of a record are written to the
+ledger, and both are checked against a strict shape first. No content of an
+index is written, printed or returned; only the sum of its charge rows.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -55,7 +59,9 @@ MAX_LINE_BYTES = 64 << 10
 READ_CHUNK_BYTES = 64 << 10
 REQUEST_MARKER = b'"request"'
 MAX_PATH_CHARS = 4096
-MAX_TEXT_CHARS = 1024
+# The model is written to the ledger and printed by `enmaas usage`, so only
+# characters that are safe on one terminal line are taken.
+MODEL_PATTERN = re.compile(r"[A-Za-z0-9._:/@+-]{1,256}")
 # os.kill takes a C int. A larger pid would raise OverflowError, not OSError.
 MAX_PID = (1 << 31) - 1
 DIALECTS = frozenset({"anthropic", "openai"})
@@ -130,7 +136,9 @@ def _parse(line: str) -> OpenRun | None:
     pid = data.get("pid")
     model = data.get("model")
     dialect = data.get("dialect")
-    if not _is_text(run_id, 64) or not _is_text(model, MAX_TEXT_CHARS):
+    if not _is_text(run_id, 64):
+        return None
+    if not isinstance(model, str) or MODEL_PATTERN.fullmatch(model) is None:
         return None
     if not _is_text(dialect, 64) or dialect not in DIALECTS:
         return None

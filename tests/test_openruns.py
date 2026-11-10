@@ -1067,3 +1067,20 @@ def test_a_record_file_owned_by_another_user_is_not_loaded(
     _foreign_owner(monkeypatch)
     with pytest.raises(OSError):
         openruns._load(state)
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["m\nforged", "m\x1b]0;title\x07", "m with space", "", "m" * 257, "m‮", "m\u0085"],
+)
+def test_a_record_with_an_unsafe_model_name_is_not_loaded(tmp_path: Path, model: str) -> None:
+    state = tmp_path / "state"
+    _write_records(state, [_record(model=model)])
+    assert openruns._load(state) == []
+
+
+@pytest.mark.parametrize("model", ["rits/zai-org/glm-5-3", "claude-opus-4@2025.1:x+y", "m" * 256])
+def test_a_record_with_a_normal_model_name_is_loaded(tmp_path: Path, model: str) -> None:
+    state = tmp_path / "state"
+    _write_records(state, [_record(model=model)])
+    assert [run.model for run in openruns._load(state)] == [model]

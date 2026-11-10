@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from enmaas_cli.auth import printable
 from enmaas_cli.pricing import (
     OPUS_REFERENCE,
     ModelPrice,
@@ -312,8 +313,11 @@ def format_summary(
             inp = int(stats["input_tokens"])
             out = int(stats["output_tokens"])
             elapsed = float(stats["elapsed"])
+            # Ledger text is printed through printable(): a row is not
+            # trusted, and a newline or escape in it would forge output.
             lines.append(
-                f"  {model:<40}  {calls:>4} calls  {inp:>10,} in  {out:>10,} out  {elapsed:>8.1f}s"
+                f"  {printable(model):<40}  {calls:>4} calls  "
+                f"{inp:>10,} in  {out:>10,} out  {elapsed:>8.1f}s"
             )
         lines.append("")
 
@@ -325,7 +329,7 @@ def format_summary(
             out = int(stats["output_tokens"])
             elapsed = float(stats["elapsed"])
             lines.append(
-                f"  {command:<10}  {calls:>4} calls  "
+                f"  {printable(command):<10}  {calls:>4} calls  "
                 f"{inp:>10,} in  {out:>10,} out  {elapsed:>8.1f}s"
             )
 
@@ -392,7 +396,8 @@ def _cost_lines(summary: UsageSummary, table: dict[str, ModelPrice]) -> list[str
     lines = [f"Spend:            ${spend:,.2f}"]
     if unpriced:
         lines.append(
-            f"  unpriced:       {', '.join(unpriced)} (no rate configured, so not counted above)"
+            f"  unpriced:       {', '.join(printable(m) for m in unpriced)} "
+            "(no rate configured, so not counted above)"
         )
     lines.append(f"Opus-equivalent:  ${reference:,.2f}")
     lines.append(f"  reference:      {OPUS_REFERENCE.label}")
