@@ -8,14 +8,14 @@ from enmaas_cli.runner import MapOutcome
 
 def test_preview_collapses_whitespace_and_truncates() -> None:
     text = "line one\n\n   line  two\n" + ("x" * 500)
-    out = preview(text, limit=40)
+    out = preview(text, key="k", limit=40)
     assert "\n" not in out
     assert len(out) == 40
     assert out.startswith("line one line two")
 
 
 def test_preview_of_empty_text_is_empty() -> None:
-    assert preview("", limit=40) == ""
+    assert preview("", key="k", limit=40) == ""
 
 
 def test_create_run_dir_uses_timestamp_and_random_slug(tmp_path: Path) -> None:
@@ -62,6 +62,7 @@ def test_ask_receipt_shows_cached_and_reasoning_tokens(tmp_path: Path) -> None:
         completion=completion,
         path=out,
         elapsed=6.2,
+        key="k",
     )
     assert "enmaas ask ok" in text
     assert "10,265 (9,216 cached)" in text
@@ -75,7 +76,9 @@ def test_ask_receipt_reports_unknown_not_zero(tmp_path: Path) -> None:
     out = tmp_path / "response.md"
     out.write_text("hi", encoding="utf-8")
     completion = Completion(text="hi", reasoning="", stop="stop", usage=Usage())
-    text = ask_receipt(model="m", dialect="openai", completion=completion, path=out, elapsed=1.0)
+    text = ask_receipt(
+        model="m", dialect="openai", completion=completion, path=out, elapsed=1.0, key="k"
+    )
     assert "unknown" in text
     assert "in 0" not in text
 
@@ -89,7 +92,9 @@ def test_ask_receipt_flags_truncation(tmp_path: Path) -> None:
         stop="length",
         usage=Usage(input_tokens=10, output_tokens=20),
     )
-    text = ask_receipt(model="m", dialect="openai", completion=completion, path=out, elapsed=1.0)
+    text = ask_receipt(
+        model="m", dialect="openai", completion=completion, path=out, elapsed=1.0, key="k"
+    )
     assert "truncated" in text
 
 
@@ -254,6 +259,7 @@ def test_the_receipt_says_when_output_was_repaired() -> None:
         completion=completion,
         path=Path("out.md"),
         elapsed=1.0,
+        key="k",
     )
     assert "1 character the model emitted could not be encoded" in text
     assert "U+FFFD" in text
@@ -267,6 +273,7 @@ def test_a_clean_response_gains_no_warning() -> None:
         completion=completion,
         path=Path("out.md"),
         elapsed=1.0,
+        key="k",
     )
     assert "U+FFFD" not in text
 
@@ -305,6 +312,7 @@ def test_ask_receipt_marks_a_defaulted_model(tmp_path: Path) -> None:
         completion=completion,
         path=path,
         elapsed=0.1,
+        key="k",
         model_defaulted=True,
     )
     assert "  model     m  (default)  (openai dialect)" in text

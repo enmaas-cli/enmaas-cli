@@ -512,6 +512,7 @@ async def run_ask(
             completion=completion,
             path=path,
             elapsed=elapsed,
+            key=key,
             model_defaulted=model_defaulted,
         ),
         path=path,
@@ -1196,7 +1197,14 @@ async def _dispatch(
                 return _setup_error(args, _error_text(str(exc), key))
             final.code = int(ExitCode.OK)
             if args.json:
-                print(json.dumps(rows, indent=2))
+                # The same redaction as the text list. JSON encoding already
+                # escapes control characters, so nothing else is needed.
+                print(
+                    json.dumps(
+                        [{**row, "id": redact(row["id"], key)} for row in rows],
+                        indent=2,
+                    )
+                )
             else:
                 for row in rows:
                     # A catalog id is gateway text, so it is printed inert.

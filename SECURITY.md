@@ -35,9 +35,10 @@ config file, or `~/.secrets/enmaas`, sent only to the configured `base_url` as a
 bearer token over HTTPS (HTTP is allowed for localhost only), and never written to
 the ledger, receipts or logs. A key that holds a character an HTTP header cannot
 carry, such as a newline, a tab or a non-ASCII letter, is refused before any
-request, and the error never shows any part of it. Gateway error bodies are
-redacted before they are shown. A gateway that echoes the key inside an answer is
-outside what the tool can detect. A gateway on `localhost` or a loopback address
+request, and the error never shows any part of it. Gateway error bodies, the
+receipt preview and the `models` output, as text or JSON, are redacted before
+they are shown. A gateway that echoes the key inside an answer file is outside
+what the tool can detect. A gateway on `localhost` or a loopback address
 is always reached directly, never through a proxy from the environment.
 
 ## What the tool keeps on disk

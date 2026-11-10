@@ -82,8 +82,8 @@ def test_printable_block_output_holds_no_other_control_character() -> None:
 
 
 def test_preview_collapses_whitespace_then_replaces_controls_then_cuts() -> None:
-    assert preview("a\n\n b\x1bc", limit=160) == "a b?c"
-    head = preview("\x1b" * 500, limit=10)
+    assert preview("a\n\n b\x1bc", key="k", limit=160) == "a b?c"
+    head = preview("\x1b" * 500, key="k", limit=10)
     assert head == "?" * 10
 
 

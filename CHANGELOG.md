@@ -97,7 +97,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   character that cannot be printed as `?`, a newline or a tab in an error or
   a preview as a space, and `inspect` keeps newlines and tabs. Answer files,
   `ask --json` and `results.jsonl` keep the text as sent, and the `map --json`
-  failure list keeps it as sent up to 200 characters.
+  failure list keeps it as sent up to 200 characters. The preview and both
+  `models` outputs also remove the key, as typed or in its JSON escaped form,
+  before the text is made printable and cut. Before, a reply that echoed the
+  key printed it in the preview, and `models --json` printed a catalog id
+  that held it.
 - The skill's commands that count and list failures from `results.jsonl` now
   run Python in isolated mode, `python3 -I -c`. Before, Python put the current
   directory first on its import path, so running them inside a repository

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .auth import cut_redacted, printable
+from .auth import cut_redacted, printable, redact
 from .dialect import Completion, Dialect
 from .outputs import state_root as state_root
 
@@ -70,14 +70,16 @@ def prune_runs(root: Path, *, max_age_days: int = 30) -> None:
                     shutil.rmtree(child)
 
 
-def preview(text: str, *, limit: int = PREVIEW_LIMIT) -> str:
+def preview(text: str, *, key: str, limit: int = PREVIEW_LIMIT) -> str:
     """Deterministic head of the response. Not a generated summary.
 
-    The reply is not trusted. An escape sequence in it, such as one that
-    sets the terminal's clipboard, is made inert before the cut, so the cut
-    counts what is shown.
+    The reply is not trusted. A reply that echoes the key would print it, so
+    the key is removed first. An escape sequence in it, such as one that sets
+    the terminal's clipboard, is made inert before the cut, so the cut counts
+    what is shown. The cut never splits the placeholder, and a cut made
+    before redaction could leave part of the key that no longer matches.
     """
-    return printable(" ".join(text.split()))[:limit]
+    return cut_redacted(printable(" ".join(redact(text, key).split())), limit)
 
 
 def failure_line_text(message: str) -> str:
@@ -111,6 +113,7 @@ def ask_receipt(
     completion: Completion,
     path: Path,
     elapsed: float,
+    key: str,
     model_defaulted: bool = False,
 ) -> str:
     size = path.stat().st_size if path.exists() else 0
@@ -133,7 +136,7 @@ def ask_receipt(
             f"  warning   {completion.replaced} character{plural} the model emitted "
             f"could not be encoded and became U+FFFD"
         )
-    head = preview(completion.text)
+    head = preview(completion.text, key=key)
     if head:
         lines.append(f"  preview   {head}")
     return "\n".join(lines)

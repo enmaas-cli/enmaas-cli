@@ -30,7 +30,7 @@ enmaas ask ok
   preview   Paris
 ```
 
-The full response is written to the file shown in the `output` line. The receipt includes a preview of at most 160 characters, with runs of whitespace collapsed to one space and every other character that cannot be printed replaced by `?`. A reply that holds a terminal escape sequence, such as one that sets the clipboard, therefore prints inert. Paths in a receipt are printed the same way. The answer file keeps the bytes the model sent. Run directories under `$XDG_STATE_HOME/enmaas/runs/` (default `~/.local/state/enmaas/runs/`) are removed once they are 30 days old, at the start of the next `ask`. Only directories with a run name (timestamp plus four hex characters) are removed, and nothing is removed when the runs directory is a symbolic link. Pass `-o PATH` for an answer that must persist.
+The full response is written to the file shown in the `output` line. The receipt includes a preview of at most 160 characters. A key the reply echoes, as typed or in its JSON escaped form, is replaced by `***REDACTED***` first. A placeholder at the cut is kept whole, so the preview can then run up to 13 characters past 160. Runs of whitespace are collapsed to one space, and every other character that cannot be printed is replaced by `?`. A reply that holds a terminal escape sequence, such as one that sets the clipboard, therefore prints inert. Paths in a receipt are printed the same way. The answer file keeps the bytes the model sent. Run directories under `$XDG_STATE_HOME/enmaas/runs/` (default `~/.local/state/enmaas/runs/`) are removed once they are 30 days old, at the start of the next `ask`. Only directories with a run name (timestamp plus four hex characters) are removed, and nothing is removed when the runs directory is a symbolic link. Pass `-o PATH` for an answer that must persist.
 
 An answer is never written through a symbolic link, and only to a regular file. If the output path already exists as a link, `ask` fails and `map` marks that item failed with `refusing to write through a symbolic link`. A FIFO, a device or anything else that is not a regular file at the output path is refused too, without blocking: `ask` fails and `map` marks that item failed. The reply's charge is still recorded.
 
@@ -302,7 +302,7 @@ catalog, an interrupt before the result, or an error inside enmaas.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `[].id` | string | The model id |
+| `[].id` | string | The model id, with any copy of the key replaced by `***REDACTED***`, as in the text list |
 | `[].dialects` | list of strings | The catalogs that list it: `anthropic`, `openai` or both |
 
 ### Errors
