@@ -765,7 +765,7 @@ def test_an_index_of_charge_rows_is_read_in_flat_memory(tmp_path: Path) -> None:
     result: list[int] = []
     peak = _peak_bytes(lambda: result.append(openruns.charge_since(run).charge))
     assert result == [count]
-    assert peak < 16 << 20
+    assert peak < 4 << 20
 
 
 def test_a_line_longer_than_the_limit_is_skipped(tmp_path: Path) -> None:

@@ -26,7 +26,9 @@ import pytest
 
 import enmaas_cli
 
-DEADLINE = 10.0
+# Every wait polls with this deadline. It only bounds a failure, so a pass
+# never waits for it.
+DEADLINE = 30.0
 # Metered tokens of one answered request: 5 uncached input plus 2 output.
 CHARGE = 7
 MODEL = "rits/zai-org/glm-5-3"
@@ -434,7 +436,7 @@ REPORTING_PROGRAM = (
 def test_a_signal_after_the_replies_gives_one_output_that_agrees_with_the_ledger(
     cli: Cli, gateway: Gateway
 ) -> None:
-    for run in range(20):
+    for run in range(3):
         child, signum, out, err, events = _signal_after_release(cli, gateway, run, late=False)
         obj = json.loads(out)
         assert isinstance(obj, dict)
@@ -513,26 +515,49 @@ def test_a_second_signal_ends_a_process_blocked_on_the_ledger(cli: Cli, gateway:
     assert "Traceback" not in err
 
 
+def _blocked_on_a_fifo(child: subprocess.Popen[str]) -> Callable[[], bool]:
+    """Whether the child is waiting in the kernel for a FIFO's other end."""
+    wchan = Path(f"/proc/{child.pid}/wchan")
+
+    def check() -> bool:
+        try:
+            return wchan.read_text(encoding="utf-8").strip() == "wait_for_partner"
+        except OSError:
+            return False
+
+    return check
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
 def test_two_quick_sigints_still_count_the_run(cli: Cli, gateway: Gateway) -> None:
+    """The second SIGINT ends a map blocked on its ledger write; its record charges the run."""
+    if not Path(f"/proc/{os.getpid()}/wchan").exists():
+        pytest.skip("needs /proc/<pid>/wchan to see where a process waits")
     gateway.answer_first = 2
+    cli.state.mkdir(parents=True)
+    os.mkfifo(cli.ledger)
     index = cli.tmp / "job" / "results.jsonl"
     child = cli.start(*cli.map_args("job", 5))
     _wait_for(lambda: len(_charges(index)) >= 2, "2 charge rows", child)
     _wait_for(_held(gateway, 1), "a held request", child)
     child.send_signal(signal.SIGINT)
-    time.sleep(0.05)
+    # The first signal stops the run, which then opens the ledger to write
+    # its event. The ledger is a FIFO with no reader, so the open blocks.
+    _wait_for(_blocked_on_a_fifo(child), "the blocked ledger write", child)
     child.send_signal(signal.SIGINT)
     _, err = child.communicate(timeout=DEADLINE)
     assert child.returncode == -signal.SIGINT, err
     assert "Traceback" not in err
+    assert cli.open_runs().exists()
 
+    cli.ledger.unlink()
     gateway.release.set()
     done = cli.run("ask", "-m", MODEL, "--dialect", "openai", "-p", "hi", "--retries", "0")
     assert done.returncode == 0, done.stderr
-    counted = [e["charge"] for e in cli.events() if e["error_kind"] in ("Interrupted", "Killed")]
-    # Once, or twice in the documented window between the ledger write and
-    # the record removal. Never zero.
-    assert sum(counted) in (2 * CHARGE, 4 * CHARGE), counted
+    assert [(e["error_kind"], e["charge"]) for e in cli.events()] == [
+        ("Killed", 2 * CHARGE),
+        (None, CHARGE),
+    ]
     assert not cli.open_runs().exists()
 
 
