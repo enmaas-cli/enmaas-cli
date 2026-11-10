@@ -234,7 +234,12 @@ def check_writable():
         fail(f"{path} is read-only. Make it writable, then run this again.")
 
 
-def write_text(old, new, done):
+def write_text(old, new, done, planned):
+    """Write new in place of old. A dry run prints the path and planned instead.
+
+    The file can hold tokens and provider headers that are not ours, so no
+    message prints any of its content, in any mode.
+    """
     if old == new:
         if mode != "check":
             print(f"  {path}: already up to date")
@@ -243,9 +248,7 @@ def write_text(old, new, done):
     if mode == "check":
         return
     if mode == "1":
-        print(f"  would write {path}:")
-        for line in new.splitlines():
-            print(f"    {line}")
+        print(f"  {path}: would {planned}")
         return
     real = os.path.realpath(path)
     perms = os.stat(real).st_mode & 0o7777 if old is not None else 0o644
@@ -318,16 +321,29 @@ def strip_ours(groups):
     return kept, first
 
 
+class DuplicateKey(ValueError):
+    """An object names one key twice. The key is not kept, so no message can show it."""
+
+
 def load_json(text):
     def no_duplicates(pairs):
         seen = set()
         for key, _ in pairs:
             if key in seen:
-                raise ValueError(f"duplicate key {key!r}")
+                raise DuplicateKey()
             seen.add(key)
         return dict(pairs)
 
     return json.loads(text, object_pairs_hook=no_duplicates)
+
+
+def json_problem(exc):
+    """Say where a JSON file stops parsing, without quoting any of it."""
+    if isinstance(exc, json.JSONDecodeError):
+        return f" ({exc.msg} at line {exc.lineno} column {exc.colno})"
+    if isinstance(exc, DuplicateKey):
+        return " (duplicate key)"
+    return ""
 
 
 def dump_json(value):
@@ -357,7 +373,7 @@ def claude(add):
     try:
         settings = load_json(old) if old is not None else {}
     except (ValueError, RecursionError) as exc:
-        fail(f"{path} is not valid JSON ({exc}). Fix or move it, then run this again.")
+        fail(f"{path} is not valid JSON{json_problem(exc)}. Fix or move it, then run this again.")
     if not isinstance(settings, dict):
         fail(f"{path} does not hold a JSON object. Fix or move it, then run this again.")
     original = copy.deepcopy(settings)
@@ -390,6 +406,7 @@ def claude(add):
         hooks["PreToolUse"] = kept
         settings["hooks"] = hooks
         done = "registered the enmaas guard"
+        planned = ("add" if first is None else "replace") + " the enmaas guard registration"
     else:
         if first is None:
             if mode != "check":
@@ -398,8 +415,9 @@ def claude(add):
         # The hooks object and the PreToolUse list stay, even when empty.
         hooks["PreToolUse"] = kept
         done = "removed the enmaas guard entry"
+        planned = "remove the enmaas guard registration"
     new = old if same(settings, original) else dump_json(settings)
-    write_text(old, new, done)
+    write_text(old, new, done, planned)
 
 
 # --- config.toml ---
@@ -458,7 +476,13 @@ def parse_toml(text, problem):
     try:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        fail(problem.replace("{exc}", str(exc)))
+        fail(problem.replace("{exc}", toml_position(exc)))
+
+
+def toml_position(exc):
+    """Say where TOML stops parsing. The parser's own message can quote a key."""
+    found = re.search(r"\((at line \d+, column \d+|at end of document)\)$", str(exc))
+    return found[1] if found else "at an unknown position"
 
 
 def codex(add):
@@ -555,6 +579,7 @@ def codex(add):
             ", timeout = 5 }]\n"
             f"{END}\n"
         )
+        planned = ("replace" if starts else "add") + " the enmaas guard registration"
         if starts:
             new = head + block + tail
         else:
@@ -574,7 +599,8 @@ def codex(add):
     else:
         new = rest
         done = "removed the enmaas guard block"
-    write_text(old, new, done)
+        planned = "remove the enmaas guard registration"
+    write_text(old, new, done, planned)
 
 
 # --- enmaas config.toml ---
@@ -739,11 +765,10 @@ def set_setting(name):
         )
     if old != new and not ensure_directory():
         if mode == "1":
-            print(f"  would create {os.path.dirname(os.path.realpath(path))} and write {path}:")
-            for line in new.splitlines():
-                print(f"    {line}")
+            directory = os.path.dirname(os.path.realpath(path))
+            print(f"  {path}: would create {directory} and set {name}")
         return
-    write_text(old, new, f"set {name}")
+    write_text(old, new, f"set {name}", f"set {name}")
 
 
 if action == "claude-add":

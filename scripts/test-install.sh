@@ -651,6 +651,78 @@ refuse_fixture duplicate-key '{"a": 1, "a": 2}' "" "duplicate key"
 # An unpaired surrogate parses but cannot be written back as UTF-8.
 refuse_fixture lone-surrogate '{"note":"\ud800"}' "" \
   "holds an unpaired surrogate escape"
+
+# A dry run names each file and the change it would make, and prints none of
+# what the files already hold: host settings can carry tokens and headers.
+CLAUDE_PLANTED="PLANTED_CLAUDE_VALUE"
+CODEX_PLANTED="PLANTED_CODEX_VALUE"
+ENMAAS_PLANTED="PLANTED_ENMAAS_VALUE"
+log_lacks_planted() {
+  ! grep -qF -e "$CLAUDE_PLANTED" -e "$CODEX_PLANTED" -e "$ENMAAS_PLANTED" "$FX_LOG"
+}
+fx="$FIXTURES/dry-planted"
+mkdir -p "$fx/claude" "$fx/codex" "$fx/home/.config/enmaas"
+printf '{"env": {"ANTHROPIC_AUTH_TOKEN": "%s"}, "model": "opus"}\n' "$CLAUDE_PLANTED" \
+  >"$fx/claude/settings.json"
+printf '[model_providers.fixture.http_headers]\nX-Token = "%s"\n' "$CODEX_PLANTED" \
+  >"$fx/codex/config.toml"
+printf '# %s\ndefault_model = "m"\n' "$ENMAAS_PLANTED" >"$fx/home/.config/enmaas/config.toml"
+snapshot "$fx" >"$TMP/dry-planted.before"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only --dry-run --gateway https://gw.example.test
+check "dry planted: an install dry run prints no settings content" log_lacks_planted
+check "dry planted: an install dry run names settings.json and the change" \
+  log_says "$fx/claude/settings.json: would add the enmaas guard registration"
+check "dry planted: an install dry run names config.toml and the change" \
+  log_says "$fx/codex/config.toml: would add the enmaas guard registration"
+check "dry planted: an install dry run names the setting it would set" \
+  log_says "$fx/home/.config/enmaas/config.toml: would set base_url"
+snapshot "$fx" >"$TMP/dry-planted.after"
+check "dry planted: the install dry run changed nothing" \
+  cmp -s "$TMP/dry-planted.before" "$TMP/dry-planted.after"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only
+py '
+for name in sys.argv[1:]:
+    text = open(name, encoding="utf-8").read()
+    need("python3 -I -S " in text, name)
+    open(name, "w", encoding="utf-8").write(text.replace("python3 -I -S ", "python3 -S "))
+' "$fx/claude/settings.json" "$fx/codex/config.toml"
+snapshot "$fx" >"$TMP/dry-planted.before"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only --dry-run
+check "dry planted: an update dry run prints no settings content" log_lacks_planted
+check "dry planted: an update dry run says settings.json would be replaced" \
+  log_says "$fx/claude/settings.json: would replace the enmaas guard registration"
+check "dry planted: an update dry run says config.toml would be replaced" \
+  log_says "$fx/codex/config.toml: would replace the enmaas guard registration"
+FX_HOME="$fx/home" fx_run dry-planted 0 --skill-only --dry-run --uninstall
+check "dry planted: an uninstall dry run prints no settings content" log_lacks_planted
+check "dry planted: an uninstall dry run says settings.json would lose the guard" \
+  log_says "$fx/claude/settings.json: would remove the enmaas guard registration"
+check "dry planted: an uninstall dry run says config.toml would lose the guard" \
+  log_says "$fx/codex/config.toml: would remove the enmaas guard registration"
+snapshot "$fx" >"$TMP/dry-planted.after"
+check "dry planted: the update and uninstall dry runs changed nothing" \
+  cmp -s "$TMP/dry-planted.before" "$TMP/dry-planted.after"
+
+# A file that does not parse is named with the place it stops parsing, and
+# none of its text, even when a key in it is the problem.
+for broken in json-unclosed json-duplicate toml-duplicate; do
+  fx="$FIXTURES/dry-broken-$broken"
+  mkdir -p "$fx/claude" "$fx/codex"
+  case "$broken" in
+    json-unclosed)
+      printf '{"env": {"TOKEN": "%s"' "$CLAUDE_PLANTED" >"$fx/claude/settings.json" ;;
+    json-duplicate)
+      printf '{"%s": 1, "%s": 2}' "$CLAUDE_PLANTED" "$CLAUDE_PLANTED" >"$fx/claude/settings.json" ;;
+    toml-duplicate)
+      printf '[%s]\nx = 1\n[%s]\n' "$CODEX_PLANTED" "$CODEX_PLANTED" >"$fx/codex/config.toml" ;;
+  esac
+  snapshot "$fx" >"$TMP/dry-broken.before"
+  fx_run "dry-broken-$broken" 1 --skill-only --dry-run
+  check "dry broken $broken: the refusal says the file is not valid" log_says "is not valid"
+  check "dry broken $broken: the refusal prints none of the file" log_lacks_planted
+  snapshot "$fx" >"$TMP/dry-broken.after"
+  check "dry broken $broken: nothing changed" cmp -s "$TMP/dry-broken.before" "$TMP/dry-broken.after"
+done
 # A dangling symlink is an error.
 fx="$FIXTURES/dangling-link"
 mkdir -p "$fx/claude"

@@ -15,6 +15,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
   writes and the installer's own guard check all use the new form. Run
   `./install.sh` again to replace a registration made by an earlier version.
   Codex then asks you to trust the changed hook.
+- `install.sh --dry-run` no longer prints the whole Claude Code
+  `settings.json`, Codex `config.toml` or enmaas `config.toml` it would write.
+  Before, a dry run that would change one of those files printed every line of
+  it, so tokens in its `env` block or in a provider header showed in the
+  output, and in any log it was pasted into. It now prints each file's path and
+  what it would add, replace, remove or set. An error about a file that does
+  not parse names the place it stops parsing and no longer quotes a key from
+  it.
 
 ### Fixed
 

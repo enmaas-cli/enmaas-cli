@@ -57,7 +57,7 @@ Options:
 | `--cli-only` | Install the command only. No skill, no guard. |
 | `--skill-only` | Copy the skill and install the guard. No command. Add `--no-hook` for the skill alone. |
 | `--no-hook` | Install the command and skill but skip the output guard. |
-| `--dry-run` | Print what would happen and change nothing. |
+| `--dry-run` | Print what would happen and change nothing. It names each file it would change and the change, and never prints what the file already holds. |
 | `--uninstall` | Remove the command, skill, guard and its registrations. |
 
 The installer is safe to run again at any time. It reinstalls the parts you
