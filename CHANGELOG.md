@@ -23,6 +23,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
   what it would add, replace, remove or set. An error about a file that does
   not parse names the place it stops parsing and no longer quotes a key from
   it.
+- The output guard now reads Bash `$'...'` and `$"..."` quoting the way Bash
+  does. Before, a shell read such as `cat $'answer.md'` or
+  `cat $'\141nswer.md'` was checked under a different name than the file Bash
+  opened, so an assistant could read a protected answer in full through either
+  host. A reader command with a `$'...'` string the guard cannot decode, such as
+  one with an unknown escape or a NUL, is now denied.
 
 ### Fixed
 

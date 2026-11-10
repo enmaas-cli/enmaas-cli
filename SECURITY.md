@@ -11,8 +11,9 @@ reply within three working days.
 The output guard denies the ordinary file reads a coding assistant makes on a
 protected answer: the hosts' file tools and the common shell readers, including
 pipelines, redirections, globs and the file commands inside `sed` and `awk`
-programs. It answers inside a fixed time budget and denies what it cannot finish
-checking. It protects against accidental reads by a well-behaved assistant. It is
+programs. It reads Bash `$'...'` quoting the way Bash does, and denies a reader
+command whose quoting it cannot decode. It answers inside a fixed time budget and
+denies what it cannot finish checking. It protects against accidental reads by a well-behaved assistant. It is
 not a sandbox: an assistant that writes its own program to open the file, copies
 or hard-links the file first, or edits the marker files, is outside its scope,
 and so is any tool the hosts do not route through `PreToolUse`. The markers live
