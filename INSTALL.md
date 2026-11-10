@@ -207,6 +207,7 @@ they are. Delete
 | `is a symbolic link to ..., which does not exist`, `is read-only`, or `Cannot write to ..., which is needed for ...` | A settings path points nowhere, or the installer cannot write where it needs to. | Fix the link or the permission, then run the installer again. |
 | `holds NaN or Infinity` or `is not valid JSON (duplicate key ...)` | `settings.json` contains a value or a repeated key that a rewrite would silently change. | Fix the file by hand, then run the installer again. |
 | `--uninstall` exits 1 and shows a `uv` or `pipx` error | The CLI is installed but the tool could not remove it. | Read the tool's error above the line, fix it, and run `./install.sh --uninstall` again. |
+| `the usage ledger ... cannot be written, so the token budget cannot be tracked` | A `[budget]` is configured and the state directory or `usage.jsonl` in it is read-only, or the path is not a regular file. No request was sent. | Fix the permission, or remove the link or FIFO at that path. To run without a budget, remove the `[budget]` table from `~/.config/enmaas/config.toml`. |
 | `exhausted max_tokens (... output tokens, stop=...) during reasoning` | The model spent its output budget thinking. | Add `--thinking off`, or shorten the prompt. On the hosted free models, raising `--max-tokens` was measured to make no difference. |
 
 If none of these match, open an issue in this repository with the full command and

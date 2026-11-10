@@ -15,6 +15,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
   writes and the installer's own guard check all use the new form. Run
   `./install.sh` again to replace a registration made by an earlier version.
   Codex then asks you to trust the changed hook.
+- A gateway on `localhost` or a loopback address is now always reached
+  directly. Before, when `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` was set,
+  in either case, a plain `http://localhost` gateway request went to that
+  proxy with the key in its header, so whoever ran the proxy could read the
+  key. TLS settings such as `SSL_CERT_FILE` still apply, and any other gateway
+  still uses the proxy variables.
 - `install.sh --dry-run` no longer prints the whole Claude Code
   `settings.json`, Codex `config.toml` or enmaas `config.toml` it would write.
   Before, a dry run that would change one of those files printed every line of
@@ -44,6 +50,57 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `$ref`, `$dynamicRef` or `$recursiveRef` that does not start with `#` stops
   the command before any request, and validation has nothing it could
   retrieve.
+- The usage ledger, the open-run records and each `map` index are now created
+  with mode 0600, and the state directory with mode 0700 by every command that
+  creates it, including `enmaas record`. Before, under the usual umask 022, the
+  ledger and the index were readable by every user on the machine, and so was
+  the state directory when `enmaas record` created it. A file that already
+  exists keeps its mode. The ledger, like the index, is now opened without
+  following a symbolic link and without blocking, and only a regular file is
+  read or written. Before, a link at `usage.jsonl` sent the ledger rows to
+  the link's target, and a FIFO there hung every `ask`, `map` and `usage` with
+  no message. Now a budgeted command refuses and names the file, `enmaas usage`
+  warns and exits 0, and an unbudgeted `ask` or `map` keeps its answer.
+- A malformed gateway reply, a stop signal or a crash no longer loses the
+  spend of the requests a run already made. Before, a reply such as
+  `{"choices": [1]}` ended a `map` run with a traceback before its ledger
+  event was written, so with a rolling `[budget]` the next run started as if
+  that spend never happened and could pass the ceiling. The charge of every
+  reply that arrived now reaches the ledger, through the run's own event or,
+  for a run that was killed, through its open-run record. The reference lists
+  the cases that can still be undercounted.
+- With a rolling `[budget]` configured, `ask` and `map` now refuse to start
+  when the usage ledger cannot be written, and send no request. Before, a
+  missing ledger in a state directory that could not be written read as no
+  spend, so every run spent, failed to record it, and let the next run start
+  from zero: the budget never bound. The command now exits 1 with
+  `the usage ledger <path> cannot be written, so the token budget cannot be
+  tracked; fix it or remove the [budget] table from the config`, or with
+  `--json` the error object. The same holds for a read-only ledger.
+- An API key that holds a character an HTTP header cannot carry, such as a
+  newline, a carriage return, a tab or a non-ASCII letter, is now refused at
+  the start, before any request, with an error that names where the key came
+  from and shows no part of it. Before, a key pasted with a second line
+  failed inside the request, and the transport error printed both lines of
+  it with the newline escaped, where redaction did not find it. The first
+  line can be a working key.
+- Text from a gateway reply or a file can no longer act on the terminal.
+  Before, a reply that held an escape sequence such as OSC 52, which asks
+  the terminal to set the clipboard, reached the terminal through the receipt
+  preview, and so could a model id in the `models` list, a file name in a
+  receipt path, and the text `enmaas inspect` printed. Gateway error lines
+  could also add a forged line to a receipt. Now each of these prints every
+  character that cannot be printed as `?`, a newline or a tab in an error or
+  a preview as a space, and `inspect` keeps newlines and tabs. Answer files,
+  `ask --json` and `results.jsonl` keep the text as sent, and the `map --json`
+  failure list keeps it as sent up to 200 characters.
+- The skill's commands that count and list failures from `results.jsonl` now
+  run Python in isolated mode, `python3 -I -c`. Before, Python put the current
+  directory first on its import path, so running them inside a repository
+  that held a `json.py` ran that file as your user. The listing also replaces
+  every character that cannot be printed with `?` and cuts each id to 100
+  characters and each error to 200, so a planted row cannot flood or drive
+  the terminal.
 
 ### Fixed
 
@@ -55,11 +112,6 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - The content type named in that error now has the API key removed before it
   is cut to 80 characters, so no part of a key survives the cut. Characters
   that cannot be printed on one line are replaced.
-- A gateway error message that holds a newline or a terminal escape sequence
-  can no longer add a line to the `ask` or `map` receipt or act on the
-  terminal. The receipt prints it on one line with those characters replaced.
-  `ask --json` and `results.jsonl` keep the message as sent, and the
-  `map --json` failure list keeps it as sent up to 200 characters.
 - A reply that reports a token count above 10**12 no longer ends the run. Such
   a count reads as not reported, the same as a negative one.
 - A reply nested too deeply to decode now fails as `BadReplyError`, and a
@@ -81,10 +133,6 @@ and versions follow [Semantic Versioning](https://semver.org/).
   is still recorded.
 - An API key echoed back JSON-escaped in a gateway error body, as happens for a
   key holding a quote or a backslash, is now removed from the error message.
-- An API key that holds a character a header cannot carry, such as a non-ASCII
-  letter, an inner space or a control character, is now refused once at the
-  start with an error naming where the key came from. It used to fail every
-  request as an internal error. The error never shows the key.
 - A client error during a request, such as a reply that cannot be decoded, now
   fails that request at once with `GatewayError` in place of a traceback. It is
   not retried, for the same reason.
@@ -132,11 +180,6 @@ and versions follow [Semantic Versioning](https://semver.org/).
   were, with the default put back for a handler not set from Python.
 - A reader that closes stdout before the receipt is printed no longer makes a
   finished `ask` or `map` exit 120 with a `BrokenPipeError`.
-- A gateway on `localhost` or a loopback address is now always reached
-  directly. The proxy variables `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`,
-  in either case, used to send those requests and the key to a proxy. TLS
-  settings such as `SSL_CERT_FILE` still apply, and any other gateway still
-  uses the proxy variables.
 - With `--json`, `ask` and `map` now print exactly one JSON object on stdout
   on every exit, and `models` prints the error object when it fails. A
   missing items file, a bad template, attachment,
@@ -186,9 +229,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   writes the index through a link.
 - Reading open runs is bounded: each pass, one to settle dead runs and one for
   the budget check, reads at most 64 MiB of index for all records together,
-  smallest index first, so one command reads at most 128 MiB. Only lines that
-  start like a charge row and are at most 64 KiB are parsed. A killed run whose
-  index grew by more than that is undercounted. An `open-runs.jsonl` over
+  smallest index first, so one command reads at most 128 MiB. A line counts
+  only when it is a whole charge row as `map` writes it for that record's run,
+  and no line is parsed as JSON, so an index planted with lines that look like
+  charge rows no longer costs tens of seconds on every budgeted command. A
+  killed run whose index grew by more than 64 MiB is undercounted. An `open-runs.jsonl` over
   1 MiB or with more than 256 records is ignored with a warning that names it.
 - `enmaas record` refuses a count above 10**12 and an `--elapsed` that is not
   a finite number. Every count and charge written to the index, the ledger or

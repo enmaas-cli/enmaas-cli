@@ -33,6 +33,28 @@ in the user's own directories and are writable by the user.
 The key is read from `--key-file`, `ENMAAS_KEY`, the `key_file` named in the
 config file, or `~/.secrets/enmaas`, sent only to the configured `base_url` as a
 bearer token over HTTPS (HTTP is allowed for localhost only), and never written to
-the ledger, receipts or logs. Gateway error bodies are redacted before they are
-shown. A gateway that echoes the key inside an answer is outside what the tool can
-detect.
+the ledger, receipts or logs. A key that holds a character an HTTP header cannot
+carry, such as a newline, a tab or a non-ASCII letter, is refused before any
+request, and the error never shows any part of it. Gateway error bodies are
+redacted before they are shown. A gateway that echoes the key inside an answer is
+outside what the tool can detect. A gateway on `localhost` or a loopback address
+is always reached directly, never through a proxy from the environment.
+
+## What the tool keeps on disk
+
+The state directory (`~/.local/state/enmaas/runs/` by default) is created with
+mode 0700. The usage ledger, the open-run records and each `map` index are
+created with mode 0600. They are opened without following a symbolic link and
+without blocking, and only a regular file is read or written, so a link or a
+FIFO planted at one of those paths cannot redirect a write or hang a command.
+With a token budget configured, a command that cannot write the ledger refuses
+to start, because spend it cannot record would not count against the budget.
+
+## What the tool prints
+
+Text from the gateway or from a file, printed to a terminal, has every
+character that cannot be printed replaced: receipt previews and error lines,
+paths in receipts, the `models` list and `enmaas inspect`. A reply that holds a
+terminal escape sequence therefore cannot set the clipboard or change the
+title. Answer files keep the bytes the model sent. A `--schema` file can only
+refer to its own parts, so checking an answer never fetches anything.
