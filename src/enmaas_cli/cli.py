@@ -779,10 +779,11 @@ class Interrupt:
 class Final:
     """The exit code of a command that has finished and is printing its result.
 
-    Set by _dispatch just before the final receipt or JSON object of ask and
-    map. From then on a stop signal changes nothing: the ledger already says
-    what happened, and the process exits with this code. The one exception
-    is a result that itself reports the interrupt, which ends by the signal.
+    Set by _dispatch just before the final output of every command,
+    refusals and errors included. From then on a stop signal changes
+    nothing: the ledger already says what happened, and the process exits
+    with this code. The one exception is a result that itself reports the
+    interrupt, which ends by the signal.
     """
 
     code: int | None = None
@@ -807,6 +808,8 @@ async def _guarded(
     key: str,
     interrupt: Interrupt,
     final: Final,
+    *,
+    process: bool = False,
 ) -> int:
     """Run the command with SIGINT and SIGTERM handled the way asyncio.Runner handles SIGINT.
 
@@ -816,9 +819,12 @@ async def _guarded(
     on a lock or a file, because a Python signal handler runs when a
     blocking system call is interrupted.
 
-    Installed with signal.signal and restored on the way out, so calling
-    main in-process leaves the handlers as they were. A signal that is
-    ignored when the command starts stays ignored.
+    Installed with signal.signal. A signal that is ignored when the command
+    starts stays ignored. In-process, the previous handlers are put back on
+    the way out, so calling main leaves them as they were. In process mode
+    they are not: both signals are ignored from then on, because a handler
+    put back would let a late signal end a finished run by its default
+    action or print a traceback after main returned.
     """
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
@@ -830,6 +836,10 @@ async def _guarded(
             task.cancel()
 
     def on_signal(signum: int, frame: object) -> None:
+        if final.code is not None and not final.interrupted:
+            # The command finished, recorded and is printing its result. A
+            # signal now changes nothing, so it is not even recorded.
+            return
         if interrupt.signum is None:
             interrupt.signum = signum
             if final.code is not None:
@@ -874,10 +884,13 @@ async def _guarded(
         return _setup_error(args, "interrupted")
     finally:
         for number, handler in previous.items():
-            # TypeError: a previous handler of None was not set from Python
-            # and cannot be put back.
-            with contextlib.suppress(ValueError, OSError, TypeError):
-                signal.signal(number, handler)
+            with contextlib.suppress(ValueError, OSError):
+                if process:
+                    signal.signal(number, signal.SIG_IGN)
+                else:
+                    # A previous handler of None was not set from Python and
+                    # cannot be passed back; the default is the nearest.
+                    signal.signal(number, signal.SIG_DFL if handler is None else handler)
 
 
 def _flush_quietly() -> None:
@@ -886,7 +899,14 @@ def _flush_quietly() -> None:
             stream.flush()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, process: bool = False) -> int:
+    """Run one command and return its exit code.
+
+    `process` is True only for the console script. Then the stop signals are
+    not put back when the command ends: the process either ends by a signal
+    it recorded, or returns its code with both signals ignored until it
+    exits. In-process callers keep their own handlers.
+    """
     args = build_parser().parse_args(argv)
     if args.command in {"inspect", "allow-read"}:
         try:
@@ -937,7 +957,9 @@ def main(argv: list[str] | None = None) -> int:
     final = Final()
     try:
         try:
-            code = asyncio.run(_guarded(args, config, base_url, key_value, interrupt, final))
+            code = asyncio.run(
+                _guarded(args, config, base_url, key_value, interrupt, final, process=process)
+            )
         except asyncio.CancelledError:
             # A cancel that was still pending when the command returned
             # cancels the task itself, outside every handler in _guarded.
@@ -1020,6 +1042,9 @@ async def _dispatch(
                 ),
             ),
         )
+        # Set before every final output, here and below, so a stop signal
+        # from then on changes nothing.
+        final.code = int(ExitCode.OK)
         _warn_if_untracked(recorded, config)
         return int(ExitCode.OK)
 
@@ -1027,6 +1052,7 @@ async def _dispatch(
     if args.command == "usage":
         ledger = state_root() / "usage.jsonl"
         events, skipped = load_events_counted(ledger)
+        final.code = int(ExitCode.OK)
         if skipped:
             print(
                 f"warning: {skipped} rows of {printable(str(ledger))} could not be read "
@@ -1056,6 +1082,7 @@ async def _dispatch(
     # is opened, so an over-budget invocation costs nothing at all.
     rolling = rolling_check(config, state_root() / "usage.jsonl")
     if rolling.message and args.command in ("ask", "map"):
+        final.code = int(ExitCode.ABORTED)
         if getattr(args, "json", False):
             # Exit 3 already means "stopped early", so a bare exit code
             # cannot distinguish a budget refusal from a breaker abort.
@@ -1098,8 +1125,10 @@ async def _dispatch(
                     timeout=timeout,
                 )
             except httpx.HTTPError as exc:
+                final.code = int(ExitCode.ERROR)
                 print(f"error: {redact(str(exc), key)}", file=sys.stderr)
                 return int(ExitCode.ERROR)
+            final.code = int(ExitCode.OK)
             if args.json:
                 print(json.dumps(rows, indent=2))
             else:
@@ -1358,3 +1387,8 @@ async def _dispatch(
                 )
             )
         return outcome.exit_code
+
+
+def entry() -> NoReturn:
+    """The console script. Runs main in process mode and exits with its code."""
+    sys.exit(main(process=True))

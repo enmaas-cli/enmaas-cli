@@ -130,7 +130,7 @@ class Cli:
         *args: str,
         stdout: int = subprocess.PIPE,
         preexec_fn: Callable[[], Any] | None = None,
-        program: str = "from enmaas_cli.cli import main; raise SystemExit(main())",
+        program: str = "from enmaas_cli.cli import entry; entry()",
     ) -> subprocess.Popen[str]:
         child = subprocess.Popen(
             [sys.executable, "-c", program] + list(args),
@@ -416,9 +416,7 @@ def _signal_after_release(
         _wait_for(lambda: len(_charges(index)) >= 4, "4 charge rows", child)
     child.send_signal(signum)
     out, err = child.communicate(timeout=DEADLINE)
-    # After main has returned, a SIGINT meets Python's default handler and the
-    # interpreter prints a KeyboardInterrupt traceback. Only that is allowed.
-    assert "Traceback" not in err.split("main returned")[0], err
+    assert "Traceback" not in err, err
     return child, signum, out, err, cli.events()[before:]
 
 
@@ -427,7 +425,7 @@ def _signal_after_release(
 REPORTING_PROGRAM = (
     "import os\n"
     "from enmaas_cli.cli import main\n"
-    "code = main()\n"
+    "code = main(process=True)\n"
     "os.write(2, b'main returned %d\\n' % code)\n"
     "raise SystemExit(code)\n"
 )
@@ -455,13 +453,10 @@ def test_a_signal_after_the_work_is_recorded_changes_nothing(cli: Cli, gateway: 
     """The signal lands while the child writes its ledger event, prints, or exits.
 
     Every run prints one JSON object and writes one ledger event, and the two
-    agree. An interrupted run ends by the signal. Once the command has put
-    the previous handlers back on its way out, a signal takes its default
-    action, so a finished run can still end by it, and a SIGINT after main
-    returned prints the interpreter's KeyboardInterrupt traceback; the
-    ledger and the output are complete by then. When it exits normally,
-    main itself returned 0. The exact orders are pinned without timing in
-    the tests below.
+    agree. An interrupted run ends by the signal. A finished run exits with
+    its own code, because in process mode both signals stay ignored once the
+    command is done. The exact orders are pinned without timing in the tests
+    below.
     """
     for run in range(8):
         child, signum, out, err, events = _signal_after_release(cli, gateway, run, late=True)
@@ -476,9 +471,8 @@ def test_a_signal_after_the_work_is_recorded_changes_nothing(cli: Cli, gateway: 
         else:
             assert event["status"] == "ok" and event["error_kind"] is None, (run, event)
             assert obj["status"] == "ok"
-            assert child.returncode in (0, -signum), (run, child.returncode, err)
-            if child.returncode == 0:
-                assert "main returned 0\n" in err, (run, err)
+            assert child.returncode == 0, (run, child.returncode, err)
+            assert "main returned 0\n" in err, (run, err)
 
 
 def test_a_child_that_ignores_sigint_finishes_its_map(cli: Cli, gateway: Gateway) -> None:
@@ -628,7 +622,7 @@ async def dispatch(args, config, base_url, key, final):
 
 
 cli._dispatch = dispatch
-code = cli.main(["--config", "none.toml", "usage"])
+code = cli.main(["--config", "none.toml", "usage"], process=True)
 os.write(2, b"main returned %d\\n" % code)
 raise SystemExit(code)
 """
@@ -720,3 +714,119 @@ def test_a_closed_stdout_does_not_fail_ask_or_json_output(
     assert event["status"] == "ok"
     assert "BrokenPipeError" not in err
     assert "Traceback" not in err
+
+
+def _read_one_object(child: subprocess.Popen[str]) -> bytes:
+    """Read the child's stdout until a whole JSON object has arrived, then return it.
+
+    Reads the descriptor directly, so nothing is left in a Python buffer, and
+    polls with a deadline.
+    """
+    import select
+
+    assert child.stdout is not None
+    fd = child.stdout.fileno()
+    data = b""
+    deadline = time.monotonic() + DEADLINE
+    while not data.endswith(b"\n}\n"):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AssertionError(f"timed out waiting for the output: {data!r}")
+        ready, _, _ = select.select([fd], [], [], min(left, 0.5))
+        if ready:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            data += chunk
+    return data
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+@pytest.mark.parametrize("command", ["ask", "map"])
+def test_a_signal_after_the_output_changes_nothing(
+    cli: Cli, gateway: Gateway, command: str, signum: int
+) -> None:
+    for run in range(15):
+        _reset(gateway, 1000)
+        before = len(cli.events())
+        json_args = cli.map_args(f"run{run}", 2) if command == "map" else ASK
+        args = [*json_args, "--json"]
+        child = cli.start(*args)
+        head = _read_one_object(child)
+        child.send_signal(signum)
+        rest, err = child.communicate(timeout=DEADLINE)
+        out = head.decode("utf-8") + rest
+        assert child.returncode == 0, (run, child.returncode, err)
+        assert "Traceback" not in err, (run, err)
+        obj = json.loads(out)
+        assert obj["status"] == "ok", (run, obj)
+        events = cli.events()[before:]
+        assert [(e["status"], e["error_kind"]) for e in events] == [("ok", None)], (run, events)
+
+
+def test_main_in_process_puts_back_a_handler_python_did_not_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A saved handler of None cannot be passed to signal.signal; the default is put back."""
+    from enmaas_cli import cli as cli_module
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    real_signal = signal.signal
+
+    def custom(signum: int, frame: object) -> None:
+        raise AssertionError("not expected to run")
+
+    def fake_signal(signum: int, handler: Any) -> Any:
+        previous = real_signal(signum, handler)
+        # The command's own install sees a handler that was not set from Python.
+        if signum == signal.SIGTERM and "_guarded" in getattr(handler, "__qualname__", ""):
+            return None
+        return previous
+
+    saved = real_signal(signal.SIGTERM, custom)
+    try:
+        before = _record_handlers()
+        monkeypatch.setattr(signal, "signal", fake_signal)
+        assert cli_module.main(["--config", str(tmp_path / "none.toml"), "usage"]) == 0
+        monkeypatch.undo()
+        after = _record_handlers()
+        assert after[signal.SIGTERM] is signal.SIG_DFL
+        assert after[signal.SIGINT] == before[signal.SIGINT]
+    finally:
+        monkeypatch.undo()
+        real_signal(signal.SIGTERM, saved)
+    capsys.readouterr()
+
+
+def test_process_mode_leaves_both_signals_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli import cli as cli_module
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    before = _record_handlers()
+    try:
+        argv = ["--config", str(tmp_path / "none.toml"), "usage"]
+        assert cli_module.main(argv, process=True) == 0
+        assert _record_handlers() == {
+            signal.SIGINT: signal.SIG_IGN,
+            signal.SIGTERM: signal.SIG_IGN,
+        }
+    finally:
+        for signum, handler in before.items():
+            signal.signal(signum, handler)
+    capsys.readouterr()
+
+
+def test_the_console_script_runs_in_process_mode() -> None:
+    import tomllib
+
+    from enmaas_cli import cli as cli_module
+
+    root = Path(enmaas_cli.__file__).resolve().parents[2]
+    with (root / "pyproject.toml").open("rb") as handle:
+        scripts = tomllib.load(handle)["project"]["scripts"]
+    assert scripts == {"enmaas": "enmaas_cli.cli:entry"}
+    assert callable(cli_module.entry)

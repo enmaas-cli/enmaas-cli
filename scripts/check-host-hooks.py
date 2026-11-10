@@ -309,7 +309,7 @@ def run_case(
         + shlex.quote(str(ROOT / "src"))
         + " exec "
         + shlex.quote(sys.executable)
-        + " -c 'from enmaas_cli.cli import main; raise SystemExit(main())' \"$@\"\n",
+        + " -c 'from enmaas_cli.cli import entry; entry()' \"$@\"\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)
