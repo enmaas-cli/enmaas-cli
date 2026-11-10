@@ -10,6 +10,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from enmaas_cli.pricing import ModelPrice
 
@@ -53,7 +54,7 @@ class Config:
 
 DEFAULTS = Config()
 
-_SCALARS = {
+_SCALARS: dict[str, type[Any]] = {
     "base_url": str,
     "key_file": str,
     "default_model": str,
@@ -87,37 +88,48 @@ def load_config(path: Path) -> Config:
     config = Config()
     warnings: list[str] = []
     updates: dict[str, object] = {}
-
     for key, value in raw.items():
-        if key == "prices":
-            parsed, price_warnings = _parse_prices(value)
-            warnings.extend(price_warnings)
-            if parsed:
-                updates["prices"] = parsed
-        elif key == "budget":
-            updates.update(_parse_budget(value))
-        elif key == "dialect_overrides":
-            if isinstance(value, dict):
-                updates["dialect_overrides"] = {str(k): str(v) for k, v in value.items()}
-            else:
-                warnings.append("dialect_overrides must be a table, ignoring it")
-        elif key in _SCALARS:
-            expected = _SCALARS[key]
-            # bool subclasses int, so `concurrency = true` would otherwise pass
-            # the isinstance check and silently become 1.
-            wrong_type = not isinstance(value, expected) or (
-                expected is int and isinstance(value, bool)
-            )
-            if wrong_type:
-                warnings.append(f"{key} must be {expected.__name__}, ignoring {value!r}")
-            elif key in {"concurrency", "timeout"} and value <= 0:
-                warnings.append(f"{key} must be positive, ignoring {value!r}")
-            else:
-                updates[key] = value
-        else:
-            warnings.append(f"unknown config key {key!r} in {path}, ignoring it")
+        _read_key(key, value, path, updates, warnings)
 
     return replace(config, **updates, warnings=warnings)  # type: ignore[arg-type]
+
+
+def _read_key(
+    key: str, value: Any, path: Path, updates: dict[str, object], warnings: list[str]
+) -> None:
+    """Read one top-level key into `updates`, or say in `warnings` why it is ignored."""
+    if key == "prices":
+        parsed, price_warnings = _parse_prices(value)
+        warnings.extend(price_warnings)
+        if parsed:
+            updates["prices"] = parsed
+    elif key == "budget":
+        updates.update(_parse_budget(value))
+    elif key == "dialect_overrides":
+        if isinstance(value, dict):
+            updates["dialect_overrides"] = {str(k): str(v) for k, v in value.items()}
+        else:
+            warnings.append("dialect_overrides must be a table, ignoring it")
+    elif key in _SCALARS:
+        problem = _scalar_problem(key, value)
+        if problem is None:
+            updates[key] = value
+        else:
+            warnings.append(problem)
+    else:
+        warnings.append(f"unknown config key {key!r} in {path}, ignoring it")
+
+
+def _scalar_problem(key: str, value: Any) -> str | None:
+    """Why the value of a scalar key cannot be used, or None when it can."""
+    expected = _SCALARS[key]
+    # bool subclasses int, so `concurrency = true` would otherwise pass the
+    # isinstance check and silently become 1.
+    if not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
+        return f"{key} must be {expected.__name__}, ignoring {value!r}"
+    if key in {"concurrency", "timeout"} and value <= 0:
+        return f"{key} must be positive, ignoring {value!r}"
+    return None
 
 
 def _parse_prices(value: object) -> tuple[dict[str, ModelPrice], list[str]]:

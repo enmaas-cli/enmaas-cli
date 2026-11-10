@@ -10,10 +10,11 @@ import os
 import resource
 import secrets
 import stat
+from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from enmaas_cli.auth import printable
 from enmaas_cli.errors import ExitCode
@@ -407,6 +408,40 @@ def _is_text(value: object) -> bool:
     return isinstance(value, str) and len(value) <= MAX_TEXT_CHARS
 
 
+def _is_timestamp(value: object) -> bool:
+    """An ISO time with a time zone. A naive one raises when compared with the window cutoff."""
+    if not isinstance(value, str):
+        return False
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return moment.tzinfo is not None
+
+
+def _is_count(value: object) -> bool:
+    # bool is refused: it subclasses int, so True would pass as 1. Bounded
+    # so that sums stay printable.
+    if value is None:
+        return True
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_RECORDED
+
+
+# The checks a row must pass, in order, each with the reason a failure
+# reports. A row is a JSON object with string keys. Text is used as a
+# dictionary key and printed, and elapsed is summed, so a value of any other
+# type would raise in `enmaas usage`.
+_ROW_RULES: tuple[tuple[str, Callable[[dict[str, Any]], bool]], ...] = (
+    ("unknown field", lambda row: set(row) <= _FIELDS),
+    ("missing field", lambda row: set(row) >= _REQUIRED),
+    ("bad timestamp", lambda row: _is_timestamp(row["timestamp"])),
+    ("bad text field", lambda row: all(_is_text(row[name]) for name in _TEXT_FIELDS)),
+    ("bad text field", lambda row: row["error_kind"] is None or _is_text(row["error_kind"])),
+    ("bad elapsed", lambda row: _is_elapsed(row["elapsed"])),
+    ("bad count", lambda row: all(_is_count(row.get(name)) for name in _COUNT_FIELDS)),
+)
+
+
 def _event_from_row(data: object) -> UsageEvent:
     """Parse one ledger row, rejecting what must not be trusted.
 
@@ -419,42 +454,11 @@ def _event_from_row(data: object) -> UsageEvent:
     """
     if not isinstance(data, dict):
         raise RowError("not an object")
-    keys = set(data)
-    if not keys <= _FIELDS:
-        raise RowError("unknown field")
-    if not keys >= _REQUIRED:
-        raise RowError("missing field")
-
-    raw = data["timestamp"]
-    if not isinstance(raw, str):
-        raise RowError("bad timestamp")
-    try:
-        timestamp = datetime.fromisoformat(raw)
-    except ValueError:
-        raise RowError("bad timestamp") from None
-    if timestamp.tzinfo is None:
-        raise RowError("bad timestamp")
-
-    # Text is used as a dictionary key and printed, and elapsed is summed, so
-    # a value of any other type would raise in `enmaas usage`.
-    if not all(_is_text(data[name]) for name in _TEXT_FIELDS):
-        raise RowError("bad text field")
-    if data["error_kind"] is not None and not _is_text(data["error_kind"]):
-        raise RowError("bad text field")
-    if not _is_elapsed(data["elapsed"]):
-        raise RowError("bad elapsed")
-
-    for name in _COUNT_FIELDS:
-        count = data.get(name)
-        if count is None:
-            continue
-        # bool first: it subclasses int, so True would pass as 1. Bounded so
-        # that sums stay printable.
-        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= MAX_RECORDED:
-            raise RowError("bad count")
-
+    for reason, rule in _ROW_RULES:
+        if not rule(data):
+            raise RowError(reason)
     row = dict(data)
-    row.pop("timestamp")
+    timestamp = datetime.fromisoformat(row.pop("timestamp"))
     return UsageEvent(timestamp=timestamp, **row)
 
 

@@ -116,6 +116,28 @@ def _backoff(attempt: int) -> float:
     return delay + random.uniform(0.0, delay * JITTER_FRACTION)
 
 
+CEILING_HINT = (
+    " (the gateway's own ~300s ceiling; set --thinking off, "
+    "shorten the prompt, or lower --max-tokens)"
+)
+
+
+def _wait_or_refuse(response: httpx.Response, detail: str, attempt: int, elapsed: float) -> float:
+    """The wait before the next attempt after a reply that is not 200.
+
+    Raises GatewayError when the status is not worth retrying.
+    """
+    if not is_retryable(response.status_code, elapsed):
+        hint = CEILING_HINT if response.status_code == 504 else ""
+        raise GatewayError(
+            f"{response.status_code}: {detail}{hint}",
+            status=response.status_code,
+            attempts=attempt,
+        )
+    wait = _retry_after(response)
+    return _backoff(attempt) if wait is None else wait
+
+
 async def call(
     client: httpx.AsyncClient,
     base_url: str,
@@ -151,12 +173,8 @@ async def call(
         except httpx.TransportError as exc:
             last_status, last_detail = None, f"{type(exc).__name__}: {exc}"
             if _elapsed() >= GATEWAY_CEILING_NEAR:
-                hint = (
-                    " (the gateway's own ~300s ceiling; set --thinking off, "
-                    "shorten the prompt, or lower --max-tokens)"
-                )
                 raise GatewayError(
-                    f"{last_detail}{hint}",
+                    f"{last_detail}{CEILING_HINT}",
                     status=None,
                     attempts=attempt,
                 ) from None
@@ -173,21 +191,7 @@ async def call(
                 return _reply_object(response, secret)
             last_status = response.status_code
             last_detail = _error_detail(response.text, secret)
-            if not is_retryable(response.status_code, _elapsed()):
-                hint = ""
-                if response.status_code == 504:
-                    hint = (
-                        " (the gateway's own ~300s ceiling; set --thinking off, "
-                        "shorten the prompt, or lower --max-tokens)"
-                    )
-                raise GatewayError(
-                    f"{response.status_code}: {last_detail}{hint}",
-                    status=response.status_code,
-                    attempts=attempt,
-                )
-            wait = _retry_after(response)
-            if wait is None:
-                wait = _backoff(attempt)
+            wait = _wait_or_refuse(response, last_detail, attempt, _elapsed())
             if attempt <= retries:
                 await sleep(wait)
                 continue

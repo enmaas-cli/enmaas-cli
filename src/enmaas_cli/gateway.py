@@ -11,7 +11,7 @@ from __future__ import annotations
 import ipaddress
 from collections.abc import Mapping
 from typing import NamedTuple
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 BASE_URL_ENV = "ENMAAS_BASE_URL"
 
@@ -63,46 +63,55 @@ def check(url: str) -> Checked:
 
     The URL is the gateway root. Requests append /v1/... to it, so a path in
     it is kept as typed. The scheme is lowered, the host keeps its case, and
-    trailing slashes are removed.
+    trailing slashes are removed. The rules run in a fixed order, and the
+    first one that fails names the problem.
     """
-
-    def refuse(problem: str) -> Checked:
-        return Checked(url, problem)
-
     if any(ch.isspace() for ch in url):
-        return refuse(WHITESPACE)
+        return Checked(url, WHITESPACE)
     try:
         parts = urlsplit(url)
     except ValueError:
         # urlsplit only raises here for a malformed bracketed IPv6 host.
-        return refuse(HOST)
-    if parts.scheme.lower() not in {"http", "https"}:
-        return refuse(SCHEME)
+        return Checked(url, HOST)
+    problem = _problem(url, parts)
+    if problem is not None:
+        return Checked(url, problem)
+    # Request paths start with a slash, so a trailing one here would double it.
+    return Checked(f"{parts.scheme.lower()}://{parts.netloc}{parts.path.rstrip('/')}", None)
+
+
+def _problem(url: str, parts: SplitResult) -> str | None:
+    scheme = parts.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return SCHEME
     # The key travels in a header, so cleartext http would send it across
     # the network readable to anyone on the path. A local gateway or
     # tunnel is the only place where that is safe.
-    if parts.scheme.lower() == "http" and not is_loopback(parts.hostname):
-        return refuse(CLEARTEXT)
+    if scheme == "http" and not is_loopback(parts.hostname):
+        return CLEARTEXT
     # Checked on the raw text: "https://h?" has an empty query, yet the
     # appended request path would still land after the "?".
     if "?" in url or "#" in url:
-        return refuse(QUERY)
+        return QUERY
     # The key travels in a header. Credentials in the URL would be a
     # second secret that ends up in logs and error messages.
     if "@" in parts.netloc:
-        return refuse(CREDENTIALS)
+        return CREDENTIALS
     # Without a host, "https://" plus "/v1/models" would send the key to a
     # host named "v1".
     if not parts.hostname:
-        return refuse(HOST)
+        return HOST
+    return _port_problem(parts)
+
+
+def _port_problem(parts: SplitResult) -> str | None:
     try:
-        _ = parts.port
+        port = parts.port
     except ValueError:
         # httpx would raise InvalidURL later, outside any handler.
-        return refuse(PORT)
+        return PORT
     # "https://host:" has no port number after its colon. urlsplit reads that
     # as no port at all, so the URL would be sent on as typed.
-    if parts.port is None and parts.netloc.endswith(":"):
-        return refuse(EMPTY_PORT)
-    # Request paths start with a slash, so a trailing one here would double it.
-    return Checked(f"{parts.scheme.lower()}://{parts.netloc}{parts.path.rstrip('/')}", None)
+    if port is None and parts.netloc.endswith(":"):
+        return EMPTY_PORT
+    return None

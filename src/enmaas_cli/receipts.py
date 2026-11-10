@@ -156,6 +156,72 @@ def rolling_total(outcome: MapOutcome, rolling_spent: int) -> int:
     return rolling_spent + outcome.charged
 
 
+# The first line of the receipt, by the reason the run stopped early.
+_MAP_HEADERS = {
+    "budget": "enmaas map stopped on budget",
+    "breaker": "enmaas map ABORTED (too many failures)",
+    "interrupted": "enmaas map interrupted",
+    "index": "enmaas map stopped: the index could not be written",
+}
+
+
+def _batch_mark(outcome: MapOutcome, batch_defaulted: bool) -> str:
+    if not batch_defaulted:
+        return ""
+    has = "has" if outcome.batch > 1 else "has no"
+    return f"  (default: template {has} ===PER ITEM===)"
+
+
+def _budget_lines(
+    outcome: MapOutcome, token_budget: int | None, rolling_ceiling: int | None, rolling_spent: int
+) -> list[str]:
+    lines = []
+    if token_budget:
+        # outcome.spent, not a figure derived from the token counts above:
+        # on a resumed run the ceiling is compared against the job total,
+        # and those counters only cover this invocation.
+        mark = "  <-- stopped here" if outcome.tripped_budget == "per_run" else ""
+        lines.append(f"  budget    {outcome.spent:,} of {token_budget:,} tokens, this run{mark}")
+    if rolling_ceiling is not None:
+        # Shown whenever a standing budget is configured, even if the
+        # per-run flag was not used. Otherwise a rolling stop would print
+        # no ceiling at all and look unexplained.
+        mark = "  <-- stopped here" if outcome.tripped_budget == "rolling" else ""
+        total = rolling_total(outcome, rolling_spent)
+        lines.append(f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}")
+    return lines
+
+
+def _failure_lines(outcome: MapOutcome) -> list[str]:
+    # Gateway text is not trusted. A newline in it would forge a receipt
+    # line, and an escape sequence would reach the terminal.
+    lines = [
+        f"  failure   {printable(item_id)}  {failure_line_text(message)}"
+        for item_id, message in outcome.failures[:FAILURE_LIMIT]
+    ]
+    if len(outcome.failures) > FAILURE_LIMIT:
+        lines.append(f"            {len(outcome.failures) - FAILURE_LIMIT} more in the index")
+    return lines
+
+
+def _resume_lines(outcome: MapOutcome) -> list[str]:
+    if outcome.tripped_budget == "rolling":
+        # Raising --token-budget would not help: the standing ceiling in
+        # config.toml is what stopped this, and only it can release it.
+        return [
+            "  resume    the rolling budget in config.toml is spent; "
+            "raise it or wait for the window to roll"
+        ]
+    if outcome.abort_reason == "budget":
+        # Not the plain --resume hint below. A budget stop resumed at the
+        # same ceiling re-trips at once, so telling the user to "re-run
+        # with --resume" would be advice that cannot work.
+        return ["  resume    raise --token-budget, then re-run with --resume"]
+    if outcome.abort_reason is not None:
+        return ["  resume    re-run with --resume to continue"]
+    return []
+
+
 def map_receipt(
     outcome: MapOutcome,
     *,
@@ -172,30 +238,14 @@ def map_receipt(
     running a whole command, the way ask_receipt already is. Takes the
     model separately because MapOutcome does not carry one.
     """
-    if outcome.abort_reason == "budget":
-        header = "enmaas map stopped on budget"
-    elif outcome.abort_reason == "breaker":
-        header = "enmaas map ABORTED (too many failures)"
-    elif outcome.abort_reason == "interrupted":
-        header = "enmaas map interrupted"
-    elif outcome.abort_reason == "index":
-        header = "enmaas map stopped: the index could not be written"
-    else:
-        header = "enmaas map ok"
-
     not_attempted = outcome.total - outcome.attempted - outcome.skipped
     model_mark = "  (default)" if model_defaulted else ""
-    if batch_defaulted:
-        has = "has" if outcome.batch > 1 else "has no"
-        batch_mark = f"  (default: template {has} ===PER ITEM===)"
-    else:
-        batch_mark = ""
-    lines = [header]
+    lines = [_MAP_HEADERS.get(outcome.abort_reason or "", "enmaas map ok")]
     if outcome.abort_reason == "index":
         lines.append(f"  error     {printable(outcome.index_error or 'unknown')}")
     lines += [
         f"  model     {model}{model_mark}",
-        f"  batch     {outcome.batch}{batch_mark}",
+        f"  batch     {outcome.batch}{_batch_mark(outcome, batch_defaulted)}",
         f"  items     {outcome.total} total: {outcome.attempted} attempted, "
         f"{outcome.ok} ok, {outcome.failed} failed, {outcome.skipped} skipped",
     ]
@@ -209,40 +259,10 @@ def map_receipt(
     lines.append(f"  outdir    {printable(str(outcome.outdir))}")
     lines.append(f"  index     {printable(str(outcome.outdir / 'results.jsonl'))}")
     lines.append(f"  tokens    in {outcome.input_tokens:,}   out {outcome.output_tokens:,}")
-    if token_budget:
-        # outcome.spent, not a figure derived from the token counts above:
-        # on a resumed run the ceiling is compared against the job total,
-        # and those counters only cover this invocation.
-        mark = "  <-- stopped here" if outcome.tripped_budget == "per_run" else ""
-        lines.append(f"  budget    {outcome.spent:,} of {token_budget:,} tokens, this run{mark}")
-    if rolling_ceiling is not None:
-        # Shown whenever a standing budget is configured, even if the
-        # per-run flag was not used. Otherwise a rolling stop would print
-        # no ceiling at all and look unexplained.
-        mark = "  <-- stopped here" if outcome.tripped_budget == "rolling" else ""
-        total = rolling_total(outcome, rolling_spent)
-        lines.append(f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}")
+    lines += _budget_lines(outcome, token_budget, rolling_ceiling, rolling_spent)
     lines.append(f"  elapsed   {outcome.elapsed:.1f}s")
-    for item_id, message in outcome.failures[:FAILURE_LIMIT]:
-        # Gateway text is not trusted. A newline in it would forge a receipt
-        # line, and an escape sequence would reach the terminal.
-        lines.append(f"  failure   {printable(item_id)}  {failure_line_text(message)}")
-    if len(outcome.failures) > FAILURE_LIMIT:
-        lines.append(f"            {len(outcome.failures) - FAILURE_LIMIT} more in the index")
-    if outcome.tripped_budget == "rolling":
-        # Raising --token-budget would not help: the standing ceiling in
-        # config.toml is what stopped this, and only it can release it.
-        lines.append(
-            "  resume    the rolling budget in config.toml is spent; "
-            "raise it or wait for the window to roll"
-        )
-    elif outcome.abort_reason == "budget":
-        # Not the plain --resume hint below. A budget stop resumed at the
-        # same ceiling re-trips at once, so telling the user to "re-run
-        # with --resume" would be advice that cannot work.
-        lines.append("  resume    raise --token-budget, then re-run with --resume")
-    elif outcome.abort_reason is not None:
-        lines.append("  resume    re-run with --resume to continue")
+    lines += _failure_lines(outcome)
+    lines += _resume_lines(outcome)
     return "\n".join(lines)
 
 
