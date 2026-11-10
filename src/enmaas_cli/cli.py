@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import openruns
-from .auth import AuthError, printable, redact, resolve_key
+from .auth import AuthError, cut_redacted, printable, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
 from .client import call, is_loopback, make_client
 from .config import Config, ConfigError, default_config_path, load_config
@@ -47,7 +47,14 @@ from .outputs import (
     state_root,
     write_output,
 )
-from .receipts import ask_receipt, create_run_dir, map_receipt, prune_runs
+from .receipts import (
+    FAILURE_LIMIT,
+    FAILURE_MESSAGE_CHARS,
+    ask_receipt,
+    create_run_dir,
+    map_receipt,
+    prune_runs,
+)
 from .runner import run_map
 from .schema import ValidationError, load_schema, validate_against_schema
 from .tokens import MAX_TOKEN_COUNT
@@ -1354,9 +1361,14 @@ async def _dispatch(
                     ),
                     "tripped": outcome.tripped_budget,
                 },
+                # Bounded like the receipt; the index keeps every message
+                # whole. Not made printable: JSON encoding escapes control
+                # characters already.
                 "failures": [
-                    {"id": item_id, "error": message} for item_id, message in outcome.failures
+                    {"id": item_id, "error": cut_redacted(message, FAILURE_MESSAGE_CHARS)}
+                    for item_id, message in outcome.failures[:FAILURE_LIMIT]
                 ],
+                "failures_truncated": len(outcome.failures) > FAILURE_LIMIT,
                 # Why the run stopped when the index could not be written.
                 "error": outcome.index_error,
             }

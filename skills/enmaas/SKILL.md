@@ -205,7 +205,7 @@ can be counted without importing this package.
 |---|---|---|
 | 0 | all succeeded | continue |
 | 1 | config, auth, or validation error, or a `map` whose `results.jsonl` could not be written | read the message, it names the fix |
-| 2 | partial failure | check `results.jsonl` in the outdir |
+| 2 | partial failure | read the failures from `results.jsonl` in the outdir, as shown below |
 | 3 | circuit breaker or token budget stopped the run | read the receipt; raise a spent budget before using `--resume` |
 | 130 or 143 | stopped by SIGINT or SIGTERM; after one signal a `map` recorded its spend and printed its receipt first | re-run the `map` with `--resume` to finish; for an `ask`, check whether the answer file exists before running it again |
 
@@ -218,6 +218,47 @@ printed changes nothing, including the exit status.
 The breaker aborts a bulk run on 6 consecutive failures, or more than 50% of a
 full 20-item window. `--resume` skips items already recorded `ok` with an
 output file present, so finishing a half-done run is cheap.
+
+### Read failures from the index
+
+The `map` receipt lists the first 20 failures, each message cut to 200
+characters, and says how many more the index holds. `--json` does the same
+and sets `failures_truncated`. `results.jsonl` in the outdir keeps every
+message whole. Use these commands to read it instead of printing the file.
+Each item counts by its latest row, so an item a resume fixed is not counted.
+
+Count the failed items:
+
+    python3 -c '
+    import json, sys
+    last = {}
+    for line in open(sys.argv[1], encoding="utf-8"):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and "id" in row and "status" in row:
+            last[str(row["id"])] = row
+    print(sum(1 for row in last.values() if row["status"] == "error"))
+    ' /tmp/triage/results.jsonl
+
+List the first 20 failed ids, each with the first 200 characters of its error:
+
+    python3 -c '
+    import json, sys
+    last = {}
+    for line in open(sys.argv[1], encoding="utf-8"):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and "id" in row and "status" in row:
+            last[str(row["id"])] = row
+    failed = [row for row in last.values() if row["status"] == "error"]
+    for row in failed[:20]:
+        text = str(row.get("error"))[:200]
+        print(row["id"], "".join(ch if ch.isprintable() else " " for ch in text))
+    ' /tmp/triage/results.jsonl
 
 ## Reasoning consumes the output budget
 

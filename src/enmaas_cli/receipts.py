@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .auth import printable
+from .auth import cut_redacted, printable
 from .dialect import Completion, Dialect
 from .outputs import state_root as state_root
 
@@ -22,6 +22,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from .runner import MapOutcome
 
 PREVIEW_LIMIT = 160
+# A run with many failures would otherwise print a receipt or a --json
+# object as long as its index. The index keeps every message whole.
+FAILURE_LIMIT = 20
+FAILURE_MESSAGE_CHARS = 200
 _RUN_NAME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{4}")
 
 
@@ -65,6 +69,15 @@ def prune_runs(root: Path, *, max_age_days: int = 30) -> None:
 def preview(text: str, *, limit: int = PREVIEW_LIMIT) -> str:
     """Deterministic head of the response. Not a generated summary."""
     return " ".join(text.split())[:limit]
+
+
+def failure_line_text(message: str) -> str:
+    """A redacted failure message made printable on one line, then cut to length.
+
+    Printable comes before the cut, so the cut counts what is shown. The cut
+    never splits the redaction placeholder.
+    """
+    return cut_redacted(printable(message), FAILURE_MESSAGE_CHARS)
 
 
 def _count(value: int | None) -> str:
@@ -188,10 +201,12 @@ def map_receipt(
             total = rolling_spent + outcome.charged
         lines.append(f"  budget    {total:,} of {rolling_ceiling:,} tokens, rolling window{mark}")
     lines.append(f"  elapsed   {outcome.elapsed:.1f}s")
-    for item_id, message in outcome.failures[:20]:
+    for item_id, message in outcome.failures[:FAILURE_LIMIT]:
         # Gateway text is not trusted. A newline in it would forge a receipt
         # line, and an escape sequence would reach the terminal.
-        lines.append(f"  failure   {printable(item_id)}  {printable(message)}")
+        lines.append(f"  failure   {printable(item_id)}  {failure_line_text(message)}")
+    if len(outcome.failures) > FAILURE_LIMIT:
+        lines.append(f"            {len(outcome.failures) - FAILURE_LIMIT} more in the index")
     if outcome.tripped_budget == "rolling":
         # Raising --token-budget would not help: the standing ceiling in
         # config.toml is what stopped this, and only it can release it.
