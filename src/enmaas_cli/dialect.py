@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .errors import BadReplyError, CallError
+from .errors import BadReplyError, CallError, where
 
 # Re-exported so existing importers of these names from this module keep working.
 from .errors import EmptyResponseError as EmptyResponseError
@@ -429,8 +429,8 @@ def parse_response(data: dict[str, Any], dialect: Dialect) -> Completion:
 
     Every failure is a CallError that carries the reply's usage, because
     those tokens were billed. An unexpected error inside a parser becomes a
-    BadReplyError naming only its class, since its text could quote the
-    reply.
+    BadReplyError naming only its class and where it was raised, since its
+    text could quote the reply.
     """
     try:
         completion = _parse_anthropic(data) if dialect == "anthropic" else _parse_openai(data)
@@ -438,7 +438,7 @@ def parse_response(data: dict[str, Any], dialect: Dialect) -> Completion:
         raise
     except Exception as exc:
         usage = _anthropic_usage(data) if dialect == "anthropic" else _openai_usage(data)
-        raise BadReplyError(f"reply could not be read ({type(exc).__name__})", usage) from None
+        raise BadReplyError(f"reply could not be read ({where(exc)})", usage) from None
     if not completion.text and completion.stop in _TRUNCATED_STOPS:
         out = completion.usage.output_tokens
         raise EmptyResponseError(

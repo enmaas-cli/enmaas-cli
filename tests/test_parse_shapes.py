@@ -6,6 +6,7 @@ carries the usage the reply reported, because those tokens were billed.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -311,7 +312,9 @@ def test_unexpected_parser_error_becomes_bad_reply_with_usage(
 
     monkeypatch.setattr(dialect_module, parser, broken)
     exc = _bad(data, dialect)
-    assert str(exc) == "reply could not be read (TypeError)"
+    assert re.fullmatch(
+        r"reply could not be read \(TypeError at test_parse_shapes\.py:\d+\)", str(exc)
+    )
 
 
 # run_ask
