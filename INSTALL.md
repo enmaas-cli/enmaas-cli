@@ -125,7 +125,7 @@ Pass `-o PATH` to keep an answer somewhere permanent.
 
 Start a new Claude Code session, or restart the one you have open, so it reloads
 settings. Type `/hooks` and confirm a `PreToolUse` entry whose command runs
-`python3 -S` on `.../enmaas/guard/hooks/pre-tool-use.py`. The skill loads on its own from
+`python3 -I -S` on `.../enmaas/guard/hooks/pre-tool-use.py`. The skill loads on its own from
 `~/.claude/skills/enmaas/`.
 
 ### Codex

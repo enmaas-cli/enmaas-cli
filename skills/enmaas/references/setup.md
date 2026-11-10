@@ -79,7 +79,7 @@ no evidence about whether a model request would succeed.
 
 `install.sh` copies the guard to `~/.local/share/enmaas/guard/` (or
 `$XDG_DATA_HOME/enmaas/guard/`) and registers
-`python3 -S ".../guard/hooks/pre-tool-use.py"` as a `PreToolUse` hook in
+`python3 -I -S ".../guard/hooks/pre-tool-use.py"` as a `PreToolUse` hook in
 `~/.claude/settings.json` and in `~/.codex/config.toml` (between
 `# >>> enmaas guard` and `# <<< enmaas guard` marker lines). `CLAUDE_CONFIG_DIR`
 and `CODEX_HOME` move those two files when set. The guard needs no

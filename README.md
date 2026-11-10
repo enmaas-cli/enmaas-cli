@@ -113,7 +113,7 @@ Delegating saves little if the assistant reads the answer straight back. The
 guard denies reads of protected answer files through the hosts' file tools and
 the common shell readers, including through pipelines, globs, redirections and
 the file commands inside `sed` and `awk` programs. Receipts and every other file
-stay readable. It runs with `python3 -S` from two standard-library-only modules,
+stay readable. It runs with `python3 -I -S` from two standard-library-only modules,
 answers inside a fixed time budget, and is registered so that a hook failure
 blocks the call on Claude Code. It guards against accidental reads by a
 well-behaved assistant. It is not a sandbox: an assistant that writes its own

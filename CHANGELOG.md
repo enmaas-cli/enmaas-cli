@@ -5,6 +5,17 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- The output guard now runs as `python3 -I -S`, in Python's isolated mode.
+  Before, when the environment a host passed to the guard set `PYTHONPATH` to
+  a directory that holds files from a repository, such as `.`, a `json.py` in
+  that directory ran as your user on every guarded tool call, and the guard
+  made no decision. The plugin registration, the registration `install.sh`
+  writes and the installer's own guard check all use the new form. Run
+  `./install.sh` again to replace a registration made by an earlier version.
+  Codex then asks you to trust the changed hook.
+
 ### Fixed
 
 - A gateway reply with status 200 whose body is not a JSON object, such as an

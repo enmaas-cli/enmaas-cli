@@ -186,7 +186,7 @@ def hook_command():
             f"The guard path {guard_script!r} is not valid UTF-8. Set XDG_DATA_HOME "
             "to another path, or run this again with --no-hook."
         )
-    return "python3 -S " + shlex.quote(guard_script)
+    return "python3 -I -S " + shlex.quote(guard_script)
 
 
 def same(a, b):
@@ -1288,7 +1288,7 @@ fi
 check_guard() {
   local script="$1" out
   out="$(printf '{"tool_name":"Read","cwd":"/","tool_input":{"file_path":"/dev/null"}}' \
-    | python3 -S -B "$script")" \
+    | python3 -I -S -B "$script")" \
     || die "The new guard copy failed to run. The installed copy, if any, is unchanged."
   [[ -z "$out" ]] \
     || die "The new guard copy denied an ordinary read: $out

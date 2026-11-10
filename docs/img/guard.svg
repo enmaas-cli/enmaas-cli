@@ -25,7 +25,7 @@
 
   <rect class="box" x="470" y="40" width="260" height="90" style="stroke:#b91c1c"/>
   <text class="t h" x="600" y="78" text-anchor="middle">PreToolUse guard</text>
-  <text class="t s" x="600" y="104" text-anchor="middle">python3 -S, stdlib only</text>
+  <text class="t s" x="600" y="104" text-anchor="middle">python3 -I -S, stdlib only</text>
 
   <rect class="file" x="920" y="120" width="240" height="120"/>
   <text class="t h" x="1040" y="170" text-anchor="middle">Answer file</text>
