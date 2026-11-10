@@ -204,3 +204,20 @@ def printable(text: str) -> str:
     if text.isprintable():
         return text
     return "".join(ch if ch.isprintable() else (" " if ch in _LINE_BREAKS else "?") for ch in text)
+
+
+_KEPT_IN_BLOCKS = frozenset("\n\t")
+
+
+def printable_block(text: str) -> str:
+    """Make text that spans lines safe to print.
+
+    Like printable, but a newline and a tab are kept, for output that is
+    meant to keep its lines, such as `inspect`. A carriage return becomes a
+    space, because it can move the cursor back over a line already shown.
+    Every other character that `str.isprintable()` rejects becomes "?".
+    """
+    return "".join(
+        ch if ch.isprintable() or ch in _KEPT_IN_BLOCKS else (" " if ch in _LINE_BREAKS else "?")
+        for ch in text
+    )

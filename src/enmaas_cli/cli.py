@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import openruns
-from .auth import AuthError, cut_redacted, printable, redact, resolve_key
+from .auth import AuthError, cut_redacted, printable, printable_block, redact, resolve_key
 from .budget import TokenBudget, metered, rolling_spend
 from .client import _reply_object, call, is_loopback, make_client
 from .config import Config, ConfigError, default_config_path, load_config
@@ -462,7 +462,7 @@ async def run_ask(
                     receipt=(
                         f"enmaas ask FAILED\n"
                         f"  model     {model}{model_mark}  ({resolved} dialect)\n"
-                        f"  output    {path}\n"
+                        f"  output    {printable(str(path))}\n"
                         f"  error     {printable(error_msg)}{repaired}"
                     ),
                     path=path,
@@ -944,7 +944,10 @@ def main(argv: list[str] | None = None, *, process: bool = False) -> int:
     if args.command in {"inspect", "allow-read"}:
         try:
             if args.command == "inspect":
-                sys.stdout.write(inspect_file(args.path, max_chars=args.max_chars))
+                # The file can hold an answer, so its text is printed inert.
+                # Its lines and tabs are kept.
+                text = inspect_file(args.path, max_chars=args.max_chars)
+                sys.stdout.write(printable_block(text))
             else:
                 allow_read(args.path)
         except (OSError, ValueError) as exc:
@@ -1196,7 +1199,9 @@ async def _dispatch(
                 print(json.dumps(rows, indent=2))
             else:
                 for row in rows:
-                    print(f"{row['id']:<45} {','.join(row['dialects'])}")
+                    # A catalog id is gateway text, so it is printed inert.
+                    model_id = printable(redact(row["id"], key))
+                    print(f"{model_id:<45} {','.join(row['dialects'])}")
             return int(ExitCode.OK)
 
         if args.command == "ask":

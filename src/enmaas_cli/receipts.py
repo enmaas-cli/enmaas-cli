@@ -71,8 +71,13 @@ def prune_runs(root: Path, *, max_age_days: int = 30) -> None:
 
 
 def preview(text: str, *, limit: int = PREVIEW_LIMIT) -> str:
-    """Deterministic head of the response. Not a generated summary."""
-    return " ".join(text.split())[:limit]
+    """Deterministic head of the response. Not a generated summary.
+
+    The reply is not trusted. An escape sequence in it, such as one that
+    sets the terminal's clipboard, is made inert before the cut, so the cut
+    counts what is shown.
+    """
+    return printable(" ".join(text.split()))[:limit]
 
 
 def failure_line_text(message: str) -> str:
@@ -113,7 +118,8 @@ def ask_receipt(
     lines = [
         "enmaas ask ok",
         f"  model     {model}{model_mark}  ({dialect} dialect)",
-        f"  output    {path}  ({size:,} B)",
+        # A path is printed inert: a file name can hold an escape sequence.
+        f"  output    {printable(str(path))}  ({size:,} B)",
         _token_line(completion),
         f"  elapsed   {elapsed:.1f}s",
     ]
@@ -183,8 +189,8 @@ def map_receipt(
         )
     if not_attempted > 0:
         lines.append(f"            {not_attempted} not attempted")
-    lines.append(f"  outdir    {outcome.outdir}")
-    lines.append(f"  index     {outcome.outdir / 'results.jsonl'}")
+    lines.append(f"  outdir    {printable(str(outcome.outdir))}")
+    lines.append(f"  index     {printable(str(outcome.outdir / 'results.jsonl'))}")
     lines.append(f"  tokens    in {outcome.input_tokens:,}   out {outcome.output_tokens:,}")
     if token_budget:
         # outcome.spent, not a figure derived from the token counts above:
