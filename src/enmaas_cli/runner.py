@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import sys
 import time
 from collections import deque
@@ -166,6 +168,30 @@ def _charge_row(charge: int, *, items: int, run: str | None = None) -> str:
     return json.dumps(row)
 
 
+def _append_index(index: Path, text: str) -> None:
+    """Append rows to the index, never through a symbolic link.
+
+    Mode 0o666 so the umask decides, as it did for a plain open. O_NOFOLLOW
+    makes a link swapped in during the run fail the write instead of sending
+    the rows to the link's target.
+    """
+    fd = os.open(index, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o666)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _check_index(index: Path) -> None:
+    """Refuse an index that is a link or not a regular file, before anything is sent."""
+    try:
+        info = os.lstat(index)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(
+            f"{index} is not a regular file; enmaas does not write its index through a link"
+        )
+
+
 def spent_tokens(outdir: Path) -> int:
     """Metered tokens already charged to this job, read from results.jsonl.
 
@@ -318,6 +344,9 @@ async def run_map(
     schema = load_schema(schema_file) if schema_file is not None else None
 
     outdir.mkdir(parents=True, exist_ok=True)
+    index = outdir / "results.jsonl"
+    # Before resume reads the index and before any request is sent.
+    _check_index(index)
     skips = resume_skips(outdir) if resume else set()
     pending = [i for i in items if str(i["id"]) not in skips]
     for item in pending:
@@ -339,7 +368,6 @@ async def run_map(
     tokens = max_tokens or default_max_tokens(thinking=thinking)
     breaker = CircuitBreaker()
     semaphore = asyncio.Semaphore(concurrency)
-    index = outdir / "results.jsonl"
     abort_reason: str | None = None
     # Seeded from the charge rows of earlier invocations, so the ceiling
     # belongs to the job rather than to one command. Resetting it per run
@@ -473,13 +501,14 @@ async def run_map(
             # written, so a cancel cannot separate an answer file from its
             # rows. An await added here would break that.
             try:
-                with index.open("a", encoding="utf-8") as handle:
-                    # Charge first. If the process dies mid-write, the
-                    # asymmetry matters: an orphaned charge row over-counts,
-                    # which is safe, while an item row whose charge never
-                    # landed lets a resumed run spend that budget twice.
-                    handle.write(_charge_row(charge, items=1, run=run_id) + "\n")
-                    handle.write(json.dumps(row) + "\n")
+                # Charge first. If the process dies mid-write, the asymmetry
+                # matters: an orphaned charge row over-counts, which is safe,
+                # while an item row whose charge never landed lets a resumed
+                # run spend that budget twice.
+                _append_index(
+                    index,
+                    _charge_row(charge, items=1, run=run_id) + "\n" + json.dumps(row) + "\n",
+                )
             except OSError:
                 # The run ends with this error. Requests that cannot be
                 # recorded must not be sent, so tasks still waiting for the
@@ -659,15 +688,17 @@ async def run_map(
             # written, so a cancel cannot separate an answer file from its
             # rows. An await added here would break that.
             try:
-                with index.open("a", encoding="utf-8") as handle:
-                    # One charge row per request, not per item: the group
-                    # was one call. Per-item rows carry "tokens": None here,
-                    # which is why the budget cannot be rebuilt from them.
-                    # Written first, so a crash over-counts rather than
-                    # letting a resumed run respend the group's budget.
-                    handle.write(_charge_row(charge, items=len(group), run=run_id) + "\n")
-                    for row in rows:
-                        handle.write(json.dumps(row) + "\n")
+                # One charge row per request, not per item: the group was one
+                # call. Per-item rows carry "tokens": None here, which is why
+                # the budget cannot be rebuilt from them. Written first, so a
+                # crash over-counts rather than letting a resumed run respend
+                # the group's budget.
+                _append_index(
+                    index,
+                    _charge_row(charge, items=len(group), run=run_id)
+                    + "\n"
+                    + "".join(json.dumps(row) + "\n" for row in rows),
+                )
             except OSError:
                 # The same rule as the single-item path above.
                 abort_reason = "index"

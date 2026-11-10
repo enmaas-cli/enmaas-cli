@@ -272,16 +272,16 @@ async def test_an_index_that_cannot_be_written_stops_new_requests(
         "shared\n===PER ITEM===\ndo {x}" if mode == BATCHED else "do {x}", encoding="utf-8"
     )
     index = tmp_path / "out" / "results.jsonl"
-    real_open = Path.open
+    real_append = runner._append_index
     writes = 0
 
-    def guarded_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+    def guarded_append(path: Path, text: str) -> None:
         nonlocal writes
-        if self == index and args and args[0] == "a":
+        if path == index:
             writes += 1
             if writes == 3:
                 raise OSError("index is read-only")
-        return real_open(self, *args, **kwargs)
+        real_append(path, text)
 
     calls = 0
 
@@ -290,7 +290,7 @@ async def test_an_index_that_cannot_be_written_stops_new_requests(
         calls += 1
         return _good(_ids_in(request), mode == BATCHED)
 
-    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(runner, "_append_index", guarded_append)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         with pytest.raises(OSError, match="index is read-only"):
             await run_map(
