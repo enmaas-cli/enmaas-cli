@@ -771,7 +771,9 @@ def _read_one_object(child: subprocess.Popen[str]) -> bytes:
 def test_a_signal_after_the_output_changes_nothing(
     cli: Cli, gateway: Gateway, command: str, signum: int
 ) -> None:
-    for run in range(15):
+    # A few runs catch a gross regression. The exact orders are pinned
+    # without timing in the scenario tests above.
+    for run in range(5):
         _reset(gateway, 1000)
         before = len(cli.events())
         json_args = cli.map_args(f"run{run}", 2) if command == "map" else ASK
