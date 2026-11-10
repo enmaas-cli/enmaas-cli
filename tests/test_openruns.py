@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import functools
 import json
 import os
 import stat
@@ -27,12 +26,27 @@ def _usage_log_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
 
 
-@functools.cache
+_dead: list[int] = []
+
+
 def _dead_pid() -> int:
-    """A process id that existed and has been reaped, so the probe finds nothing."""
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait()
-    return child.pid
+    """A process id that existed and has been reaped, so the probe finds nothing.
+
+    Checked again on every call: once reaped, the id can be given to a new
+    process, and a record with that id would then look alive.
+    """
+    while True:
+        if _dead:
+            try:
+                os.kill(_dead[0], 0)
+            except ProcessLookupError:
+                return _dead[0]
+            except PermissionError:
+                pass
+            _dead.clear()
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        _dead.append(child.pid)
 
 
 def _index(outdir: Path, rows: list[dict[str, Any]]) -> Path:
@@ -134,16 +148,37 @@ def test_files_are_mode_0600(tmp_path: Path) -> None:
 
 
 def test_every_change_holds_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every load and store happens between taking the lock and releasing it."""
     state = tmp_path / "state"
     events: list[str] = []
+    lock_fds: set[int] = set()
     real_flock = fcntl.flock
     real_replace = os.replace
     real_unlink = os.unlink
+    real_open = os.open
+    real_close = os.close
+    real_load = openruns._load
 
     def flock(fd: int, operation: int) -> None:
         assert os.readlink(f"/proc/self/fd/{fd}") == str(state / openruns.LOCK_FILE)
-        events.append(f"flock {operation}")
+        events.append("unlock" if operation & fcntl.LOCK_UN else f"flock {operation}")
         real_flock(fd, operation)
+
+    def open_(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path) == str(state / openruns.LOCK_FILE):
+            lock_fds.add(fd)
+        return fd
+
+    def close(fd: int) -> None:
+        if fd in lock_fds:
+            lock_fds.discard(fd)
+            events.append("close")
+        real_close(fd)
+
+    def load(state_dir: Path) -> list[OpenRun]:
+        events.append("load")
+        return real_load(state_dir)
 
     def replace(src: Any, dst: Any) -> None:
         events.append("replace")
@@ -157,6 +192,9 @@ def test_every_change_holds_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyP
         pytest.skip("needs /proc to name a descriptor")
     dead = _record()
     monkeypatch.setattr(fcntl, "flock", flock)
+    monkeypatch.setattr(os, "open", open_)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(openruns, "_load", load)
     monkeypatch.setattr(os, "replace", replace)
     monkeypatch.setattr(os, "unlink", unlink)
 
@@ -167,7 +205,11 @@ def test_every_change_holds_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyP
     lock = f"flock {fcntl.LOCK_EX | fcntl.LOCK_NB}"
     # settle proves the directory is writable (an empty temporary file is
     # made and removed) before it appends, then removes the data file.
-    assert events == [lock, "replace", lock, "unlink", lock, "unlink", "unlink"]
+    assert events == [
+        *[lock, "load", "replace", "close"],
+        *[lock, "load", "unlink", "close"],
+        *[lock, "load", "unlink", "unlink", "close"],
+    ]
 
 
 def test_settle_writes_one_killed_event_and_removes_the_record(tmp_path: Path) -> None:
@@ -1308,3 +1350,18 @@ def test_a_run_that_ends_during_the_budget_check_is_counted(
     check = rolling_check(Config(budget_tokens=1000, budget_window_days=7), ledger)
     # Counted once or, for this one check, twice. Never zero.
     assert check.spent in (60, 120)
+
+
+def test_end_when_the_record_is_already_gone_does_nothing(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    run = openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai")
+    assert run is not None
+    other = openruns.begin(state, outdir=tmp_path / "b", model="m", dialect="openai")
+    openruns.end(state, run)
+    before = (state / openruns.OPEN_RUNS_FILE).read_bytes()
+    openruns.end(state, run)
+    assert (state / openruns.OPEN_RUNS_FILE).read_bytes() == before
+    openruns.end(state, other)
+    assert not (state / openruns.OPEN_RUNS_FILE).exists()
+    openruns.end(state, other)
+    assert not (state / openruns.OPEN_RUNS_FILE).exists()

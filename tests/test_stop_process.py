@@ -653,3 +653,70 @@ def test_the_printed_result_decides_how_the_process_ends(
     assert "Traceback" not in err
     if returncode == 0:
         assert err.endswith("main returned 0\n"), err
+
+
+def _budget_config(cli: Cli, tokens: int) -> Path:
+    config = cli.tmp / "budget.toml"
+    config.write_text(f"[budget]\nwindow_days = 7\ntokens = {tokens}\n", encoding="utf-8")
+    return config
+
+
+ASK = ["ask", "-m", MODEL, "--dialect", "openai", "-p", "hi", "--retries", "0"]
+
+
+def test_a_killed_runs_spend_makes_the_next_ask_refuse(cli: Cli, gateway: Gateway) -> None:
+    gateway.answer_first = 2
+    index = cli.tmp / "job" / "results.jsonl"
+    _kill_after(cli, cli.map_args("job", 5), index, 2)
+    arrived = gateway.arrived
+    gateway.release.set()
+    done = cli.run("--config", str(_budget_config(cli, 2 * CHARGE)), *ASK)
+    assert done.returncode == 3, done.stderr
+    assert "refused" in done.stderr
+    assert gateway.arrived == arrived
+    assert [(e["error_kind"], e["charge"]) for e in cli.events()] == [("Killed", 2 * CHARGE)]
+
+
+def test_a_live_maps_spend_makes_a_concurrent_ask_refuse(cli: Cli, gateway: Gateway) -> None:
+    gateway.answer_first = 2
+    index = cli.tmp / "job" / "results.jsonl"
+    child = cli.start(*cli.map_args("job", 3))
+    _wait_for(lambda: len(_charges(index)) >= 2, "2 charge rows", child)
+    _wait_for(_held(gateway, 1), "a held request", child)
+    arrived = gateway.arrived
+    done = cli.run("--config", str(_budget_config(cli, 2 * CHARGE)), *ASK)
+    assert done.returncode == 3, done.stderr
+    assert f"including {2 * CHARGE} in runs still open" in done.stderr
+    assert gateway.arrived == arrived
+    gateway.release.set()
+    _, err = child.communicate(timeout=DEADLINE)
+    assert child.returncode == 0, err
+    assert [e["charge"] for e in cli.events()] == [3 * CHARGE]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [*ASK],
+        [*ASK, "--json"],
+        ["--json"],
+    ],
+    ids=["ask", "ask-json", "map-json"],
+)
+def test_a_closed_stdout_does_not_fail_ask_or_json_output(
+    cli: Cli, gateway: Gateway, args: list[str]
+) -> None:
+    gateway.answer_first = 0
+    if args == ["--json"]:
+        args = cli.map_args("job", 2, "--json")
+    child = cli.start(*args)
+    _wait_for(_held(gateway, 1), "a held request", child)
+    assert child.stdout is not None
+    child.stdout.close()
+    gateway.release.set()
+    _, err = child.communicate(timeout=DEADLINE)
+    assert child.returncode == 0, err
+    (event,) = cli.events()
+    assert event["status"] == "ok"
+    assert "BrokenPipeError" not in err
+    assert "Traceback" not in err
