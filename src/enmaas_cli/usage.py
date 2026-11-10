@@ -111,7 +111,19 @@ def _open_for_append(ledger: Path) -> int:
     """
     ledger.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
-    fd = os.open(ledger, flags, 0o600)
+    try:
+        fd = os.open(ledger, flags, 0o600)
+    except OSError:
+        # A link fails here with ELOOP and a FIFO with no reader with ENXIO.
+        # Both are named as what they are, so the warning can say which path
+        # to fix instead of an error class that does not point at it.
+        try:
+            planted = not stat.S_ISREG(os.lstat(ledger).st_mode)
+        except OSError:
+            planted = False
+        if planted:
+            raise NotRegularFile(f"{ledger} is not a regular file") from None
+        raise
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise NotRegularFile(f"{ledger} is not a regular file")
@@ -186,8 +198,23 @@ def _has_room(directory: Path) -> bool:
     return True
 
 
+class LedgerWrite(NamedTuple):
+    """What became of one ledger row."""
+
+    recorded: bool
+    # Why a write that was tried failed, safe to print on one line. None
+    # when the row was written, or when ENMAAS_NO_USAGE_LOG meant no write
+    # was tried.
+    failure: str | None
+
+
 def append_event(ledger: Path, event: UsageEvent) -> bool:
-    """Write one event as a JSON line. Returns whether it was recorded.
+    """Write one event as a JSON line. Returns whether it was recorded."""
+    return write_event(ledger, event).recorded
+
+
+def write_event(ledger: Path, event: UsageEvent) -> LedgerWrite:
+    """Write one event as a JSON line, and say why when it was not written.
 
     Failure never breaks the call: the work is already done and paid for
     by the time this runs, so raising here would turn a bookkeeping
@@ -195,11 +222,14 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
 
     But it does report. A ledger that silently refuses writes is
     indistinguishable from one showing no spend, so a caller enforcing a
-    budget needs to know the ceiling just stopped tracking. A link or a
-    FIFO at the ledger path is refused the same way.
+    budget needs to know the ceiling just stopped tracking, and a user
+    without one needs to know rows stopped. A link or a FIFO at the ledger
+    path is refused the same way, and the reason names the path. Any other
+    reason is the error class only: the message of an OS error can quote
+    more than the path.
     """
     if _is_disabled():
-        return False
+        return LedgerWrite(recorded=False, failure=None)
 
     # Convert datetime to ISO string for JSON
     data = asdict(event)
@@ -230,9 +260,11 @@ def append_event(ledger: Path, event: UsageEvent) -> bool:
     try:
         with os.fdopen(_open_for_append(ledger), "w", encoding="utf-8") as handle:
             handle.write(json.dumps(data) + "\n")
-    except OSError:
-        return False
-    return True
+    except NotRegularFile:
+        return LedgerWrite(False, f"{printable(str(ledger))} is not a regular file")
+    except OSError as exc:
+        return LedgerWrite(False, type(exc).__name__)
+    return LedgerWrite(recorded=True, failure=None)
 
 
 def _recorded(value: object) -> int | None:

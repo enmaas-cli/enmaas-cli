@@ -60,14 +60,15 @@ from .runner import run_map
 from .schema import ValidationError, load_schema, validate_against_schema
 from .tokens import MAX_TOKEN_COUNT
 from .usage import (
+    LedgerWrite,
     UsageEvent,
-    append_event,
     can_append,
     format_summary,
     format_summary_json,
     load_events_counted,
     load_events_strict,
     summarize_usage,
+    write_event,
 )
 
 BASE_URL_ENV = "ENMAAS_BASE_URL"
@@ -575,14 +576,19 @@ def _read_prompt(args: argparse.Namespace) -> str:
     raise ValueError("no prompt: pass -p, --prompt-file, or pipe text on stdin")
 
 
-def _warn_if_untracked(recorded: bool, config: Config) -> None:
-    """Say so when spend a budget depends on was not written down.
+def _warn_if_untracked(written: LedgerWrite, config: Config) -> None:
+    """Say so when a ledger row was not written down.
 
-    An unwritable ledger looks exactly like one showing no spend, so a
-    configured ceiling would quietly stop binding. The work is already
-    paid for, so this warns rather than failing.
+    A write that was tried and failed is always reported, budget or not:
+    otherwise a user whose ledger stopped taking rows, for example because
+    it is a link an older version followed, learns nothing until the
+    totals look wrong. An unwritable ledger also looks exactly like one
+    showing no spend, so a configured ceiling would quietly stop binding.
+    The work is already paid for, so this warns rather than failing.
     """
-    if not recorded and config.budget_tokens is not None:
+    if written.failure is not None:
+        print(f"warning: usage was not recorded: {written.failure}", file=sys.stderr)
+    if not written.recorded and config.budget_tokens is not None:
         print(
             "warning: a token budget is configured but this run's usage was "
             "not recorded, so it will not count against the ceiling",
@@ -1059,7 +1065,7 @@ async def _dispatch(
         # construction. Recording is a subcommand rather than a library
         # function so a caller in any language can be counted without
         # taking a dependency on this package.
-        recorded = append_event(
+        written = write_event(
             state_root() / "usage.jsonl",
             UsageEvent(
                 timestamp=datetime.now(UTC),
@@ -1092,7 +1098,7 @@ async def _dispatch(
         # Set before every final output, here and below, so a stop signal
         # from then on changes nothing.
         final.code = int(ExitCode.OK)
-        _warn_if_untracked(recorded, config)
+        _warn_if_untracked(written, config)
         return int(ExitCode.OK)
 
     # Handle usage command first (no timeout argument)
@@ -1238,7 +1244,7 @@ async def _dispatch(
             )
 
             usage_obj = result.usage
-            recorded = append_event(
+            written = write_event(
                 state_root() / "usage.jsonl",
                 UsageEvent(
                     timestamp=datetime.now(UTC),
@@ -1259,7 +1265,7 @@ async def _dispatch(
                     charge=metered(usage_obj) if usage_obj else 0,
                 ),
             )
-            _warn_if_untracked(recorded, config)
+            _warn_if_untracked(written, config)
             # Reported before the result is printed. From here a stop signal
             # changes nothing.
             final.code = result.exit_code
@@ -1346,7 +1352,7 @@ async def _dispatch(
                 "interrupted": "Interrupted",
                 "index": "IndexWriteError",
             }.get(outcome.abort_reason or "", "PartialFailure")
-        recorded = append_event(
+        written = write_event(
             state_root() / "usage.jsonl",
             UsageEvent(
                 timestamp=datetime.now(UTC),
@@ -1369,12 +1375,12 @@ async def _dispatch(
                 charge=outcome.charged,
             ),
         )
-        _warn_if_untracked(recorded, config)
+        _warn_if_untracked(written, config)
         # Removed after the ledger event, never before. A kill between the two
         # counts this run twice, which only over-counts. The other order
         # could lose the spend. When the ledger did not take the event, the
         # record stays, so a later command settles the run once it can.
-        if recorded:
+        if written.recorded:
             openruns.end(state_root(), record)
         # Reported before the result is printed. From here a stop signal
         # changes nothing.

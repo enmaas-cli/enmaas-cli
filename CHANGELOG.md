@@ -60,7 +60,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   read or written. Before, a link at `usage.jsonl` sent the ledger rows to
   the link's target, and a FIFO there hung every `ask`, `map` and `usage` with
   no message. Now a budgeted command refuses and names the file, `enmaas usage`
-  warns and exits 0, and an unbudgeted `ask` or `map` keeps its answer.
+  warns and exits 0, and an unbudgeted `ask` or `map` keeps its answer. Any
+  `ask`, `map` or `enmaas record` that tries to write a row and fails prints
+  `warning: usage was not recorded: <reason>` on stderr, budget or not, so a
+  ledger that an older version let you make a link no longer stops taking
+  rows without a word. The reason names the path when it is not a regular
+  file, and is the error class name otherwise. The exit code and `--json`
+  output do not change.
 - A malformed gateway reply, a stop signal or a crash no longer loses the
   spend of the requests a run already made. Before, a reply such as
   `{"choices": [1]}` ended a `map` run with a traceback before its ledger

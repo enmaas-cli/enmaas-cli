@@ -478,8 +478,9 @@ damaged one does not stop work; `enmaas usage` keeps reporting what it can from
 the rows it understands.
 
 If a run finishes but its usage cannot be written back, and a budget is
-configured, it prints a warning. That spend will not count against the ceiling, so
-the ceiling has quietly stopped tracking.
+configured, it prints a second warning after the one every failed write prints
+(see [Usage ledger](#usage-ledger)). That spend will not count against the
+ceiling, so the ceiling has quietly stopped tracking.
 
 **Not an enforcement boundary for runs side by side.** Each run reads the ledger
 at startup and writes its event at the end. The check also adds what every `map`
@@ -530,15 +531,21 @@ Set `ENMAAS_NO_USAGE_LOG=1` to turn recording off. Without a `[budget]`, a
 ledger that cannot be written never stops your command. With a `[budget]`
 configured, the command refuses to start when the ledger cannot be read or
 written or recording is disabled, because it cannot know what has been spent.
-When a write fails after a budgeted run has finished, you get a warning that the
-run will not count against the ceiling.
+Whenever `ask`, `map` or `enmaas record` tries to write a row and fails, it
+prints one line on stderr, budget or not: `warning: usage was not recorded:
+<reason>`. For a path that is not a regular file the reason is `<path> is not a
+regular file`; for any other failure it is the error class name, such as
+`PermissionError`. The exit code does not change, and `--json` output on stdout
+does not change. With a budget configured, a second line says the run will not
+count against the ceiling. With `ENMAAS_NO_USAGE_LOG` set no write is tried, so
+nothing is printed.
 
 **The ledger file.** When any command creates the state directory, it gets mode
 0700, and a new ledger gets mode 0600. A directory or a ledger that already
 exists keeps its mode. The ledger is opened without following a symbolic link
 and without blocking, and only a regular file is read or written. A link or a
-FIFO at the ledger path is never written through: the write is reported as not
-recorded. `enmaas usage` over such a path prints `warning: <path> is not a
+FIFO at the ledger path is never written through: the command prints
+`warning: usage was not recorded: <path> is not a regular file` and goes on. `enmaas usage` over such a path prints `warning: <path> is not a
 regular file, so no usage was read from it`, reports no calls, and exits 0.
 
 ### Runs that stop early
