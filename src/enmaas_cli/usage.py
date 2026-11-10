@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import math
 import os
+import resource
+import secrets
 import stat
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime
@@ -118,17 +121,68 @@ def _open_for_append(ledger: Path) -> int:
     return fd
 
 
+# The room a budgeted command proves before it sends a request. Far more
+# than one row, small enough to cost nothing.
+LEDGER_HEADROOM = 64 * 1024
+
+
 def can_append(ledger: Path) -> bool:
     """Whether one row could be appended now, by the same rules append_event uses.
 
-    Creates the ledger and its directory when they are missing, and writes
-    nothing. A budget can only bind when its spend is written down, so a
-    budgeted command proves this before it sends a request.
+    Proves three things: the ledger opens for append, its directory has room
+    for a row, and the process file size limit lets the ledger grow by
+    LEDGER_HEADROOM bytes. An open alone is not enough: on a full disk or at
+    a size limit the ledger still opens, and every budgeted run would spend
+    and record nothing. Creates the ledger and its directory when they are
+    missing, and writes no row. A budget can only bind when its spend is
+    written down, so a budgeted command proves this before it sends a
+    request.
+
+    Not proved: room can still run out while the request is in flight. The
+    write then fails, and the command warns that the run was not recorded.
     """
     try:
-        os.close(_open_for_append(ledger))
+        fd = _open_for_append(ledger)
+        try:
+            size = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
     except OSError:
         return False
+    soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)
+    if soft != resource.RLIM_INFINITY and size + LEDGER_HEADROOM > soft:
+        return False
+    return _has_room(ledger.parent)
+
+
+def _has_room(directory: Path) -> bool:
+    """Whether LEDGER_HEADROOM bytes can be written to a new file in `directory`.
+
+    The probe file is created exclusively and without following a link, so
+    it never touches a file that is already there, and it is always removed.
+    """
+    probe = directory / f".usage-room-{os.getpid()}-{secrets.token_hex(8)}"
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return False
+    try:
+        try:
+            left = memoryview(bytes(LEDGER_HEADROOM))
+            while left:
+                written = os.write(fd, left)
+                if written <= 0:
+                    return False
+                left = left[written:]
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    finally:
+        # The write is already proved or refused, so a failed removal does
+        # not change the answer.
+        with contextlib.suppress(OSError):
+            os.unlink(probe)
     return True
 
 

@@ -76,7 +76,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   from zero: the budget never bound. The command now exits 1 with
   `the usage ledger <path> cannot be written, so the token budget cannot be
   tracked; fix it or remove the [budget] table from the config`, or with
-  `--json` the error object. The same holds for a read-only ledger.
+  `--json` the error object. The same holds for a read-only ledger, a full
+  disk and a ledger at the process file size limit: before it sends, the
+  command writes 64 KiB to a hidden file in the state directory and removes
+  it, and checks the ledger can grow under the size limit. Room can still run
+  out while a request is in flight, and then the command warns.
 - An API key that holds a character an HTTP header cannot carry, such as a
   newline, a carriage return, a tab or a non-ASCII letter, is now refused at
   the start, before any request, with an error that names where the key came

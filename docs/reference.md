@@ -455,13 +455,18 @@ not a regular file is one problem, `<path> is not a regular file`, and nothing
 waits on it.
 
 With a budget configured, `ask` and `map` also prove the ledger can be written
-before they send anything: they open it for append, creating it and the state
-directory when missing, and close it again. When that fails, for example because
-the state directory or the ledger is read-only, the command sends no request and
-exits 1 with `the usage ledger <path> cannot be written, so the token budget
+before they send anything. They prove three things: the ledger opens for append
+(it and the state directory are created when missing), the state directory has
+room for a row, and the process file size limit lets the ledger grow by one.
+For the room, they write 64 KiB to a new hidden file in the state directory and
+remove it again. When any of that fails, for example because the state
+directory or the ledger is read-only, the disk is full, or the ledger is at the
+size limit, the command sends no request and exits 1 with `the usage ledger <path> cannot be written, so the token budget
 cannot be tracked; fix it or remove the [budget] table from the config`, or with
 `--json` the error object. Without that check, each run would spend, fail to
-record it, and let the next run start from zero again. With
+record it, and let the next run start from zero again. The check cannot see
+the future: room can still run out while the request is in flight, and then the
+write fails and the command warns. With
 `ENMAAS_NO_USAGE_LOG` set the earlier refusal applies: the command exits 3 and
 says the ledger is disabled. Without a budget, a ledger that cannot be written
 never stops a command. A refusal over the open-run records names `open-runs.jsonl`:

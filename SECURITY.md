@@ -49,6 +49,10 @@ without blocking, and only a regular file is read or written, so a link or a
 FIFO planted at one of those paths cannot redirect a write or hang a command.
 With a token budget configured, a command that cannot write the ledger refuses
 to start, because spend it cannot record would not count against the budget.
+Before it sends a request it proves that the ledger opens for writing, that the
+state directory has room for a row, and that the file size limit allows one.
+Room can still run out while the request is in flight. The write then fails and
+the command warns that the run was not recorded.
 
 ## What the tool prints
 
