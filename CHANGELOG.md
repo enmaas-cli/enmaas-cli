@@ -212,6 +212,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `models`, `ask` and `map` refuse a gateway URL with an empty port, such as
+  `https://host:`, with `gateway URL is not valid (empty port)`. Before, the
+  URL was used as typed. The installer already refused it.
 - The token totals of a `map` run count every usage block the gateway
   returned, so an item sent alone whose answer fails validation now counts in
   the receipt, in `map --json` and in the ledger event.

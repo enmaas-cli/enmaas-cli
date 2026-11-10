@@ -23,6 +23,7 @@ QUERY = "query"
 CREDENTIALS = "credentials"
 HOST = "host"
 PORT = "port"
+EMPTY_PORT = "empty_port"
 
 
 class Checked(NamedTuple):
@@ -99,5 +100,9 @@ def check(url: str) -> Checked:
     except ValueError:
         # httpx would raise InvalidURL later, outside any handler.
         return refuse(PORT)
+    # "https://host:" has no port number after its colon. urlsplit reads that
+    # as no port at all, so the URL would be sent on as typed.
+    if parts.port is None and parts.netloc.endswith(":"):
+        return refuse(EMPTY_PORT)
     # Request paths start with a slash, so a trailing one here would double it.
     return Checked(f"{parts.scheme.lower()}://{parts.netloc}{parts.path.rstrip('/')}", None)

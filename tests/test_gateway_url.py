@@ -47,6 +47,13 @@ def test_bad_gateway_urls_are_rejected_with_a_reason(url: str, reason: str) -> N
     assert str(exc_info.value) == f"gateway URL is not valid ({reason}): {url}"
 
 
+@pytest.mark.parametrize("url", ["https://g.test:", "https://g.test:/v1", "http://[::1]:"])
+def test_a_url_with_an_empty_port_is_rejected(url: str) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        _resolve(url)
+    assert str(exc_info.value) == f"gateway URL is not valid (empty port): {url}"
+
+
 def test_a_bad_configured_url_is_rejected_too() -> None:
     with pytest.raises(ValueError, match=r"\(missing host\): https://$"):
         resolve_base_url("https://", {}, CONFIG)

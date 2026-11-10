@@ -25,6 +25,8 @@ from enmaas_cli import gateway
         ("https://", gateway.HOST),
         ("http://[::1", gateway.HOST),
         ("https://g.test:bad", gateway.PORT),
+        ("https://g.test:", gateway.EMPTY_PORT),
+        ("https://g.test:/v1", gateway.EMPTY_PORT),
     ],
 )
 def test_each_rule_returns_its_problem_code(url: str, problem: str) -> None:

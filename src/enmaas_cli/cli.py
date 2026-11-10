@@ -693,6 +693,7 @@ GATEWAY_PROBLEMS = {
     gateway.CREDENTIALS: "credentials in the URL are not allowed",
     gateway.HOST: "missing host",
     gateway.PORT: "invalid port",
+    gateway.EMPTY_PORT: "empty port",
 }
 
 
