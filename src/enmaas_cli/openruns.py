@@ -43,6 +43,9 @@ STALE_AFTER = timedelta(hours=48)
 # a forged future time would keep a record from ever turning stale.
 CLOCK_SKEW = timedelta(minutes=5)
 MAX_FILE_BYTES = 1 << 20
+# Records honored in one file. A run writes one record, so more than this
+# many at once is not normal use, and each record costs a probe and a read.
+MAX_RECORDS = 256
 # Bytes of index read in one call to settle or live_charge, shared by every
 # record it handles, so a command's cost does not grow with the record count.
 MAX_READ_BYTES = 64 << 20
@@ -67,6 +70,25 @@ DROPPED_WARNING = (
     "warning: an open-run record could not be read and was dropped; "
     "its spend is not counted ({kind})"
 )
+
+
+class _TooLarge(OSError):
+    """The record file holds more bytes or records than the loader takes."""
+
+
+# Paths already reported as too large. A process runs one command, so this
+# keeps the warning to one line per command.
+_reported_too_large: set[str] = set()
+
+
+def _warn_too_large(state_dir: Path) -> None:
+    path = str(state_dir / OPEN_RUNS_FILE)
+    if path not in _reported_too_large:
+        _reported_too_large.add(path)
+        print(
+            f"warning: {path} is too large and was ignored; delete it if you did not create it",
+            file=sys.stderr,
+        )
 
 
 @dataclass(frozen=True)
@@ -154,35 +176,50 @@ def _read_bounded(fd: int, limit: int) -> bytes:
 def _load(state_dir: Path) -> list[OpenRun]:
     """Every valid record. Raises OSError when the file exists but cannot be read.
 
-    O_NONBLOCK keeps a planted FIFO from blocking the open, so the fstat
-    check below can refuse it.
+    Raises _TooLarge when the file is over MAX_FILE_BYTES or holds more than
+    MAX_RECORDS valid records. Reading only part of it would hide the rest,
+    and a later write would drop them for good. O_NONBLOCK keeps a planted
+    FIFO from blocking the open, so the fstat check below can refuse it.
     """
     try:
         fd = os.open(state_dir / OPEN_RUNS_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return []
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             return []
-        raw = _read_bounded(fd, MAX_FILE_BYTES)
+        if info.st_size > MAX_FILE_BYTES:
+            raise _TooLarge(OPEN_RUNS_FILE)
+        raw = _read_bounded(fd, MAX_FILE_BYTES + 1)
     finally:
         os.close(fd)
+    if len(raw) > MAX_FILE_BYTES:
+        raise _TooLarge(OPEN_RUNS_FILE)
     runs: list[OpenRun] = []
     for line in raw.decode("utf-8", errors="replace").splitlines():
         run = _parse(line)
         if run is not None:
             runs.append(run)
+            if len(runs) > MAX_RECORDS:
+                raise _TooLarge(OPEN_RUNS_FILE)
     return runs
 
 
 def _store(state_dir: Path, runs: list[OpenRun]) -> None:
-    """Replace the data file in one step, or remove it when no record is left."""
+    """Replace the data file in one step, or remove it when no record is left.
+
+    Refuses a list the loader would refuse, so a write can never turn a
+    readable file into an ignored one.
+    """
     path = state_dir / OPEN_RUNS_FILE
     if not runs:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
         return
     text = "".join(json.dumps(asdict(run)) + "\n" for run in runs)
+    if len(runs) > MAX_RECORDS or len(text.encode("utf-8")) > MAX_FILE_BYTES:
+        raise OSError("the open-run record file would be too large")
     temporary = state_dir / f".{OPEN_RUNS_FILE}.{secrets.token_hex(8)}.tmp"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -241,7 +278,9 @@ def begin(state_dir: Path, *, outdir: Path, model: str, dialect: str) -> OpenRun
             runs = _load(state_dir)
             runs.append(run)
             _store(state_dir, runs)
-    except OSError:
+    except OSError as exc:
+        if isinstance(exc, _TooLarge):
+            _warn_too_large(state_dir)
         print(BEGIN_WARNING, file=sys.stderr)
         return None
     return run
@@ -413,7 +452,17 @@ def settle(state_dir: Path, ledger: Path) -> None:
     """
     if _is_disabled():
         return
-    with contextlib.suppress(OSError), _locked(state_dir):
+    try:
+        _settle(state_dir, ledger)
+    except _TooLarge:
+        _warn_too_large(state_dir)
+    except OSError:
+        # Nothing was settled. The records stay for the next command.
+        pass
+
+
+def _settle(state_dir: Path, ledger: Path) -> None:
+    with _locked(state_dir):
         runs = _load(state_dir)
         now = datetime.now(UTC)
         kept: list[OpenRun] = []
@@ -467,6 +516,9 @@ def live_charge(state_dir: Path) -> int:
         return 0
     try:
         runs = _load(state_dir)
+    except _TooLarge:
+        _warn_too_large(state_dir)
+        return 0
     except OSError:
         return 0
     now = datetime.now(UTC)

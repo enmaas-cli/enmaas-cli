@@ -385,7 +385,8 @@ def test_the_record_file_read_is_bounded(tmp_path: Path, monkeypatch: pytest.Mon
     size = path.stat().st_size
     _write_records(state, [_record(run_id="first"), _record(run_id="second")])
     monkeypatch.setattr(openruns, "MAX_FILE_BYTES", size)
-    assert [run.run_id for run in openruns._load(state)] == ["first"]
+    with pytest.raises(OSError):
+        openruns._load(state)
 
 
 def test_a_record_file_that_is_a_link_is_not_followed(tmp_path: Path) -> None:
@@ -947,3 +948,69 @@ def test_map_through_main_tags_its_charge_rows_with_its_record(
     capsys.readouterr()
     lines = (tmp_path / "out2" / "results.jsonl").read_text(encoding="utf-8").splitlines()
     assert all("run" not in json.loads(line) for line in lines)
+
+
+def _too_large_warning(state: Path) -> str:
+    return (
+        f"warning: {state / openruns.OPEN_RUNS_FILE} is too large and was ignored; "
+        "delete it if you did not create it\n"
+    )
+
+
+BEGIN_LINE = (
+    "warning: the open-run record could not be written; "
+    "if this run is killed its spend is not counted\n"
+)
+
+
+def _many_records(state: Path, count: int) -> Path:
+    return _write_records(state, [_record(run_id=f"r{n}", pid=os.getppid()) for n in range(count)])
+
+
+@pytest.mark.parametrize("shape", ["too many records", "too many bytes"])
+def test_a_file_the_loader_refuses_is_reported_and_left_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], shape: str
+) -> None:
+    state = tmp_path / "state"
+    if shape == "too many records":
+        path = _many_records(state, openruns.MAX_RECORDS + 1)
+    else:
+        path = _write_records(state, [_record()])
+        with path.open("ab") as handle:
+            handle.write(b"x" * (openruns.MAX_FILE_BYTES + 1 - path.stat().st_size))
+        assert path.stat().st_size == openruns.MAX_FILE_BYTES + 1
+    before = path.read_bytes()
+    assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
+    assert capsys.readouterr().err == _too_large_warning(state) + BEGIN_LINE
+    assert path.read_bytes() == before
+
+
+def test_the_too_large_warning_prints_once_per_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state"
+    path = _many_records(state, openruns.MAX_RECORDS + 1)
+    before = path.read_bytes()
+    openruns.settle(state, state / "usage.jsonl")
+    assert openruns.live_charge(state) == 0
+    assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
+    assert capsys.readouterr().err == _too_large_warning(state) + BEGIN_LINE
+    assert path.read_bytes() == before
+    assert not (state / "usage.jsonl").exists()
+
+
+def test_the_record_limit_itself_is_loaded(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _many_records(state, openruns.MAX_RECORDS)
+    assert len(openruns._load(state)) == openruns.MAX_RECORDS
+
+
+def test_begin_never_writes_more_records_than_the_loader_takes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tmp_path / "state"
+    path = _many_records(state, openruns.MAX_RECORDS)
+    before = path.read_bytes()
+    assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
+    assert capsys.readouterr().err == BEGIN_LINE
+    assert path.read_bytes() == before
