@@ -464,13 +464,20 @@ async def run_map(
             # Nothing awaits between the reply arriving and these rows being
             # written, so a cancel cannot separate an answer file from its
             # rows. An await added here would break that.
-            with index.open("a", encoding="utf-8") as handle:
-                # Charge first. If the process dies mid-write, the
-                # asymmetry matters: an orphaned charge row over-counts,
-                # which is safe, while an item row whose charge never
-                # landed lets a resumed run spend that budget twice.
-                handle.write(_charge_row(charge, items=1) + "\n")
-                handle.write(json.dumps(row) + "\n")
+            try:
+                with index.open("a", encoding="utf-8") as handle:
+                    # Charge first. If the process dies mid-write, the
+                    # asymmetry matters: an orphaned charge row over-counts,
+                    # which is safe, while an item row whose charge never
+                    # landed lets a resumed run spend that budget twice.
+                    handle.write(_charge_row(charge, items=1) + "\n")
+                    handle.write(json.dumps(row) + "\n")
+            except OSError:
+                # The run ends with this error. Requests that cannot be
+                # recorded must not be sent, so tasks still waiting for the
+                # semaphore return without sending.
+                abort_reason = "index"
+                raise
             counts["charge"] += charge
             breaker.record(ok=ok)
             if breaker.should_abort() and abort_reason is None:
@@ -643,15 +650,20 @@ async def run_map(
             # Nothing awaits between the reply arriving and these rows being
             # written, so a cancel cannot separate an answer file from its
             # rows. An await added here would break that.
-            with index.open("a", encoding="utf-8") as handle:
-                # One charge row per request, not per item: the group
-                # was one call. Per-item rows carry "tokens": None here,
-                # which is why the budget cannot be rebuilt from them.
-                # Written first, so a crash over-counts rather than
-                # letting a resumed run respend the group's budget.
-                handle.write(_charge_row(charge, items=len(group)) + "\n")
-                for row in rows:
-                    handle.write(json.dumps(row) + "\n")
+            try:
+                with index.open("a", encoding="utf-8") as handle:
+                    # One charge row per request, not per item: the group
+                    # was one call. Per-item rows carry "tokens": None here,
+                    # which is why the budget cannot be rebuilt from them.
+                    # Written first, so a crash over-counts rather than
+                    # letting a resumed run respend the group's budget.
+                    handle.write(_charge_row(charge, items=len(group)) + "\n")
+                    for row in rows:
+                        handle.write(json.dumps(row) + "\n")
+            except OSError:
+                # The same rule as the single-item path above.
+                abort_reason = "index"
+                raise
             counts["charge"] += charge
             for row in rows:
                 breaker.record(ok=row["status"] == "ok")

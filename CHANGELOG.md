@@ -28,6 +28,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
   file cannot be written, now exits 1 with a failure receipt and records the
   charge in the usage ledger. An unexpected error there is reported as
   `internal error (<class> at <file>:<line>)` and never shows its text.
+- A `map` run whose `results.jsonl` cannot be written now sends no further
+  requests. It still ends with the write error.
 - A client error during a request, such as a reply that cannot be decoded, now
   fails that request at once with `GatewayError` in place of a traceback. It is
   not retried, for the same reason.

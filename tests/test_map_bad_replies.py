@@ -7,6 +7,7 @@ once with a batched template.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Callable
@@ -256,9 +257,20 @@ async def test_internal_error_in_a_batched_request_fails_every_item_of_the_group
 
 
 @pytest.mark.parametrize("mode", MODES)
-async def test_an_index_that_cannot_be_written_still_stops_the_run(
+async def test_an_index_that_cannot_be_written_stops_new_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
+    # Six requests either way: six single items, or twelve items in pairs.
+    count = 6 if mode == SINGLE else 12
+    items = tmp_path / "items.jsonl"
+    items.write_text(
+        "\n".join(json.dumps({"id": f"i{n}", "x": f"i{n}"}) for n in range(count)) + "\n",
+        encoding="utf-8",
+    )
+    template = tmp_path / "t.txt"
+    template.write_text(
+        "shared\n===PER ITEM===\ndo {x}" if mode == BATCHED else "do {x}", encoding="utf-8"
+    )
     index = tmp_path / "out" / "results.jsonl"
     real_open = Path.open
     writes = 0
@@ -267,13 +279,41 @@ async def test_an_index_that_cannot_be_written_still_stops_the_run(
         nonlocal writes
         if self == index and args and args[0] == "a":
             writes += 1
-            if writes == 2:
+            if writes == 3:
                 raise OSError("index is read-only")
         return real_open(self, *args, **kwargs)
 
+    calls = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _good(_ids_in(request), mode == BATCHED)
+
     monkeypatch.setattr(Path, "open", guarded_open)
-    with pytest.raises(OSError, match="index is read-only"):
-        await _run(tmp_path, mode, None)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        with pytest.raises(OSError, match="index is read-only"):
+            await run_map(
+                client=client,
+                base_url="https://g.test",
+                key="sk-oai-x",
+                model="rits/zai-org/glm-5-3",
+                items_path=items,
+                template_path=template,
+                outdir=tmp_path / "out",
+                concurrency=1,
+                retries=0,
+                timeout=5,
+                thinking=False,
+                max_tokens=None,
+                dialect="openai",
+                resume=False,
+                batch=2 if mode == BATCHED else 1,
+            )
+        # Give the tasks still waiting for the semaphore time to run.
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+    assert calls == 3
 
 
 def test_receipt_shows_the_internal_count(tmp_path: Path) -> None:
