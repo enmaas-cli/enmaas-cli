@@ -28,7 +28,7 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, NamedTuple, TypeGuard
 
 from .budget import charge_from_rows
 from .usage import UsageEvent, _is_disabled, append_event
@@ -39,7 +39,14 @@ LOCK_FILE = "open-runs.lock"
 # settled once it is this old. Otherwise it could stay open forever.
 STALE_AFTER = timedelta(hours=48)
 MAX_FILE_BYTES = 1 << 20
-MAX_INDEX_TAIL_BYTES = 64 << 20
+# Bytes of index read in one call to settle or live_charge, shared by every
+# record it handles, so a command's cost does not grow with the record count.
+MAX_READ_BYTES = 64 << 20
+# A charge row is short. A longer line is skipped unparsed, so one huge line
+# cannot cost memory or parse time.
+MAX_LINE_BYTES = 64 << 10
+READ_CHUNK_BYTES = 64 << 10
+REQUEST_MARKER = b'"request"'
 MAX_PATH_CHARS = 4096
 MAX_TEXT_CHARS = 1024
 # os.kill takes a C int. A larger pid would raise OverflowError, not OSError.
@@ -245,39 +252,99 @@ def end(state_dir: Path, run: OpenRun | None) -> None:
             _store(state_dir, remaining)
 
 
-def charge_since(run: OpenRun) -> int:
+class IndexRead(NamedTuple):
+    """What one index read found."""
+
+    charge: int
+    # Bytes read, taken from the caller's read budget.
+    used: int
+    # False when the budget ran out before the end of the index.
+    complete: bool
+
+
+@dataclass
+class _Progress:
+    used: int = 0
+    at_end: bool = False
+
+
+def _lines(fd: int, budget: int, progress: _Progress) -> Iterator[bytes]:
+    """Lines of at most MAX_LINE_BYTES, read in chunks up to `budget` bytes.
+
+    Memory stays flat: only one chunk and one partial line are held. A
+    longer line is dropped as it streams past, never parsed.
+    """
+    pending = b""
+    skipping = False
+    while progress.used < budget:
+        chunk = os.read(fd, min(READ_CHUNK_BYTES, budget - progress.used))
+        if not chunk:
+            progress.at_end = True
+            break
+        progress.used += len(chunk)
+        start = 0
+        while (newline := chunk.find(b"\n", start)) >= 0:
+            # A line held whole in this chunk without the marker is passed
+            # over without a copy. Most index lines are item rows.
+            wanted = bool(pending) or chunk.find(REQUEST_MARKER, start, newline) >= 0
+            if wanted and not skipping and len(pending) + newline - start <= MAX_LINE_BYTES:
+                yield pending + chunk[start:newline]
+            pending = b""
+            skipping = False
+            start = newline + 1
+        if not skipping:
+            pending += chunk[start:]
+            if len(pending) > MAX_LINE_BYTES:
+                pending = b""
+                skipping = True
+    # A last line with no newline is parsed only at the end of the file. A
+    # line cut by the budget is not.
+    if pending and not skipping and progress.at_end:
+        yield pending
+
+
+def _charge_rows(fd: int, budget: int, progress: _Progress) -> Iterator[dict[str, Any]]:
+    """The JSON objects among the lines that can be charge rows."""
+    for line in _lines(fd, budget, progress):
+        # Cheap filter first: only a line that names the row type is parsed.
+        if REQUEST_MARKER not in line:
+            continue
+        try:
+            parsed = json.loads(line.decode("utf-8", errors="replace"))
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(parsed, dict):
+            yield parsed
+
+
+def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
     """Sum the charge rows the run wrote after its offset. Any failure gives 0.
 
-    The index is opened without following a link and must be a regular file,
-    so a forged record cannot point this at a device or a FIFO. Only the sum
-    leaves this function, never the content of a row.
+    Reads at most `budget` bytes, MAX_READ_BYTES by default, as a stream, and
+    never holds the rows. The index is opened without following a link and
+    must be a regular file, so a forged record cannot point this at a device
+    or a FIFO. Only the sum leaves this function, never the content of a row.
     """
+    limit = MAX_READ_BYTES if budget is None else budget
     try:
         fd = os.open(
             os.path.join(run.outdir, INDEX_NAME),
             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
     except OSError:
-        return 0
+        return IndexRead(0, 0, True)
+    progress = _Progress()
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size < run.offset:
-            return 0
+            return IndexRead(0, 0, True)
         os.lseek(fd, run.offset, os.SEEK_SET)
-        raw = _read_bounded(fd, MAX_INDEX_TAIL_BYTES)
+        charge = charge_from_rows(_charge_rows(fd, limit, progress))
     except OSError:
-        return 0
+        return IndexRead(0, progress.used, True)
     finally:
         os.close(fd)
-    rows: list[dict[str, Any]] = []
-    for line in raw.decode("utf-8", errors="replace").splitlines():
-        try:
-            parsed = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(parsed, dict):
-            rows.append(parsed)
-    return charge_from_rows(rows)
+    return IndexRead(charge, progress.used, progress.at_end)
 
 
 def _is_dead(run: OpenRun, now: datetime) -> bool:
@@ -336,14 +403,30 @@ def settle(state_dir: Path, ledger: Path) -> None:
         now = datetime.now(UTC)
         kept: list[OpenRun] = []
         warned = False
+        budget = MAX_READ_BYTES
+        remaining = budget
         for run in runs:
             # One record that cannot be handled must not stop the command or
             # come back on every later one, so it is dropped with a warning.
             try:
-                if not _is_dead(run, now):
+                if remaining <= 0 or not _is_dead(run, now):
+                    # Out of budget: the next command reads it.
                     kept.append(run)
                     continue
-                charge = charge_since(run)
+                read = charge_since(run, remaining)
+                fresh = remaining == budget
+                remaining -= read.used
+                if not read.complete and not fresh:
+                    # Cut short by what earlier records used. The next command
+                    # starts with this record and a full budget, so the charge
+                    # is counted whole. Nothing more is read now.
+                    remaining = 0
+                    kept.append(run)
+                    continue
+                # A record that had the full budget and still did not finish
+                # is settled with what was read. Keeping it would block every
+                # later command on the same read.
+                charge = read.charge
                 if charge > 0 and not append_event(ledger, _killed_event(run, charge, now)):
                     kept.append(run)
             except Exception as exc:
@@ -374,10 +457,16 @@ def live_charge(state_dir: Path) -> int:
     now = datetime.now(UTC)
     total = 0
     warned = False
+    # One budget for every record. Records past it count as zero here.
+    remaining = MAX_READ_BYTES
     for run in runs:
+        if remaining <= 0:
+            break
         try:
             if not _is_dead(run, now):
-                total += charge_since(run)
+                read = charge_since(run, remaining)
+                remaining -= read.used
+                total += read.charge
         except Exception as exc:
             warned = _warn_dropped(exc, warned)
     return total

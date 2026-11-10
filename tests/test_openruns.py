@@ -201,7 +201,7 @@ def test_an_index_shorter_than_the_offset_counts_nothing(tmp_path: Path) -> None
     outdir = tmp_path / "out"
     _index(outdir, [_charge(9)])
     run = OpenRun(**_record(outdir=str(outdir), offset=10_000))
-    assert openruns.charge_since(run) == 0
+    assert openruns.charge_since(run).charge == 0
 
 
 def test_a_zero_charge_dead_record_is_removed_without_an_event(tmp_path: Path) -> None:
@@ -285,24 +285,24 @@ def test_an_index_that_is_a_link_gives_zero(tmp_path: Path) -> None:
     outdir = tmp_path / "forged"
     outdir.mkdir()
     (outdir / "results.jsonl").symlink_to(real)
-    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))) == 0
+    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))).charge == 0
 
 
 def test_an_index_that_is_a_directory_gives_zero(tmp_path: Path) -> None:
     outdir = tmp_path / "forged"
     (outdir / "results.jsonl").mkdir(parents=True)
-    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))) == 0
+    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))).charge == 0
 
 
 def test_an_index_that_is_a_fifo_gives_zero_without_blocking(tmp_path: Path) -> None:
     outdir = tmp_path / "forged"
     outdir.mkdir()
     os.mkfifo(outdir / "results.jsonl")
-    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))) == 0
+    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))).charge == 0
 
 
 def test_a_missing_index_gives_zero(tmp_path: Path) -> None:
-    assert openruns.charge_since(OpenRun(**_record(outdir=str(tmp_path / "none")))) == 0
+    assert openruns.charge_since(OpenRun(**_record(outdir=str(tmp_path / "none")))).charge == 0
 
 
 def test_negative_and_malformed_charge_rows_never_lower_the_sum(tmp_path: Path) -> None:
@@ -323,16 +323,18 @@ def test_negative_and_malformed_charge_rows_never_lower_the_sum(tmp_path: Path) 
     with index.open("ab") as raw:
         raw.write(b"\xff\xfe\n")
     _index(outdir, [_charge(1)])
-    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))) == 6
+    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))).charge == 6
 
 
-def test_the_index_tail_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_index_tail_is_bounded(tmp_path: Path) -> None:
     outdir = tmp_path / "out"
     index = _index(outdir, [_charge(5)])
     first = index.stat().st_size
     _index(outdir, [_charge(7)])
-    monkeypatch.setattr(openruns, "MAX_INDEX_TAIL_BYTES", first)
-    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))) == 5
+    read = openruns.charge_since(OpenRun(**_record(outdir=str(outdir))), first)
+    assert read.charge == 5
+    assert read.used == first
+    assert not read.complete
 
 
 def test_garbage_lines_are_skipped(tmp_path: Path) -> None:
@@ -658,3 +660,148 @@ def test_a_live_record_whose_handling_raises_is_skipped(
     captured = capsys.readouterr()
     assert captured.err == SKIPPED_WARNING
     assert _run_ids(state) == ["bad", "good"]
+
+
+def _padded_index(outdir: Path, size: int, charges: list[int]) -> Path:
+    """An index of about `size` bytes: the charge rows spread through `{}` padding lines."""
+    index = _index(outdir, [])
+    filler = (size // max(1, len(charges))) // 3
+    with index.open("a", encoding="utf-8") as handle:
+        for n in charges:
+            handle.write("{}\n" * filler)
+            handle.write(json.dumps(_charge(n)) + "\n")
+    return index
+
+
+def _peak_bytes(work: Any) -> int:
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        work()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_an_index_of_empty_objects_is_read_in_flat_memory(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+    index = _index(outdir, [])
+    index.write_text("{}\n" * ((2 << 20) // 3), encoding="utf-8")
+    run = OpenRun(**_record(outdir=str(outdir)))
+    assert _peak_bytes(lambda: openruns.charge_since(run)) < 16 << 20
+
+
+def test_an_index_of_charge_rows_is_read_in_flat_memory(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+    index = _index(outdir, [])
+    line = json.dumps(_charge(1)) + "\n"
+    count = (2 << 20) // len(line)
+    index.write_text(line * count, encoding="utf-8")
+    run = OpenRun(**_record(outdir=str(outdir)))
+    result: list[int] = []
+    peak = _peak_bytes(lambda: result.append(openruns.charge_since(run).charge))
+    assert result == [count]
+    assert peak < 16 << 20
+
+
+def test_a_line_longer_than_the_limit_is_skipped(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+    long_row = {"type": "request", "charge": 1000, "pad": "x" * (200 << 10)}
+    _index(outdir, [_charge(3), long_row, _charge(4)])
+    read = openruns.charge_since(OpenRun(**_record(outdir=str(outdir))))
+    assert read.charge == 7
+    assert read.complete
+
+
+def test_a_line_without_the_request_marker_is_not_parsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outdir = tmp_path / "out"
+    _index(outdir, [_item("a"), _charge(3), _item("b")])
+    parsed: list[str] = []
+    real_loads = json.loads
+
+    def loads(text: Any, *args: Any, **kwargs: Any) -> Any:
+        parsed.append(text)
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads)
+    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))).charge == 3
+    assert len(parsed) == 1
+
+
+def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the size of every os.read result."""
+    sizes: list[int] = []
+    real_read = os.read
+
+    def read(fd: int, n: int) -> bytes:
+        data = real_read(fd, n)
+        sizes.append(len(data))
+        return data
+
+    monkeypatch.setattr(os, "read", read)
+    return sizes
+
+
+def test_one_read_budget_is_shared_by_every_record_in_a_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    budget = 1 << 20
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", budget)
+    charges = {"a": 3, "b": 5, "c": 11}
+    records = []
+    for name, n in charges.items():
+        _padded_index(tmp_path / name, 400 << 10, [n, n])
+        records.append(_record(outdir=str(tmp_path / name), run_id=name))
+    record_file = _write_records(state, records)
+    record_bytes = record_file.stat().st_size
+    ledger = state / "usage.jsonl"
+    reads = _count_reads(monkeypatch)
+
+    openruns.settle(state, ledger)
+    first = [row["charge"] for row in _ledger_rows(ledger)]
+    assert sum(reads) - record_bytes <= budget
+    assert 1 <= len(first) <= 2
+    assert 1 <= len(_run_ids(state)) <= 2
+
+    openruns.settle(state, ledger)
+    assert sorted(row["charge"] for row in _ledger_rows(ledger)) == sorted(
+        2 * n for n in charges.values()
+    )
+    assert not record_file.exists()
+
+
+def test_an_index_longer_than_the_budget_is_settled_with_what_was_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented undercount: a tail beyond the read limit is not counted."""
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    index = _index(outdir, [_charge(5)])
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", index.stat().st_size)
+    _index(outdir, [_charge(7)])
+    _write_records(state, [_record(outdir=str(outdir))])
+    openruns.settle(state, state / "usage.jsonl")
+    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
+    assert not (state / openruns.OPEN_RUNS_FILE).exists()
+
+
+def test_live_charge_stops_reading_when_the_budget_runs_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    budget = 1 << 20
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", budget)
+    records = []
+    for name in ("a", "b", "c", "d"):
+        _padded_index(tmp_path / name, 400 << 10, [1, 1])
+        records.append(_record(outdir=str(tmp_path / name), run_id=name, pid=os.getppid()))
+    _write_records(state, records)
+    reads = _count_reads(monkeypatch)
+    total = openruns.live_charge(state)
+    index_bytes = sum(reads) - os.path.getsize(state / openruns.OPEN_RUNS_FILE)
+    assert index_bytes <= budget
+    assert 4 <= total < 8
