@@ -1198,3 +1198,51 @@ async def test_map_prints_no_reasoning_warning_for_a_verified_off_knob(
     )
     assert "reasoning" not in err
     assert "warning" not in err
+
+
+def _request_rows(outdir: Path) -> list[dict[str, Any]]:
+    rows = [json.loads(line) for line in (outdir / "results.jsonl").read_text().splitlines()]
+    return [row for row in rows if row.get("type") == "request"]
+
+
+async def test_a_charge_row_names_the_run_when_a_run_id_is_given(tmp_path: Path) -> None:
+    body = _usage_response(prompt=100, completion=10)
+    await _run(tmp_path, lambda r: httpx.Response(200, json=body), count=2, run_id="feedbeef")
+    assert (
+        _request_rows(tmp_path / "out")
+        == [{"type": "request", "charge": 110, "items": 1, "run": "feedbeef"}] * 2
+    )
+
+
+async def test_a_batched_charge_row_names_the_run(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        ids = [f"i{n}" for n in range(4) if f"=== ITEM i{n} ===" in prompt]
+        return httpx.Response(200, json=_answers(ids))
+
+    await _run(
+        tmp_path,
+        handler,
+        count=4,
+        template_path_override=_batch_template(tmp_path),
+        batch=2,
+        run_id="feedbeef",
+    )
+    assert [row["run"] for row in _request_rows(tmp_path / "out")] == ["feedbeef"] * 2
+
+
+async def test_a_charge_row_without_a_run_id_is_unchanged(tmp_path: Path) -> None:
+    body = _usage_response(prompt=100, completion=10)
+    await _run(tmp_path, lambda r: httpx.Response(200, json=body), count=1)
+    assert _request_rows(tmp_path / "out") == [{"type": "request", "charge": 110, "items": 1}]
+
+
+async def test_spent_tokens_counts_tagged_and_untagged_rows(tmp_path: Path) -> None:
+    """A resumed job's budget belongs to the job, whichever run wrote the row."""
+    from enmaas_cli.runner import spent_tokens
+
+    body = _usage_response(prompt=100, completion=10)
+    await _run(tmp_path, lambda r: httpx.Response(200, json=body), count=1)
+    await _run(tmp_path, lambda r: httpx.Response(200, json=body), count=1, run_id="feedbeef")
+    assert spent_tokens(tmp_path / "out") == 220

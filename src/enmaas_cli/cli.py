@@ -1090,6 +1090,8 @@ async def _dispatch(args: argparse.Namespace, config: Config, base_url: str, key
                 if rolling.ceiling is not None
                 else None
             ),
+            # Tags the charge rows, so a settle counts only this run's rows.
+            run_id=record.run_id if record is not None else None,
         )
 
         error_kind = None

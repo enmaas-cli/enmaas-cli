@@ -227,8 +227,11 @@ are N-1 further groups, which can be a lot of tokens. There is no fixed token
 bound without bounding request size.
 
 **The ceiling belongs to the whole job across resumes.** Every request appends a
-`{"type": "request", "charge": N}` row to `results.jsonl`, and a resumed run adds
-those up before spending anything. So `--resume` on its own re-trips immediately.
+`{"type": "request", "charge": N, "items": K, "run": "<run id>"}` row to
+`results.jsonl`, and a resumed run adds up every charge row, whichever run wrote
+it, before spending anything. So `--resume` on its own re-trips immediately.
+The `run` field is the id of the run's open-run record (see below). It is absent
+when no record was written, for example with `ENMAAS_NO_USAGE_LOG` set.
 To carry on, raise the ceiling deliberately:
 
 ```bash

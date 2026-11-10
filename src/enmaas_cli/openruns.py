@@ -309,8 +309,14 @@ def _lines(fd: int, budget: int, progress: _Progress) -> Iterator[bytes]:
         yield pending
 
 
-def _charge_rows(fd: int, budget: int, progress: _Progress) -> Iterator[dict[str, Any]]:
-    """The JSON objects among the lines that can be charge rows."""
+def _charge_rows(
+    fd: int, budget: int, progress: _Progress, run_id: str
+) -> Iterator[dict[str, Any]]:
+    """The charge rows tagged with `run_id`.
+
+    A row without the tag, or with another run's, is never counted. Another
+    run on the same directory writes its own ledger event for its rows.
+    """
     for line in _lines(fd, budget, progress):
         # Cheap filter first: only a line that names the row type is parsed.
         if REQUEST_MARKER not in line:
@@ -319,12 +325,15 @@ def _charge_rows(fd: int, budget: int, progress: _Progress) -> Iterator[dict[str
             parsed = json.loads(line.decode("utf-8", errors="replace"))
         except (ValueError, RecursionError):
             continue
-        if isinstance(parsed, dict):
+        if isinstance(parsed, dict) and parsed.get("run") == run_id:
             yield parsed
 
 
 def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
-    """Sum the charge rows the run wrote after its offset. Any failure gives 0.
+    """Sum the charge rows this run wrote after its offset. Any failure gives 0.
+
+    The offset is where reading starts. A row counts only when its `run`
+    field is the record's run id.
 
     Reads at most `budget` bytes, MAX_READ_BYTES by default, as a stream, and
     never holds the rows. The index is opened without following a link and
@@ -345,7 +354,7 @@ def charge_since(run: OpenRun, budget: int | None = None) -> IndexRead:
         if not stat.S_ISREG(info.st_mode) or info.st_size < run.offset:
             return IndexRead(0, 0, True)
         os.lseek(fd, run.offset, os.SEEK_SET)
-        charge = charge_from_rows(_charge_rows(fd, limit, progress))
+        charge = charge_from_rows(_charge_rows(fd, limit, progress, run.run_id))
     except OSError:
         return IndexRead(0, progress.used, True)
     finally:

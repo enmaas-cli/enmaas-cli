@@ -140,7 +140,7 @@ def _internal_message(exc: BaseException) -> str:
     return f"internal error ({where(exc)})"
 
 
-def _charge_row(charge: int, *, items: int) -> str:
+def _charge_row(charge: int, *, items: int, run: str | None = None) -> str:
     """One JSONL row recording what a single request cost.
 
     Written beside the per-item rows because the budget cannot be rebuilt
@@ -155,8 +155,15 @@ def _charge_row(charge: int, *, items: int) -> str:
     failed in transport is not charged, because a non-200 carries no usage
     body for us to read. That spend is unknowable from the client side
     rather than merely unimplemented.
+
+    `run` names the invocation that wrote the row, when it has an open-run
+    record. Two runs can share one output directory, and an offset alone
+    cannot tell their rows apart.
     """
-    return json.dumps({"type": "request", "charge": charge, "items": items})
+    row: dict[str, Any] = {"type": "request", "charge": charge, "items": items}
+    if run is not None:
+        row["run"] = run
+    return json.dumps(row)
 
 
 def spent_tokens(outdir: Path) -> int:
@@ -294,6 +301,7 @@ async def run_map(
     batch: int | None = None,
     token_budget: int | None = None,
     rolling_budget: TokenBudget | None = None,
+    run_id: str | None = None,
 ) -> MapOutcome:
     items = load_items(items_path)
     template = template_path.read_text(encoding="utf-8")
@@ -470,7 +478,7 @@ async def run_map(
                     # asymmetry matters: an orphaned charge row over-counts,
                     # which is safe, while an item row whose charge never
                     # landed lets a resumed run spend that budget twice.
-                    handle.write(_charge_row(charge, items=1) + "\n")
+                    handle.write(_charge_row(charge, items=1, run=run_id) + "\n")
                     handle.write(json.dumps(row) + "\n")
             except OSError:
                 # The run ends with this error. Requests that cannot be
@@ -657,7 +665,7 @@ async def run_map(
                     # which is why the budget cannot be rebuilt from them.
                     # Written first, so a crash over-counts rather than
                     # letting a resumed run respend the group's budget.
-                    handle.write(_charge_row(charge, items=len(group)) + "\n")
+                    handle.write(_charge_row(charge, items=len(group), run=run_id) + "\n")
                     for row in rows:
                         handle.write(json.dumps(row) + "\n")
             except OSError:

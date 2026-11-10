@@ -43,8 +43,14 @@ def _index(outdir: Path, rows: list[dict[str, Any]]) -> Path:
     return index
 
 
-def _charge(n: int, items: int = 1) -> dict[str, Any]:
-    return {"type": "request", "charge": n, "items": items}
+RUN_ID = "0123456789abcdef"
+
+
+def _charge(n: int, items: int = 1, run: str | None = RUN_ID) -> dict[str, Any]:
+    row: dict[str, Any] = {"type": "request", "charge": n, "items": items}
+    if run is not None:
+        row["run"] = run
+    return row
 
 
 def _item(item_id: str) -> dict[str, Any]:
@@ -340,7 +346,7 @@ def test_the_index_tail_is_bounded(tmp_path: Path) -> None:
 def test_garbage_lines_are_skipped(tmp_path: Path) -> None:
     state = tmp_path / "state"
     outdir = tmp_path / "out"
-    _index(outdir, [_charge(3)])
+    _index(outdir, [_charge(3, run="good")])
     good = _record(outdir=str(outdir), run_id="good")
     bad = [
         _record(offset=True),
@@ -418,7 +424,7 @@ def test_a_ledger_that_cannot_be_written_keeps_the_record(tmp_path: Path) -> Non
 def test_settle_keeps_live_records_and_removes_dead_ones(tmp_path: Path) -> None:
     state = tmp_path / "state"
     outdir = tmp_path / "out"
-    _index(outdir, [_charge(5)])
+    _index(outdir, [_charge(5, run="dead")])
     live = _record(outdir=str(outdir), pid=os.getppid(), run_id="live")
     dead = _record(outdir=str(outdir), run_id="dead")
     _write_records(state, [live, dead])
@@ -585,8 +591,12 @@ def test_ask_under_a_rolling_budget_survives_huge_charge_rows(
     state = _main_env(tmp_path, monkeypatch)
     live_out = tmp_path / "live"
     dead_out = tmp_path / "dead"
-    _index(live_out, [_charge(HUGE), _charge(HUGE), _charge(21)])
-    _index(dead_out, [_charge(HUGE), _charge(HUGE), _charge(21)])
+    _index(
+        live_out, [_charge(HUGE, run="live"), _charge(HUGE, run="live"), _charge(21, run="live")]
+    )
+    _index(
+        dead_out, [_charge(HUGE, run="dead"), _charge(HUGE, run="dead"), _charge(21, run="dead")]
+    )
     _write_records(
         state,
         [
@@ -604,8 +614,8 @@ def test_a_record_whose_handling_raises_is_dropped_and_the_rest_settle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     state = tmp_path / "state"
-    _index(tmp_path / "a", [_charge(3)])
-    _index(tmp_path / "b", [_charge(5)])
+    _index(tmp_path / "a", [_charge(3, run="bad")])
+    _index(tmp_path / "b", [_charge(5, run="good")])
     _write_records(
         state,
         [
@@ -636,8 +646,8 @@ def test_a_live_record_whose_handling_raises_is_skipped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     state = tmp_path / "state"
-    _index(tmp_path / "a", [_charge(3)])
-    _index(tmp_path / "b", [_charge(5)])
+    _index(tmp_path / "a", [_charge(3, run="bad")])
+    _index(tmp_path / "b", [_charge(5, run="good")])
     _write_records(
         state,
         [
@@ -662,14 +672,14 @@ def test_a_live_record_whose_handling_raises_is_skipped(
     assert _run_ids(state) == ["bad", "good"]
 
 
-def _padded_index(outdir: Path, size: int, charges: list[int]) -> Path:
+def _padded_index(outdir: Path, size: int, charges: list[int], run: str) -> Path:
     """An index of about `size` bytes: the charge rows spread through `{}` padding lines."""
     index = _index(outdir, [])
     filler = (size // max(1, len(charges))) // 3
     with index.open("a", encoding="utf-8") as handle:
         for n in charges:
             handle.write("{}\n" * filler)
-            handle.write(json.dumps(_charge(n)) + "\n")
+            handle.write(json.dumps(_charge(n, run=run)) + "\n")
     return index
 
 
@@ -754,7 +764,7 @@ def test_one_read_budget_is_shared_by_every_record_in_a_settle(
     charges = {"a": 3, "b": 5, "c": 11}
     records = []
     for name, n in charges.items():
-        _padded_index(tmp_path / name, 400 << 10, [n, n])
+        _padded_index(tmp_path / name, 400 << 10, [n, n], name)
         records.append(_record(outdir=str(tmp_path / name), run_id=name))
     record_file = _write_records(state, records)
     record_bytes = record_file.stat().st_size
@@ -797,7 +807,7 @@ def test_live_charge_stops_reading_when_the_budget_runs_out(
     monkeypatch.setattr(openruns, "MAX_READ_BYTES", budget)
     records = []
     for name in ("a", "b", "c", "d"):
-        _padded_index(tmp_path / name, 400 << 10, [1, 1])
+        _padded_index(tmp_path / name, 400 << 10, [1, 1], name)
         records.append(_record(outdir=str(tmp_path / name), run_id=name, pid=os.getppid()))
     _write_records(state, records)
     reads = _count_reads(monkeypatch)
@@ -867,3 +877,73 @@ def test_the_refusal_without_open_runs_does_not_mention_them(tmp_path: Path) -> 
     ledger = _ledger_with(tmp_path / "state" / "usage.jsonl", 150)
     check = rolling_check(Config(budget_tokens=100, budget_window_days=7), ledger)
     assert check.message == "150 of 100 tokens spent in the last 7 days"
+
+
+def test_a_charge_row_without_a_run_is_never_counted(tmp_path: Path) -> None:
+    outdir = tmp_path / "out"
+    _index(outdir, [_charge(100, run=None), _charge(3), _charge(50, run="other"), _charge(4)])
+    _index(outdir, [{"type": "request", "charge": 9, "items": 1, "run": None}])
+    assert openruns.charge_since(OpenRun(**_record(outdir=str(outdir)))).charge == 7
+
+
+def test_two_runs_on_one_directory_are_each_charged_their_own_rows(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    outdir = tmp_path / "out"
+    # A started first; B started later and its rows interleave with A's.
+    _index(outdir, [_charge(1, run="a"), _item("a1")])
+    offset_b = (outdir / "results.jsonl").stat().st_size
+    _index(
+        outdir,
+        [_charge(10, run="b"), _charge(2, run="a"), _charge(20, run="b"), _charge(4, run="a")],
+    )
+    ledger = _ledger_with(state / "usage.jsonl", 30)  # B's own event
+    _write_records(state, [_record(outdir=str(outdir), run_id="a")])
+    openruns.settle(state, ledger)
+    assert [row["charge"] for row in _ledger_rows(ledger)] == [30, 7]
+
+    _write_records(
+        state,
+        [
+            _record(outdir=str(outdir), run_id="a", pid=os.getppid()),
+            _record(outdir=str(outdir), run_id="b", pid=os.getppid(), offset=offset_b),
+        ],
+    )
+    assert openruns.live_charge(state) == 7 + 30
+
+
+def test_map_through_main_tags_its_charge_rows_with_its_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.cli import main
+
+    _main_env(tmp_path, monkeypatch)
+    began: list[OpenRun | None] = []
+    real_begin = openruns.begin
+
+    def begin(*args: Any, **kwargs: Any) -> OpenRun | None:
+        run = real_begin(*args, **kwargs)
+        began.append(run)
+        return run
+
+    monkeypatch.setattr(openruns, "begin", begin)
+    items = tmp_path / "items.jsonl"
+    items.write_text('{"id": "a", "x": 1}\n{"id": "b", "x": 2}\n', encoding="utf-8")
+    template = tmp_path / "t.txt"
+    template.write_text("do {x}", encoding="utf-8")
+    argv = ["--config", str(tmp_path / "none.toml"), "map", "-m", "rits/zai-org/glm-5-3"]
+    argv += ["--dialect", "openai", "--items", str(items), "--template", str(template)]
+    argv += ["--outdir", str(tmp_path / "out"), "--retries", "0"]
+    assert main(argv) == 0
+    capsys.readouterr()
+    (run,) = began
+    assert run is not None
+    lines = (tmp_path / "out" / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    tags = [json.loads(line).get("run") for line in lines if '"request"' in line]
+    assert tags == [run.run_id, run.run_id]
+
+    monkeypatch.setenv("ENMAAS_NO_USAGE_LOG", "1")
+    assert main([*argv, "--resume"]) == 0
+    assert main([*argv[:-4], "--outdir", str(tmp_path / "out2"), "--retries", "0"]) == 0
+    capsys.readouterr()
+    lines = (tmp_path / "out2" / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    assert all("run" not in json.loads(line) for line in lines)
