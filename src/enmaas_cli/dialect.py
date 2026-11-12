@@ -262,9 +262,9 @@ def _count(value: object) -> int | None:
     """Return a token count only when it is an integer from 0 to MAX_TOKEN_COUNT.
 
     The gateway's usage numbers flow into error messages, receipts, the
-    --json object and the usage ledger. A string there was copied through
-    unchanged, so a 9,000 character value grew every one of those, and
-    "abc" was recorded as an input count. A bool is an int subclass in
+    --json object and the usage ledger. A string copied through unchanged
+    would make a 9,000 character value grow every one of those, and would
+    record "abc" as an input count. A bool is an int subclass in
     Python, so it is excluded by name. A value above the cap reads as not
     reported, the same as a negative one.
     """

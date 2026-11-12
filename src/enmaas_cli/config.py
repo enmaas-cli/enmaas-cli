@@ -157,8 +157,8 @@ def _parse_dialect_overrides(value: dict[Any, Any]) -> tuple[dict[str, Dialect],
 def _parse_prices(value: object) -> tuple[dict[str, ModelPrice], list[str]]:
     """Read the [prices] table, warning rather than dropping silently.
 
-    A price that vanishes without a word makes a model look free, which is
-    the same silent understatement the ledger already had to be fixed for.
+    A price that vanishes without a word makes a model look free, which
+    understates the cost without saying so.
     """
     warnings: list[str] = []
     if not isinstance(value, dict):

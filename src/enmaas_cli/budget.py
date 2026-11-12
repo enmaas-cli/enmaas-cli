@@ -28,9 +28,9 @@ def metered(usage: Usage) -> int:
 
     No reasoning term, deliberately. `output_tokens` is OpenAI's
     `completion_tokens`, which already includes reasoning; `reasoning_tokens`
-    is a breakdown of it (dialect.py:228). On the Anthropic dialect it is
-    always None (dialect.py:269) because thinking is folded into
-    `output_tokens`. Adding it would double-charge.
+    is a breakdown of it (see `_openai_usage` in dialect.py). On the
+    Anthropic dialect it is always None (see `_anthropic_usage`) because
+    thinking is folded into `output_tokens`. Adding it would double-charge.
 
     Cached input is excluded: it is the saving that batching exists to
     produce, and a ceiling blind to it would make the tool's main

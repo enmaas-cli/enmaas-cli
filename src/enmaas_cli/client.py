@@ -153,8 +153,8 @@ async def call(
     """POST a built request, retrying service faults. Returns the parsed JSON.
 
     When `secret` is set, every copy of it in an error body is replaced
-    before the body is cut to length. Redacting after the cut missed a key
-    that straddled the cut, and the part before it survived.
+    before the body is cut to length. Redacting after the cut would miss a
+    key that straddles the cut, and the part before the cut would survive.
     """
     last_status: int | None = None
     last_detail = ""

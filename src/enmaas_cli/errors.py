@@ -24,7 +24,7 @@ class ExitCode(enum.IntEnum):
 
 
 def where(exc: BaseException) -> str:
-    """Class name and the innermost frame: `TypeError at runner.py:123`. Never the exception text.
+    """Class name and innermost frame, as `TypeError at <file>:<line>`. Never the exception text.
 
     An error that no handler expected can carry any text, including part of
     a reply or a prompt, so only where it happened is reported. With no

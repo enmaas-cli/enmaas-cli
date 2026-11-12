@@ -311,9 +311,9 @@ class MapOutcome:
     skipped: int
     attempted: int
     total: int
-    # Not a bool. A second way to abort arrived with token budgets, and a
-    # receipt saying only "ABORTED" sends people hunting for failures that
-    # never happened. None when the run did not stop early.
+    # Not a bool. A run can stop for several reasons, and a receipt saying
+    # only "ABORTED" sends people hunting for failures that never happened.
+    # None when the run did not stop early.
     abort_reason: AbortReason | None
     input_tokens: int
     output_tokens: int
@@ -328,7 +328,7 @@ class MapOutcome:
     # The per-run budget's running total, job-wide when resumed. Not
     # derivable from input_tokens/cached_tokens above: clamping after
     # aggregation gives a different answer than summing per-request
-    # clamps. Defaulted so existing constructions still work.
+    # clamps.
     spent: int = 0
     # Which ceiling stopped the run: "per_run", "rolling" or None.
     # abort_reason only says "budget", which would make a rolling stop

@@ -445,8 +445,8 @@ _ROW_RULES: tuple[tuple[str, Callable[[dict[str, Any]], bool]], ...] = (
 def _event_from_row(data: object) -> UsageEvent:
     """Parse one ledger row, rejecting what must not be trusted.
 
-    Validation matters here in a way it did not when this was purely a
-    reporting path. A negative count subtracts from recorded spend, a
+    Validation matters here because a budget reads these rows, not only a
+    report. A negative count subtracts from recorded spend, a
     string count breaks the arithmetic downstream, and a timezone-naive
     timestamp raises when compared against an aware window cutoff. A
     budget that read any of those would be wrong rather than merely
@@ -467,7 +467,7 @@ def _open_for_read(ledger: Path) -> int | None:
 
     Raises NotRegularFile for a link, a FIFO or any other path that is not a
     regular file. A FIFO would block the read until some other process
-    wrote to it, which hung every command that reads the ledger. The open
+    wrote to it, which would hang every command that reads the ledger. The open
     is nonblocking and the type is checked on the descriptor, so nothing
     waits. A link is refused because the writer never writes through one.
     """
@@ -743,8 +743,8 @@ def compute_costs(
     """Return (spend, unpriced models, Opus-equivalent).
 
     One computation behind both the text and the JSON renderings. Two
-    copies would drift, which is how a hand-maintained summary of this
-    very ledger went stale in the first place.
+    copies would drift apart, the way a summary of this ledger kept by
+    hand goes stale.
     """
     table = table or {}
     spend = 0.0

@@ -52,8 +52,8 @@ def prune_runs(root: Path, *, max_age_days: int = 30) -> None:
 
     Only children named the way create_run_dir names them are removed.
     Without that, a runs root that a link or a mistaken XDG_STATE_HOME
-    pointed at some other directory lost every subdirectory older than the
-    cutoff. A root reached through a link is skipped entirely for the same
+    pointed at some other directory would lose every subdirectory older
+    than the cutoff. A root reached through a link is skipped entirely for the same
     reason.
     """
     cutoff = time.time() - (max_age_days * 86400)
