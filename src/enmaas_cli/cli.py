@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, NoReturn, TextIO, cast
+from typing import Any, Literal, NoReturn, TextIO
 
 import httpx
 
@@ -30,7 +30,6 @@ from .dialect import (
     ANTHROPIC_VERSION,
     Dialect,
     DialectError,
-    Usage,
     resolve_dialect,
 )
 from .errors import BadReplyError, CallError, ExitCode, where
@@ -50,7 +49,7 @@ from .receipts import (
 )
 from .runner import MapJob, run_job
 from .schema import ValidationError
-from .tokens import MAX_TOKEN_COUNT
+from .tokens import MAX_TOKEN_COUNT, Usage
 from .usage import (
     LedgerWrite,
     ask_event,
@@ -170,22 +169,12 @@ def _resolve_model(flag: str | None, config: Config) -> tuple[str, bool]:
 def _resolve_dialect_override(model: str, flag: Dialect | None, config: Config) -> Dialect | None:
     """Apply a configured dialect override unless the flag was given.
 
-    Returns the Literal type send_ask and MapJob require. The config
-    value is a plain str, so it is checked and then cast rather than
-    returned as is; mypy strict rejects str where Dialect is expected.
+    load_config has already dropped, with a warning, every value that is not
+    a dialect.
     """
     if flag is not None:
         return flag
-    override = config.dialect_overrides.get(model)
-    if override is None:
-        return None
-    if override in ("anthropic", "openai"):
-        return cast(Dialect, override)
-    print(
-        f"warning: invalid dialect override '{override}' for {model}, ignoring",
-        file=sys.stderr,
-    )
-    return None
+    return config.dialect_overrides.get(model)
 
 
 def package_version() -> str:
@@ -301,13 +290,11 @@ async def run_models(
     client: httpx.AsyncClient,
     base_url: str,
     key: str,
-    dialect: str,
+    dialect: Dialect | Literal["both"],
     timeout: float,
 ) -> list[dict[str, Any]]:
     """Query one or both catalogs. Neither is complete on its own."""
-    wanted: list[Dialect] = (
-        ["anthropic", "openai"] if dialect == "both" else [dialect]  # type: ignore[list-item]
-    )
+    wanted: list[Dialect] = ["anthropic", "openai"] if dialect == "both" else [dialect]
     found: dict[str, set[str]] = {}
     for d in wanted:
         headers = (

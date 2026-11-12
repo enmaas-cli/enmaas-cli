@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from enmaas_cli.auth import printable
 from enmaas_cli.errors import ExitCode
@@ -69,7 +69,7 @@ def recorded_event(
     dialect: str,
     usage: Usage,
     elapsed: float,
-    status: str,
+    status: Literal["ok", "error"],
     error_kind: str | None,
     charge: int,
 ) -> UsageEvent:
@@ -609,46 +609,6 @@ def summarize_usage(events: list[UsageEvent]) -> UsageSummary:
     total_reasoning_tokens = sum(e.reasoning_tokens or 0 for e in events)
     total_elapsed = sum(e.elapsed for e in events)
 
-    by_model: dict[str, dict[str, int | float]] = {}
-    by_command: dict[str, dict[str, int | float]] = {}
-
-    for event in events:
-        # By model
-        if event.model not in by_model:
-            by_model[event.model] = {
-                "calls": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cached_tokens": 0,
-                "reasoning_tokens": 0,
-                "elapsed": 0.0,
-            }
-        model_stats = by_model[event.model]
-        model_stats["calls"] += 1
-        model_stats["input_tokens"] += event.input_tokens or 0
-        model_stats["output_tokens"] += event.output_tokens or 0
-        model_stats["cached_tokens"] += event.cached_tokens or 0
-        model_stats["reasoning_tokens"] += event.reasoning_tokens or 0
-        model_stats["elapsed"] += event.elapsed
-
-        # By command
-        if event.command not in by_command:
-            by_command[event.command] = {
-                "calls": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cached_tokens": 0,
-                "reasoning_tokens": 0,
-                "elapsed": 0.0,
-            }
-        cmd_stats = by_command[event.command]
-        cmd_stats["calls"] += 1
-        cmd_stats["input_tokens"] += event.input_tokens or 0
-        cmd_stats["output_tokens"] += event.output_tokens or 0
-        cmd_stats["cached_tokens"] += event.cached_tokens or 0
-        cmd_stats["reasoning_tokens"] += event.reasoning_tokens or 0
-        cmd_stats["elapsed"] += event.elapsed
-
     return UsageSummary(
         total_calls=total_calls,
         total_input_tokens=total_input_tokens,
@@ -656,9 +616,35 @@ def summarize_usage(events: list[UsageEvent]) -> UsageSummary:
         total_cached_tokens=total_cached_tokens,
         total_reasoning_tokens=total_reasoning_tokens,
         total_elapsed=total_elapsed,
-        by_model=by_model,
-        by_command=by_command,
+        by_model=_breakdown(events, lambda event: event.model),
+        by_command=_breakdown(events, lambda event: event.command),
     )
+
+
+def _breakdown(
+    events: list[UsageEvent], key: Callable[[UsageEvent], str]
+) -> dict[str, dict[str, int | float]]:
+    """Totals per value of `key`, in the order each value first appears."""
+    totals: dict[str, dict[str, int | float]] = {}
+    for event in events:
+        stats = totals.setdefault(
+            key(event),
+            {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "elapsed": 0.0,
+            },
+        )
+        stats["calls"] += 1
+        stats["input_tokens"] += event.input_tokens or 0
+        stats["output_tokens"] += event.output_tokens or 0
+        stats["cached_tokens"] += event.cached_tokens or 0
+        stats["reasoning_tokens"] += event.reasoning_tokens or 0
+        stats["elapsed"] += event.elapsed
+    return totals
 
 
 def format_summary(

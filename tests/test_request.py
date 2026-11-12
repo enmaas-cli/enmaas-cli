@@ -1,7 +1,7 @@
 from enmaas_cli.dialect import (
     ANTHROPIC_VERSION,
+    DEFAULT_MAX_TOKENS,
     build_request,
-    default_max_tokens,
     thinking_off_payload,
 )
 
@@ -12,8 +12,7 @@ KEY = "sk-oai-test"
 
 def test_default_max_tokens_is_flat() -> None:
     """A bigger budget was measured not to help; it only slows the failure."""
-    assert default_max_tokens(thinking=True) == 8192
-    assert default_max_tokens(thinking=False) == 8192
+    assert DEFAULT_MAX_TOKENS == 8192
 
 
 def test_glm_openai_uses_reasoning_effort() -> None:

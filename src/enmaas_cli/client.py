@@ -17,7 +17,8 @@ from .auth import cut_redacted, printable, redact
 from .dialect import Request
 from .errors import BadReplyError
 
-# Re-exported so existing importers of this name from this module keep working.
+# Also importable from this module. test_errors.py checks that it is the same
+# object as in errors.py.
 from .errors import GatewayError as GatewayError
 from .gateway import is_loopback
 

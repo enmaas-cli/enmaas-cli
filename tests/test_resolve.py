@@ -1,9 +1,11 @@
 """Model and dialect resolution shared by ask and map."""
 
+from pathlib import Path
+
 import pytest
 
-from enmaas_cli.cli import _resolve_dialect_override, _resolve_model
-from enmaas_cli.config import Config
+from enmaas_cli.cli import _resolve_dialect_override, _resolve_model, main
+from enmaas_cli.config import Config, load_config
 
 
 def test_explicit_model_wins() -> None:
@@ -31,9 +33,23 @@ def test_dialect_override_applies_when_flag_absent() -> None:
     assert _resolve_dialect_override("m", None, cfg) == "anthropic"
 
 
-def test_invalid_override_is_ignored_with_warning(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    cfg = Config(dialect_overrides={"m": "cobol"})
+def test_invalid_override_is_ignored_with_warning(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[dialect_overrides]\nm = "cobol"\n', encoding="utf-8")
+    cfg = load_config(path)
     assert _resolve_dialect_override("m", None, cfg) is None
-    assert "invalid dialect override 'cobol'" in capsys.readouterr().err
+    assert cfg.warnings == ["invalid dialect override 'cobol' for m, ignoring"]
+
+
+def test_invalid_override_is_reported_when_the_config_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The warning comes before the gateway URL is resolved, so it is printed
+    # even though the command stops there and never resolves a dialect.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("ENMAAS_BASE_URL", raising=False)
+    path = tmp_path / "config.toml"
+    path.write_text('[dialect_overrides]\nm = "cobol"\n', encoding="utf-8")
+    assert main(["--config", str(path), "ask", "-m", "m", "--dialect", "openai", "-p", "hi"]) == 1
+    err = capsys.readouterr().err.splitlines()
+    assert err[0] == "warning: invalid dialect override 'cobol' for m, ignoring"

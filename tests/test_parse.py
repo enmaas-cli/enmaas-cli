@@ -1,6 +1,7 @@
 import pytest
 
-from enmaas_cli.dialect import EmptyResponseError, parse_response
+from enmaas_cli.dialect import parse_response
+from enmaas_cli.errors import EmptyResponseError
 
 
 def test_openai_text_and_usage() -> None:

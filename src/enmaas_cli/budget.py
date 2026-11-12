@@ -16,8 +16,7 @@ from typing import Any
 
 from enmaas_cli.auth import printable
 from enmaas_cli.config import Config
-from enmaas_cli.dialect import Usage
-from enmaas_cli.tokens import MAX_RECORDED
+from enmaas_cli.tokens import MAX_RECORDED, Usage
 from enmaas_cli.usage import UsageEvent, load_events_strict
 
 

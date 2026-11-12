@@ -11,7 +11,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -20,9 +20,9 @@ from .batching import PER_ITEM_MARKER, build_batch_prompt, split_batch_response,
 from .budget import TokenBudget, charge_from_rows, metered
 from .client import CallSettings, call
 from .dialect import (
+    DEFAULT_MAX_TOKENS,
     Dialect,
     build_request,
-    default_max_tokens,
     parse_response,
     resolve_dialect,
     thinking_off_payload,
@@ -32,8 +32,10 @@ from .outputs import protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
 from .tokens import MAX_RECORDED, Usage
 
-# ValidationError moved to .schema; re-exported so existing importers keep working.
-__all__ = ["ValidationError", "load_schema", "run_map", "validate_against_schema"]
+# Why a run stopped before its last item.
+AbortReason = Literal["breaker", "budget", "interrupted", "index"]
+# Which ceiling stopped a run.
+BudgetName = Literal["per_run", "rolling"]
 
 
 class CircuitBreaker:
@@ -311,9 +313,8 @@ class MapOutcome:
     total: int
     # Not a bool. A second way to abort arrived with token budgets, and a
     # receipt saying only "ABORTED" sends people hunting for failures that
-    # never happened. One of None, "breaker", "budget", "interrupted",
-    # "index".
-    abort_reason: str | None
+    # never happened. None when the run did not stop early.
+    abort_reason: AbortReason | None
     input_tokens: int
     output_tokens: int
     # Carried because caching is the largest cost lever on bulk work, and it
@@ -333,7 +334,7 @@ class MapOutcome:
     # abort_reason only says "budget", which would make a rolling stop
     # look like the per-run flag and send the user to raise the wrong
     # number.
-    tripped_budget: str | None = None
+    tripped_budget: BudgetName | None = None
     # Exact tokens this invocation's requests cost, failures
     # included. What the ledger records, so the rolling window and
     # the charge rows cannot disagree.
@@ -470,8 +471,8 @@ class _RunState:
     tally: Tally = field(default_factory=Tally)
     # The first cause wins, apart from "index" and "interrupted", which end
     # the run however it was stopping.
-    abort_reason: str | None = None
-    tripped_budget: str | None = None
+    abort_reason: AbortReason | None = None
+    tripped_budget: BudgetName | None = None
     index_error: str | None = None
 
 
@@ -674,7 +675,11 @@ def _charge_budgets(run: _RunState, charge: int) -> None:
     "budget", hiding the more actionable failure. Nothing here awaits, so
     no other request can run between these statements.
     """
-    for name, limit in (("per_run", run.budget), ("rolling", run.rolling_budget)):
+    limits: tuple[tuple[BudgetName, TokenBudget | None], ...] = (
+        ("per_run", run.budget),
+        ("rolling", run.rolling_budget),
+    )
+    for name, limit in limits:
         if limit is not None:
             limit.record(charge)
             if limit.should_abort() and run.abort_reason is None:
@@ -770,7 +775,7 @@ def _prepare(job: MapJob) -> _Plan:
         per_item=per_item,
         schema=schema,
         dialect=dialect,
-        max_tokens=job.max_tokens or default_max_tokens(thinking=job.thinking),
+        max_tokens=job.max_tokens or DEFAULT_MAX_TOKENS,
     )
 
 
@@ -792,7 +797,11 @@ def _start(job: MapJob, key: str, prior_spend: int) -> _RunState:
         budget=budget,
         rolling_budget=job.rolling_budget,
     )
-    for name, limit in (("per_run", budget), ("rolling", job.rolling_budget)):
+    limits: tuple[tuple[BudgetName, TokenBudget | None], ...] = (
+        ("per_run", budget),
+        ("rolling", job.rolling_budget),
+    )
+    for name, limit in limits:
         if limit is not None and limit.should_abort():
             run.abort_reason = "budget"
             run.tripped_budget = name

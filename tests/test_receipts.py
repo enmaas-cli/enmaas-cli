@@ -1,9 +1,10 @@
 import re
 from pathlib import Path
 
-from enmaas_cli.dialect import Completion, Usage
+from enmaas_cli.dialect import Completion
 from enmaas_cli.receipts import ask_receipt, create_run_dir, map_receipt, preview, prune_runs
 from enmaas_cli.runner import MapOutcome
+from enmaas_cli.tokens import Usage
 
 
 def test_preview_collapses_whitespace_and_truncates() -> None:

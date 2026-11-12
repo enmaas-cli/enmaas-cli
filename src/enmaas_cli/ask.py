@@ -6,18 +6,16 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import httpx
 
 from .auth import printable, redact
 from .client import CallSettings, call
 from .dialect import (
+    DEFAULT_MAX_TOKENS,
     Completion,
     Dialect,
-    Usage,
     build_request,
-    default_max_tokens,
     parse_response,
     resolve_dialect,
 )
@@ -25,6 +23,7 @@ from .errors import CallError, ExitCode, where
 from .outputs import protect, write_output
 from .receipts import ask_receipt, create_run_dir, prune_runs
 from .schema import ValidationError, load_schema, validate_against_schema
+from .tokens import Usage
 
 
 @dataclass(frozen=True)
@@ -34,7 +33,8 @@ class AskResult:
     exit_code: int
     model: str
     dialect: str
-    completion: Any | None  # Completion object or None on error
+    # None when the request failed or the answer was not saved.
+    completion: Completion | None
     elapsed: float
     error: str | None
     # Kept apart from completion: an empty answer has no completion, yet
@@ -114,7 +114,7 @@ async def send_ask(
         model=model,
         prompt=prompt,
         dialect=resolved,
-        max_tokens=max_tokens if max_tokens is not None else default_max_tokens(thinking=thinking),
+        max_tokens=max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS,
         thinking=thinking,
         system=system,
         key=key,

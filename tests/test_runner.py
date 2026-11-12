@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from enmaas_cli.runner import ValidationError, load_items, render, resume_skips
+from enmaas_cli.runner import load_items, render, resume_skips
+from enmaas_cli.schema import ValidationError
 
 
 def _items(tmp_path: Path, rows: list[dict[str, object]]) -> Path:

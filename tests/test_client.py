@@ -1,8 +1,9 @@
 import httpx
 import pytest
 
-from enmaas_cli.client import GatewayError, call, is_retryable
+from enmaas_cli.client import call, is_retryable
 from enmaas_cli.dialect import Request
+from enmaas_cli.errors import GatewayError
 
 REQ = Request(path="/v1/messages", headers={"x-api-key": "k"}, body={"model": "m"})
 BASE = "https://gateway.test"

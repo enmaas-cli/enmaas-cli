@@ -9,12 +9,11 @@ import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .auth import cut_redacted, printable, redact
 from .dialect import Completion, Dialect
 from .errors import ExitCode
-from .outputs import state_root as state_root
 
 if TYPE_CHECKING:  # pragma: no cover
     # Types only. ask imports this module, and receipts stays a leaf.
@@ -289,7 +288,7 @@ def ask_json(result: AskResult) -> dict[str, Any]:
     }
 
 
-def _map_status(outcome: MapOutcome) -> str:
+def _map_status(outcome: MapOutcome) -> Literal["ok", "partial", "aborted"]:
     if outcome.abort_reason is not None:
         return "aborted"
     return "partial" if outcome.failed > 0 else "ok"

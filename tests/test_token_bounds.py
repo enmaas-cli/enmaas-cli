@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
-from enmaas_cli import dialect
+from enmaas_cli import tokens
 from enmaas_cli.cli import main
 from enmaas_cli.dialect import parse_response
 from enmaas_cli.runner import run_map
@@ -65,7 +65,7 @@ def test_anthropic_counts_above_the_cap_read_as_not_reported() -> None:
 
 
 def test_the_cap_itself_is_kept_and_one_more_is_not() -> None:
-    assert dialect.MAX_TOKEN_COUNT == 10**12
+    assert tokens.MAX_TOKEN_COUNT == 10**12
     kept = parse_response(_openai({"prompt_tokens": 10**12}), "openai").usage
     assert kept.input_tokens == 10**12
     dropped = parse_response(_openai({"prompt_tokens": 10**12 + 1}), "openai").usage

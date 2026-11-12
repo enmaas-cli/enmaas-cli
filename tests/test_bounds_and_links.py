@@ -12,8 +12,9 @@ import pytest
 
 from enmaas_cli import ask, cli
 from enmaas_cli.auth import AuthError, resolve_key
-from enmaas_cli.client import MAX_RETRY_AFTER_SECONDS, GatewayError, call
-from enmaas_cli.dialect import EmptyResponseError, Request, parse_response
+from enmaas_cli.client import MAX_RETRY_AFTER_SECONDS, call
+from enmaas_cli.dialect import Request, parse_response
+from enmaas_cli.errors import EmptyResponseError, GatewayError
 from enmaas_cli.outputs import is_protected, marker_path, protect, write_output
 from enmaas_cli.receipts import prune_runs
 from enmaas_cli.runner import run_map
