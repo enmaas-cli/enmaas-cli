@@ -1,13 +1,10 @@
-"""An ask that fails after the reply arrived still records the charge.
-
-The gateway billed the request once the reply came back. A failure in the
-schema check or the file write after that must not lose the ledger event.
-"""
+"""Tests for the ask module."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +13,56 @@ import pytest
 
 from enmaas_cli.ask import run_ask
 from enmaas_cli.cli import main
+
+# Tests for warning output.
+
+
+def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_ask_surfaces_reasoning_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ask with a model that has no verified knob and explicit --thinking off writes a warning."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": "response"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    async with _client(handler) as client:
+        await run_ask(
+            client=client,
+            base_url="https://g.test",
+            key="sk-test",
+            model="gpt-6-sol",
+            prompt="hi",
+            system=None,
+            dialect="openai",
+            thinking=False,
+            max_tokens=None,
+            timeout=5.0,
+            retries=0,
+            output=None,
+            run_root=tmp_path,
+            save_thinking=False,
+        )
+
+    captured = capsys.readouterr()
+    assert "warning:" in captured.err
+    assert "gpt-6-sol" in captured.err
+
+
+# An ask that fails after the reply arrived still records the charge.
+#
+# The gateway billed the request once the reply came back. A failure in the
+# schema check or the file write after that must not lose the ledger event.
+
 
 REPLY = {
     "choices": [{"finish_reason": "stop", "message": {"content": '{"a": 1}'}}],
