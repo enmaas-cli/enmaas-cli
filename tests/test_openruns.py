@@ -393,11 +393,172 @@ def test_the_index_tail_is_bounded(tmp_path: Path) -> None:
     assert not read.complete
 
 
-def test_garbage_lines_are_skipped(tmp_path: Path) -> None:
+@pytest.mark.parametrize("newline", [False, True])
+@pytest.mark.parametrize("offset", [0, 13])
+@pytest.mark.parametrize("extra_budget", [-1, 0, 1])
+def test_index_eof_below_at_and_above_the_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    newline: bool,
+    offset: int,
+    extra_budget: int,
+) -> None:
+    outdir = tmp_path / "out"
+    index = _index(outdir, [])
+    tail = (json.dumps(_charge(5)) + "\n" + json.dumps(_charge(7))).encode()
+    if newline:
+        tail += b"\n"
+    index.write_bytes(b"\n" * offset + tail)
+    budget = len(tail) + extra_budget
+    reads = _count_reads(monkeypatch)
+    read = openruns.charge_since(OpenRun(**_record(outdir=str(outdir), offset=offset)), budget)
+    assert sum(reads) == read.used <= budget
+    assert read == (5 if extra_budget < 0 else 12, min(budget, len(tail)), extra_budget >= 0, None)
+
+
+def test_exact_cap_eof_uses_the_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outdir = tmp_path / "out"
+    index = _index(outdir, [])
+    original = json.dumps(_charge(7)).encode()
+    index.write_bytes(original)
+    real_read = os.read
+    replaced = False
+
+    def read(fd: int, n: int) -> bytes:
+        nonlocal replaced
+        data = real_read(fd, n)
+        if not replaced:
+            replaced = True
+            index.rename(outdir / "original.jsonl")
+            index.write_bytes(original + b"\nmore bytes")
+        return data
+
+    monkeypatch.setattr(os, "read", read)
+    result = openruns.charge_since(OpenRun(**_record(outdir=str(outdir))), len(original))
+    assert result == (7, len(original), True, None)
+
+
+@pytest.mark.parametrize("operation", ["open_charge", "settle"])
+@pytest.mark.parametrize("newline", [False, True])
+def test_the_last_record_can_use_exactly_the_remaining_read_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, newline: bool
+) -> None:
+    state = tmp_path / "state"
+    records = []
+    budget = 0
+    for name, charge in [("a", 5), ("b", 777)]:
+        index = _index(tmp_path / name, [])
+        tail = json.dumps(_charge(charge, run=name)).encode() + (b"\n" if newline else b"")
+        index.write_bytes(b"previous run\n" + tail)
+        budget += len(tail)
+        records.append(_record(outdir=str(index.parent), offset=13, run_id=name))
+    path = _write_records(state, records)
+    record_bytes = path.stat().st_size
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", budget)
+    reads = _count_reads(monkeypatch)
+    if operation == "open_charge":
+        assert openruns.open_charge(state) == (782, True)
+        assert sum(reads) - record_bytes == budget
+    else:
+        ledger = state / "usage.jsonl"
+        openruns.settle(state, ledger)
+        assert [row["charge"] for row in _ledger_rows(ledger)] == [5, 777]
+        assert not path.exists()
+        assert sum(reads) - 2 * record_bytes == budget
+
+
+@pytest.mark.parametrize("kind", ["live", "dead", "stale"])
+def test_capped_records_remain_after_repeated_settlements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    state = tmp_path / "state"
+    index = _index(tmp_path / "out", [_charge(5)])
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", index.stat().st_size)
+    _index(index.parent, [_charge(7)])
+    started = datetime.now(UTC)
+    if kind == "stale":
+        started -= openruns.STALE_AFTER + timedelta(hours=1)
+    record = _record(
+        outdir=str(index.parent),
+        pid=os.getpid() if kind == "dead" else os.getppid(),
+        started=started.isoformat(),
+    )
+    path = _write_records(state, [record])
+    before = path.read_bytes()
+    for _ in range(2):
+        openruns.settle(state, state / "usage.jsonl")
+        assert openruns.open_charge(state) == (5, False)
+        assert path.read_bytes() == before
+        assert _ledger_rows(state / "usage.jsonl") == []
+
+
+@pytest.mark.parametrize("raw", [None, b"", b"\n \t\r\n"])
+def test_missing_or_blank_record_files_are_empty(tmp_path: Path, raw: bytes | None) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    if raw is not None:
+        (state / openruns.OPEN_RUNS_FILE).write_bytes(raw)
+    assert openruns._load(state) == []
+    assert openruns.open_charge(state) == (0, True)
+    openruns.settle(state, state / "usage.jsonl")
+    assert _ledger_rows(state / "usage.jsonl") == []
+
+
+def test_unknown_fields_in_a_valid_record_are_accepted(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    index = _index(tmp_path / "out", [_charge(9)])
+    _write_records(state, [_record(outdir=str(index.parent), future={"field": "accepted"})])
+    assert openruns.open_charge(state) == (9, True)
+    openruns.settle(state, state / "usage.jsonl")
+    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [9]
+
+
+@pytest.mark.parametrize("bad", [b'{"broken":', b"[]", b"null", b"{}", b"\xff"])
+def test_a_malformed_row_refuses_every_update_and_preserves_unknown_fields(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: bytes
+) -> None:
+    state = tmp_path / "state"
+    index = _index(tmp_path / "out", [_charge(9)])
+    record = _record(outdir=str(index.parent), future={"private-content": "retained"})
+    path = _write_records(state, [record])
+    before = path.read_bytes() + bad + b"\n"
+    path.write_bytes(before)
+    run = OpenRun(**{name: record[name] for name in openruns._FIELD_RULES})
+    for _ in range(2):
+        with pytest.raises(OSError):
+            openruns._load(state)
+        assert openruns.open_charge(state) == (0, False)
+        assert openruns.begin(state, outdir=tmp_path / "new", model="m", dialect="openai") is None
+        assert path.read_bytes() == before
+        openruns.end(state, run)
+        assert path.read_bytes() == before
+        openruns.settle(state, state / "usage.jsonl")
+        assert path.read_bytes() == before
+        assert _ledger_rows(state / "usage.jsonl") == []
+    assert capsys.readouterr().err == BEGIN_LINE * 2
+
+
+def test_a_record_file_that_is_a_directory_refuses_every_update(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    path = state / openruns.OPEN_RUNS_FILE
+    path.mkdir(parents=True)
+    marker = path / "retained"
+    marker.write_bytes(b"original")
+    assert openruns.open_charge(state) == (0, False)
+    assert openruns.begin(state, outdir=tmp_path / "out", model="m", dialect="openai") is None
+    openruns.end(state, OpenRun(**_record()))
+    openruns.settle(state, state / "usage.jsonl")
+    assert marker.read_bytes() == b"original"
+    assert _ledger_rows(state / "usage.jsonl") == []
+
+
+def test_garbage_lines_refuse_the_whole_file(tmp_path: Path) -> None:
     state = tmp_path / "state"
     outdir = tmp_path / "out"
     _index(outdir, [_charge(3, run="good")])
-    good = _record(outdir=str(outdir), run_id="good")
+    good = _record(outdir=str(outdir), run_id="good", future={"field": "retained"})
     bad = [
         _record(offset=True),
         _record(offset=-1),
@@ -419,14 +580,22 @@ def test_garbage_lines_are_skipped(tmp_path: Path) -> None:
     ]
     missing = _record()
     del missing["pid"]
+    for invalid in [*bad, missing]:
+        _write_records(state, [good, invalid])
+        with pytest.raises(OSError):
+            openruns._load(state)
+        assert openruns.open_charge(state) == (0, False)
     extra = "not json\n[1, 2]\nnull\n" + "[" * 100_000 + "\n"
     path = _write_records(state, [*bad, missing, good], extra=extra)
     with path.open("ab") as handle:
         handle.write(b"\xff\xfe{\n")
-    assert [run.run_id for run in openruns._load(state)] == ["good"]
+    before = path.read_bytes()
+    with pytest.raises(OSError):
+        openruns._load(state)
+    assert openruns.open_charge(state) == (0, False)
     openruns.settle(state, state / "usage.jsonl")
-    (event,) = _ledger_rows(state / "usage.jsonl")
-    assert event["charge"] == 3
+    assert _ledger_rows(state / "usage.jsonl") == []
+    assert path.read_bytes() == before
 
 
 def test_the_record_file_read_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -457,8 +626,22 @@ def test_a_record_file_that_is_a_fifo_does_not_block(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir()
     os.mkfifo(state / openruns.OPEN_RUNS_FILE)
-    assert openruns.open_charge(state) == (0, True)
-    openruns.settle(state, state / "usage.jsonl")
+    code = (
+        "import pathlib, stat, sys\n"
+        "from enmaas_cli import openruns\n"
+        "state = pathlib.Path(sys.argv[1])\n"
+        "assert openruns.open_charge(state) == (0, False)\n"
+        "openruns.settle(state, state / 'usage.jsonl')\n"
+        "assert openruns.begin(state, outdir=state / 'out', model='m', dialect='openai') "
+        "is None\n"
+        f"openruns.end(state, openruns.OpenRun(**{_record()!r}))\n"
+        "assert stat.S_ISFIFO((state / openruns.OPEN_RUNS_FILE).stat().st_mode)\n"
+        "assert not (state / 'usage.jsonl').exists()\n"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", code, str(state)], capture_output=True, text=True, timeout=5
+    )
+    assert child.returncode == 0, child.stderr
 
 
 def test_a_ledger_that_cannot_be_written_keeps_the_record(tmp_path: Path) -> None:
@@ -535,26 +718,34 @@ def test_end_leaves_other_records(tmp_path: Path) -> None:
     assert _run_ids(state) == [second.run_id]
 
 
-def test_nothing_read_is_ever_printed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_nothing_read_is_ever_printed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], corrupt: bool
+) -> None:
     state = tmp_path / "state"
     outdir = tmp_path / "out"
     secret = "SECRET-ROW-CONTENT-sk-oai-123"
     _index(outdir, [_charge(5), {"id": "a", "status": "ok", "error": secret}])
     with (outdir / "results.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(secret + "\n")
-    _write_records(
+    path = _write_records(
         state,
         [_record(outdir=str(outdir)), _record(outdir=str(outdir), pid=os.getppid())],
-        extra=secret + "\n",
+        extra=secret + "\n" if corrupt else "",
     )
-    # Both records carry the same run id, so each counts the same row.
-    assert openruns.open_charge(state) == (10, True)
+    before = path.read_bytes()
+    # In a valid file both records count the same row. A corrupt file refuses whole.
+    assert openruns.open_charge(state) == ((0, False) if corrupt else (10, True))
     openruns.settle(state, state / "usage.jsonl")
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
-    assert secret not in (state / "usage.jsonl").read_text(encoding="utf-8")
-    assert secret not in (state / openruns.OPEN_RUNS_FILE).read_text(encoding="utf-8")
+    if corrupt:
+        assert _ledger_rows(state / "usage.jsonl") == []
+        assert path.read_bytes() == before
+    else:
+        assert secret not in (state / "usage.jsonl").read_text(encoding="utf-8")
+        assert secret not in path.read_text(encoding="utf-8")
 
 
 def test_rolling_check_counts_a_live_record(tmp_path: Path) -> None:
@@ -838,19 +1029,29 @@ def test_one_read_budget_is_shared_by_every_record_in_a_settle(
     assert not record_file.exists()
 
 
-def test_an_index_longer_than_the_budget_is_settled_with_what_was_read(
+def test_an_index_longer_than_the_budget_keeps_its_record_until_fully_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The documented undercount: a tail beyond the read limit is not counted."""
+    """A partial read must never become a final event or lose the unread tail."""
     state = tmp_path / "state"
     outdir = tmp_path / "out"
     index = _index(outdir, [_charge(5)])
     monkeypatch.setattr(openruns, "MAX_READ_BYTES", index.stat().st_size)
     _index(outdir, [_charge(7)])
-    _write_records(state, [_record(outdir=str(outdir))])
-    openruns.settle(state, state / "usage.jsonl")
-    assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [5]
-    assert not (state / openruns.OPEN_RUNS_FILE).exists()
+    path = _write_records(state, [_record(outdir=str(outdir))])
+    before = path.read_bytes()
+    ledger = state / "usage.jsonl"
+    for _ in range(2):
+        assert openruns.open_charge(state) == (5, False)
+        openruns.settle(state, ledger)
+        assert _ledger_rows(ledger) == []
+        assert path.read_bytes() == before
+    monkeypatch.setattr(openruns, "MAX_READ_BYTES", index.stat().st_size)
+    openruns.settle(state, ledger)
+    assert [row["charge"] for row in _ledger_rows(ledger)] == [12]
+    assert not path.exists()
+    openruns.settle(state, ledger)
+    assert [row["charge"] for row in _ledger_rows(ledger)] == [12]
 
 
 def test_open_charge_stops_reading_when_the_budget_runs_out(
@@ -877,9 +1078,14 @@ def test_a_record_started_in_the_future_is_not_loaded(tmp_path: Path) -> None:
     outdir = tmp_path / "out"
     _index(outdir, [_charge(9)])
     ahead = (datetime.now(UTC) + timedelta(days=1)).isoformat()
-    _write_records(state, [_record(outdir=str(outdir), pid=1, started=ahead)])
-    assert openruns._load(state) == []
-    assert openruns.open_charge(state) == (0, True)
+    path = _write_records(state, [_record(outdir=str(outdir), pid=1, started=ahead)])
+    before = path.read_bytes()
+    with pytest.raises(OSError):
+        openruns._load(state)
+    assert openruns.open_charge(state) == (0, False)
+    openruns.settle(state, state / "usage.jsonl")
+    assert path.read_bytes() == before
+    assert _ledger_rows(state / "usage.jsonl") == []
 
 
 def test_a_record_within_the_clock_skew_allowance_is_loaded(tmp_path: Path) -> None:
@@ -1006,8 +1212,8 @@ def test_map_through_main_tags_its_charge_rows_with_its_record(
 
 def _too_large_warning(state: Path, reason: str = "is too large") -> str:
     return (
-        f"warning: {state / openruns.OPEN_RUNS_FILE} {reason} and was ignored; "
-        "delete it if you did not create it\n"
+        f"warning: {state / openruns.OPEN_RUNS_FILE} {reason}; records were retained; "
+        "restore accounting before budgeted work can resume\n"
     )
 
 
@@ -1139,8 +1345,13 @@ def test_a_record_file_owned_by_another_user_is_not_loaded(
 )
 def test_a_record_with_an_unsafe_model_name_is_not_loaded(tmp_path: Path, model: str) -> None:
     state = tmp_path / "state"
-    _write_records(state, [_record(model=model)])
-    assert openruns._load(state) == []
+    path = _write_records(state, [_record(model=model)])
+    before = path.read_bytes()
+    with pytest.raises(OSError):
+        openruns._load(state)
+    assert openruns.open_charge(state) == (0, False)
+    openruns.settle(state, state / "usage.jsonl")
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -1488,9 +1699,11 @@ def test_a_small_real_run_is_settled_ahead_of_large_planted_ones(
     _index(tmp_path / "real", [_charge(9, run="real")])
     records.append(_record(outdir=str(tmp_path / "real"), run_id="real"))
     _write_records(state, records)
-    openruns.settle(state, state / "usage.jsonl")
-    assert 9 in [row["charge"] for row in _ledger_rows(state / "usage.jsonl")]
-    assert "real" not in _run_ids(state)
+    for _ in range(2):
+        openruns.settle(state, state / "usage.jsonl")
+        assert [row["charge"] for row in _ledger_rows(state / "usage.jsonl")] == [9]
+        assert _run_ids(state) == [f"planted{n}" for n in range(5)]
+        assert not openruns.open_charge(state).complete
 
 
 def test_a_small_live_run_is_counted_ahead_of_a_large_planted_one(
@@ -1529,7 +1742,7 @@ def _refuse_open(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
 
 INCOMPLETE_REFUSAL = (
     "open-run records in {path} could not all be read, so the token budget cannot be "
-    "checked; run the command again, or delete that file if you did not create it"
+    "checked; records were retained; restore accounting before budgeted work can resume"
 )
 
 

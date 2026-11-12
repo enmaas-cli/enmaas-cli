@@ -11,12 +11,12 @@ it is settled, and while its run is alive its spend is only an estimate read
 from the index.
 
 Every record is treated as untrusted. A forged one can add spend, because
-that only makes a budget stricter. It can never lower spend, print file
-content, block a later command for good, or cost more than a bounded amount
-of time and memory. The model and dialect of a record are written to the
-ledger, so the model must be printable and short and the dialect must be a
-known one. No content of an
-index is written, printed or returned; only the sum of its charge rows.
+that only makes a budget stricter. Reads use bounded time and memory and
+never print stored content. Incomplete indexes and unreadable record files
+retain their records and block budgeted work until accounting is restored.
+The model and dialect of a record are written to the ledger, so the model
+must be printable and short and the dialect must be a known one. No content
+of an index is written, printed or returned; only the sum of its charge rows.
 """
 
 from __future__ import annotations
@@ -118,7 +118,8 @@ def _warn_too_large(state_dir: Path, reason: str) -> None:
     if path not in _reported_too_large:
         _reported_too_large.add(path)
         print(
-            f"warning: {path} {reason} and was ignored; delete it if you did not create it",
+            f"warning: {path} {reason}; records were retained; "
+            "restore accounting before budgeted work can resume",
             file=sys.stderr,
         )
 
@@ -219,10 +220,10 @@ def _read_bounded(fd: int, limit: int) -> bytes:
 
 
 def _load(state_dir: Path) -> list[OpenRun]:
-    """Every valid record. Raises OSError when the file exists but cannot be read.
+    """Every record, or OSError when any part of the file cannot be read or parsed.
 
     Raises _TooLarge when the file is over MAX_FILE_BYTES or holds more than
-    MAX_RECORDS valid records. Reading only part of it would hide the rest,
+    MAX_RECORDS records. Accepting only part of it would hide the rest,
     and a later write would drop them for good. O_NONBLOCK keeps a planted
     FIFO from blocking the open, so the fstat check below can refuse it.
     """
@@ -233,7 +234,7 @@ def _load(state_dir: Path) -> list[OpenRun]:
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            return []
+            raise OSError("the open-run record file is not a regular file")
         _require_owner(info)
         if info.st_size > MAX_FILE_BYTES:
             raise _TooLarge(TOO_MANY_BYTES)
@@ -242,13 +243,20 @@ def _load(state_dir: Path) -> list[OpenRun]:
         os.close(fd)
     if len(raw) > MAX_FILE_BYTES:
         raise _TooLarge(TOO_MANY_BYTES)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OSError("the open-run record file is not valid UTF-8") from None
     runs: list[OpenRun] = []
-    for line in raw.decode("utf-8", errors="replace").splitlines():
+    for line in text.splitlines():
+        if not line.strip():
+            continue
         run = _parse(line)
-        if run is not None:
-            runs.append(run)
-            if len(runs) > MAX_RECORDS:
-                raise _TooLarge(TOO_MANY_RECORDS)
+        if run is None:
+            raise OSError("the open-run record file contains an invalid record")
+        runs.append(run)
+        if len(runs) > MAX_RECORDS:
+            raise _TooLarge(TOO_MANY_RECORDS)
     return runs
 
 
@@ -399,7 +407,7 @@ def begin(state_dir: Path, *, outdir: Path, model: str, dialect: str) -> OpenRun
             model=model,
             dialect=dialect,
         )
-        # A record the loader would skip protects nothing, so it is refused
+        # A record the loader would refuse protects nothing, so it is refused
         # here with the same warning as a failed write.
         if _parse(json.dumps(asdict(run))) != run:
             raise OSError("the open-run record is not valid")
@@ -479,6 +487,11 @@ def charge_pattern(run_id: str) -> ChargePattern:
     return ChargePattern(regex, longest)
 
 
+def _at_eof(fd: int) -> bool:
+    """Check the open file's position without reading beyond the byte budget."""
+    return os.lseek(fd, 0, os.SEEK_CUR) >= os.fstat(fd).st_size
+
+
 def _reference_charges(
     fd: int, budget: int, progress: _Progress, pattern: ChargePattern
 ) -> Iterator[int]:
@@ -499,6 +512,7 @@ def _reference_charges(
         for line in lines:
             if match := pattern.regex.fullmatch(line):
                 yield int(match.group(1))
+    progress.at_end = progress.at_end or _at_eof(fd)
     # A last line with no newline is used only at the end of the file. A
     # line cut by the budget is not.
     if pending and progress.at_end and (match := pattern.regex.fullmatch(pending)):
@@ -544,6 +558,9 @@ def _scan_charges(
         skipping = len(pending) > pattern.longest
         if skipping:
             pending = b""
+    # The final read may have used exactly the budget. Check this descriptor
+    # before using a final row without a newline, without reading more bytes.
+    progress.at_end = progress.at_end or _at_eof(fd)
     if not skipping and progress.at_end and (match := pattern.regex.fullmatch(pending)):
         yield int(match.group(1))
 
@@ -652,7 +669,8 @@ def settle(state_dir: Path, ledger: Path) -> None:
     A record is removed only when there was nothing to charge or the ledger
     took the event. A record whose event could not be written stays, so the
     next run tries again rather than losing the spend. A record whose index
-    could not be read stays too, until it is older than STALE_AFTER.
+    could not be read stays too, until it is older than STALE_AFTER. An index
+    cut short by the read limit keeps its record even when it is stale.
     """
     if _is_disabled():
         return
@@ -738,15 +756,13 @@ def _pick_dead(state_dir: Path) -> _Settling | None:
 
 def _read_dead(settling: _Settling) -> None:
     """With no lock held, read what each dead run charged, smallest index first."""
-    budget = MAX_READ_BYTES
-    remaining = budget
+    remaining = MAX_READ_BYTES
     for run in _smallest_first(settling.dead):
         if remaining <= 0:
             # Out of budget: the next command reads it.
             break
         try:
             read = charge_since(run, remaining)
-            fresh = remaining == budget
             remaining -= read.used
             if read.failed is not None:
                 # The spend may be real, so the record waits for a later
@@ -755,15 +771,11 @@ def _read_dead(settling: _Settling) -> None:
                 if _is_stale(run, settling.now):
                     settling.drop(run, read.failed)
                 continue
-            if not read.complete and not fresh:
-                # Cut short by what earlier records used. The next command
-                # reads it with a full budget, so the charge is counted
-                # whole. Nothing more is read now.
+            if not read.complete:
+                # A partial charge cannot become a final ledger event. Keep
+                # the record until its whole index can be accounted for.
                 remaining = 0
                 continue
-            # A record that had the full budget and still did not finish is
-            # settled with what was read. Keeping it would block every later
-            # command on the same read.
             settling.decided.append((run, read.charge))
         except Exception as exc:
             settling.drop(run, type(exc).__name__)
@@ -845,8 +857,8 @@ def open_charge(state_dir: Path) -> OpenCharge:
 
     The read is incomplete when the record file could not be loaded, an
     index could not be read, or the shared read budget ran out with records
-    unread. A record that had the whole budget and still did not reach the
-    end of its index counts what was read, as settle does.
+    unread. A partial charge is returned with complete=False, even when
+    that record had the whole read budget.
 
     Read without the lock: the file is only ever replaced whole, so a reader
     sees one complete version or the other.
@@ -863,8 +875,7 @@ def open_charge(state_dir: Path) -> OpenCharge:
     total = 0
     complete = True
     # One budget for every record, read smallest index first.
-    budget = MAX_READ_BYTES
-    remaining = budget
+    remaining = MAX_READ_BYTES
     for run in _smallest_first(runs):
         if remaining <= 0:
             complete = False
@@ -875,9 +886,8 @@ def open_charge(state_dir: Path) -> OpenCharge:
             # Nothing is dropped here. The check refuses instead.
             complete = False
             continue
-        fresh = remaining == budget
         remaining -= read.used
         total += read.charge
-        if read.failed is not None or (not read.complete and not fresh):
+        if not read.complete:
             complete = False
     return OpenCharge(min(total, MAX_RECORDED), complete)

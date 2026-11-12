@@ -233,8 +233,8 @@ def rolling_check(config: Config, ledger: Path) -> RollingCheck:
             config.budget_tokens,
             message=(
                 f"open-run records in {ledger.parent / openruns.OPEN_RUNS_FILE} could not "
-                "all be read, so the token budget cannot be checked; run the command "
-                "again, or delete that file if you did not create it"
+                "all be read, so the token budget cannot be checked; records were retained; "
+                "restore accounting before budgeted work can resume"
             ),
         )
     live = opened.charge

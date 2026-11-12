@@ -277,6 +277,36 @@ def codex_hook_override(groups: list[Any]) -> str:
     return "hooks.PreToolUse=" + toml_value(groups)
 
 
+def case_environment(root: Path, url: str) -> dict[str, str]:
+    """Keep host state and settings local, retaining only the executable path."""
+    env = {
+        # Installed host binaries may live outside the system directories.
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "ANTHROPIC_BASE_URL": url,
+        "ANTHROPIC_API_KEY": "local-fixture-key",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_AUTOUPDATER": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    for name, directory in (
+        ("HOME", "home"),
+        ("CLAUDE_CONFIG_DIR", "claude-config"),
+        ("CODEX_HOME", "codex-home"),
+        ("XDG_CONFIG_HOME", "xdg-config"),
+        ("XDG_STATE_HOME", "xdg-state"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_DATA_HOME", "xdg-data"),
+        ("XDG_RUNTIME_DIR", "xdg-runtime"),
+        ("TMPDIR", "tmp"),
+    ):
+        path = root / directory
+        path.mkdir(mode=0o700)
+        env[name] = str(path)
+    return env
+
+
 def run_case(
     host: str,
     case: str,
@@ -313,17 +343,22 @@ def run_case(
         encoding="utf-8",
     )
     executable.chmod(0o755)
+    config_path = root / "fixture-config.toml"
+    key_path = root / "fixture-key"
+    key_path.write_text("local-fixture-key\n", encoding="utf-8")
+    key_path.chmod(0o600)
+    cli_command = (
+        f"{shlex.quote(str(executable))} --config {shlex.quote(str(config_path))}"
+        f" --key-file {shlex.quote(str(key_path))}"
+    )
     target = source if case == "ordinary-file" else metadata if case == "metadata" else answer
     command = f"cat {shlex.quote(str(target))}"
     if case == "inspect":
-        command = f"{shlex.quote(str(executable))} inspect {shlex.quote(str(answer))}"
+        command = f"{cli_command} inspect {shlex.quote(str(answer))}"
     elif case == "self-approval":
-        command = f"{shlex.quote(str(executable))} allow-read {shlex.quote(str(answer))}"
+        command = f"{cli_command} allow-read {shlex.quote(str(answer))}"
     elif case == "stdout":
-        command = (
-            f"{shlex.quote(str(executable))} --key-file {shlex.quote(str(root / 'missing-key'))}"
-            " ask --stdout -p fixture -m rits/local-fixture"
-        )
+        command = f"{cli_command} ask --stdout -p fixture -m rits/local-fixture"
     elif case == "human-override":
         allow_read(answer)
     elif case == "search":
@@ -338,21 +373,21 @@ def run_case(
         command = f"rg -l --json hello {shlex.quote(str(answer))}"
     elif case == "comment-read":
         command = (
-            f"{shlex.quote(str(executable))} inspect {shlex.quote(str(answer))} # note\n"
+            f"{cli_command} inspect {shlex.quote(str(answer))} # note\n"
             f"cat {shlex.quote(str(answer))}"
         )
     elif case == "continuation-read":
-        command = f"cat {root}/ans" + "\\\n" + "wer.md"
+        command = f"cat {shlex.quote(str(root / 'ans'))}" + "\\\n" + "wer.md"
     elif case == "scoped-cd":
         command = "(cd nested && pwd); cat answer.md"
     elif case == "stdout-abbrev":
         command = (
-            f"{shlex.quote(str(executable))} --conf {root}/missing-config --k {root}/missing-key"
+            f"{cli_command} --conf {shlex.quote(str(config_path))} --k {shlex.quote(str(key_path))}"
             " ask --std -p fixture -m rits/local-fixture"
         )
     elif case == "self-approval-abbrev":
         command = (
-            f"{shlex.quote(str(executable))} --conf {root}/missing-config"
+            f"{cli_command} --conf {shlex.quote(str(config_path))}"
             f" allow-read {shlex.quote(str(answer))}"
         )
 
@@ -374,7 +409,7 @@ def run_case(
     elif case == "brace-read":
         command = "cat {answer,other}.md"
     elif case == "stdout-short":
-        command = f"{shlex.quote(str(executable))} ask --st -p fixture"
+        command = f"{cli_command} ask --st -p fixture"
     elif case == "ignored-search":
         command = "rg ENMAAS ."
 
@@ -404,7 +439,16 @@ def run_case(
         def log_message(self, *_args: object) -> None:
             pass
 
+        def unknown_endpoint(self) -> None:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"unknown fixture endpoint"}')
+
         def do_GET(self) -> None:
+            if self.path.partition("?")[0] != "/v1/models":
+                self.unknown_endpoint()
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -412,8 +456,14 @@ def run_case(
 
         def do_POST(self) -> None:
             nonlocal request_count
+            path = self.path.partition("?")[0]
+            endpoint = "/v1/messages" if host == "claude" else "/v1/responses"
+            count_tokens = host == "claude" and path == "/v1/messages/count_tokens"
+            if path != endpoint and not count_tokens:
+                self.unknown_endpoint()
+                return
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if self.path.startswith("/v1/messages/count_tokens"):
+            if count_tokens:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -436,23 +486,12 @@ def run_case(
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}"
-    env = os.environ.copy()
-    for key in (
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ENMAAS_KEY",
-    ):
-        env.pop(key, None)
-    env.update(
-        ANTHROPIC_BASE_URL=url,
-        ANTHROPIC_API_KEY="local-fixture-key",
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
-        DISABLE_AUTOUPDATER="1",
-        # Keep Python children from writing bytecode caches into the source tree.
-        PYTHONDONTWRITEBYTECODE="1",
+    config_path.write_text(
+        f"base_url = {toml_string(url)}\nkey_file = {toml_string(str(key_path))}\n"
+        'default_model = "rits/local-fixture"\ntimeout = 2\n',
+        encoding="utf-8",
     )
+    env = case_environment(root, url)
     if host == "claude":
         # --setting-sources "" turns off the user, project and local settings
         # files, so only the file given to --settings registers hooks.
@@ -485,10 +524,6 @@ def run_case(
         # Pass the hooks as a config override with the user config ignored.
         # This checks the host decision path; hook trust prompts are separate.
         hook_override = codex_hook_override(repo_hook_groups() if groups is None else groups)
-        # Keep Codex state for this case under the case root.
-        codex_home = root / "codex-home"
-        codex_home.mkdir()
-        env["CODEX_HOME"] = str(codex_home)
         cmd = [
             "codex",
             "--no-daemon",
