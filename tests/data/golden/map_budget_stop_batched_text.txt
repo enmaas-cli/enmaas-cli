@@ -1,0 +1,51 @@
+=== exit 3
+=== stdout
+enmaas map stopped on budget
+  model     rits/zai-org/glm-5-3
+  batch     2
+  items     5 total: 4 attempted, 4 ok, 0 failed, 0 skipped
+            1 not attempted
+  outdir    out
+  index     out/results.jsonl
+  tokens    in 160   out 24
+  budget    144 of 80 tokens, this run  <-- stopped here
+  elapsed   <ELAPSED>
+  resume    raise --token-budget, then re-run with --resume
+
+=== stderr
+
+=== out
+.enmaas-output/  755
+.enmaas-output/11dd481a3da4aeae885606cdbde0921c891443bd4edb5adaac199a5d0262ad6a.json  600
+{"version": 1, "basename": "b.md", "state": "protected"}
+
+.enmaas-output/70df5b0ba0618de7b885d242d8fb9886912f4338500a91586db7489e2892e83b.json  600
+{"version": 1, "basename": "d.md", "state": "protected"}
+
+.enmaas-output/aacf0bccc928f711bfaa96db8e51723513010caf434f162305023b16fd739248.json  600
+{"version": 1, "basename": "e.md", "state": "protected"}
+
+.enmaas-output/c285dde67a08371eb17fcb983994c5da0f8ebad19bcb9ee0754f82182024cc4a.json  600
+{"version": 1, "basename": "c.md", "state": "protected"}
+
+.enmaas-output/fecccc97532467adbf93017b357c8b17e0c75527df76a143de5cfecc2613f615.json  600
+{"version": 1, "basename": "a.md", "state": "protected"}
+
+a.md  600
+{"answer": "yes"}
+b.md  600
+{"answer": "yes"}
+c.md  600
+{"answer": "yes"}
+d.md  600
+{"answer": "yes"}
+results.jsonl  600
+{"type": "request", "charge": 72, "items": 2, "run": "<RUN>"}
+{"id": "a", "status": "ok", "path": "out/a.md", "tokens": null, "batch_size": 2, "error": null}
+{"id": "b", "status": "ok", "path": "out/b.md", "tokens": null, "batch_size": 2, "error": null}
+{"type": "request", "charge": 72, "items": 2, "run": "<RUN>"}
+{"id": "c", "status": "ok", "path": "out/c.md", "tokens": null, "batch_size": 2, "error": null}
+{"id": "d", "status": "ok", "path": "out/d.md", "tokens": null, "batch_size": 2, "error": null}
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "map", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 160, "cached_tokens": 40, "output_tokens": 24, "reasoning_tokens": 8, "elapsed": <ELAPSED>, "status": "error", "schema_used": false, "error_kind": "TokenBudgetExceeded", "items_total": 5, "items_ok": 4, "items_failed": 0, "charge": 144}

@@ -7,8 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from enmaas_cli.ask import run_ask
 from enmaas_cli.auth import resolve_key
-from enmaas_cli.cli import run_ask, run_models
+from enmaas_cli.cli import run_models
 from enmaas_cli.client import call
 from enmaas_cli.dialect import Dialect, build_request, parse_response
 from enmaas_cli.runner import run_map

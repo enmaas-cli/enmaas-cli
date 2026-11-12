@@ -31,8 +31,8 @@ import secrets
 import stat
 import sys
 import time
-from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypeGuard
@@ -147,6 +147,52 @@ def _is_text(value: object, limit: int) -> TypeGuard[str]:
     return isinstance(value, str) and 0 < len(value) <= limit and "\x00" not in value
 
 
+def _is_model(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= MAX_MODEL_CHARS and value.isprintable()
+
+
+def _is_dialect(value: object) -> bool:
+    return _is_text(value, 64) and value in DIALECTS
+
+
+def _is_outdir(value: object) -> bool:
+    return _is_text(value, MAX_PATH_CHARS) and os.path.isabs(value)
+
+
+def _is_offset(value: object) -> bool:
+    return _is_int(value) and value >= 0
+
+
+def _is_pid(value: object) -> bool:
+    return _is_int(value) and 0 < value <= MAX_PID
+
+
+def _is_started(value: object) -> bool:
+    """An aware ISO time no later than CLOCK_SKEW after now."""
+    if not _is_text(value, 64):
+        return False
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if moment.utcoffset() is None:
+        return False
+    return moment - datetime.now(UTC) <= CLOCK_SKEW
+
+
+# The rule each field of a record must pass. A record that fails any one is
+# refused as a whole, and fields not named here are ignored.
+_FIELD_RULES: dict[str, Callable[[object], bool]] = {
+    "run_id": lambda value: _is_text(value, 64),
+    "model": _is_model,
+    "dialect": _is_dialect,
+    "outdir": _is_outdir,
+    "offset": _is_offset,
+    "pid": _is_pid,
+    "started": _is_started,
+}
+
+
 def _parse(line: str) -> OpenRun | None:
     """One record, or None when any field has the wrong type or shape."""
     try:
@@ -155,46 +201,9 @@ def _parse(line: str) -> OpenRun | None:
         return None
     if not isinstance(data, dict):
         return None
-    run_id = data.get("run_id")
-    outdir = data.get("outdir")
-    offset = data.get("offset")
-    started = data.get("started")
-    pid = data.get("pid")
-    model = data.get("model")
-    dialect = data.get("dialect")
-    if not _is_text(run_id, 64):
+    if not all(rule(data.get(name)) for name, rule in _FIELD_RULES.items()):
         return None
-    if not isinstance(model, str) or not 0 < len(model) <= MAX_MODEL_CHARS:
-        return None
-    if not model.isprintable():
-        return None
-    if not _is_text(dialect, 64) or dialect not in DIALECTS:
-        return None
-    if not _is_text(outdir, MAX_PATH_CHARS) or not os.path.isabs(outdir):
-        return None
-    if not _is_int(offset) or offset < 0:
-        return None
-    if not _is_int(pid) or not 0 < pid <= MAX_PID:
-        return None
-    if not _is_text(started, 64):
-        return None
-    try:
-        moment = datetime.fromisoformat(started)
-    except ValueError:
-        return None
-    if moment.utcoffset() is None:
-        return None
-    if moment - datetime.now(UTC) > CLOCK_SKEW:
-        return None
-    return OpenRun(
-        run_id=run_id,
-        outdir=outdir,
-        offset=offset,
-        started=started,
-        pid=pid,
-        model=model,
-        dialect=dialect,
-    )
+    return OpenRun(**{name: data[name] for name in _FIELD_RULES})
 
 
 def _read_bounded(fd: int, limit: int) -> bytes:
@@ -680,29 +689,58 @@ def _settle(state_dir: Path, ledger: Path) -> None:
     The window that remains: a stop between the appends and the commit
     counts those runs twice, once.
     """
-    warned = False
+    settling = _pick_dead(state_dir)
+    if settling is None:
+        return
+    _read_dead(settling)
+    with _locked(state_dir):
+        if settling.decided:
+            _apply(state_dir, ledger, settling.decided, settling.now)
+        _remove_leftovers(state_dir)
+
+
+@dataclass
+class _Settling:
+    """What one settle has decided so far."""
+
+    now: datetime
     # Records to remove, each with what it owes. 0 means remove with no event.
-    decided: list[tuple[OpenRun, int]] = []
-    dead: list[OpenRun] = []
+    decided: list[tuple[OpenRun, int]] = field(default_factory=list)
+    dead: list[OpenRun] = field(default_factory=list)
+    # Whether the dropped-record warning was printed, so it is printed once.
+    warned: bool = False
+
+    def drop(self, run: OpenRun, kind: str) -> None:
+        """Remove a record with no event, with a warning that names `kind`."""
+        self.warned = _warn_dropped(kind, self.warned)
+        self.decided.append((run, 0))
+
+
+def _pick_dead(state_dir: Path) -> _Settling | None:
+    """Under the lock, load the records and pick the dead ones. None when there are none."""
     with _locked(state_dir):
         runs = _load(state_dir)
-        now = datetime.now(UTC)
+        settling = _Settling(now=datetime.now(UTC))
         for run in runs:
             # One record that cannot be handled must not stop the command or
             # come back on every later one, so it is dropped with a warning.
             try:
-                if _is_dead(run, now):
-                    dead.append(run)
+                if _is_dead(run, settling.now):
+                    settling.dead.append(run)
             except Exception as exc:
-                warned = _warn_dropped(type(exc).__name__, warned)
-                decided.append((run, 0))
-        if not dead and not decided:
+                settling.drop(run, type(exc).__name__)
+        if not settling.dead and not settling.decided:
             # Nothing to settle, so this is the last step under the lock.
             _remove_leftovers(state_dir)
-            return
+            return None
+    return settling
+
+
+def _read_dead(settling: _Settling) -> None:
+    """With no lock held, read what each dead run charged, smallest index first."""
     budget = MAX_READ_BYTES
     remaining = budget
-    for run in _smallest_first(dead):
+    for run in _smallest_first(settling.dead):
         if remaining <= 0:
             # Out of budget: the next command reads it.
             break
@@ -714,9 +752,8 @@ def _settle(state_dir: Path, ledger: Path) -> None:
                 # The spend may be real, so the record waits for a later
                 # command. A record that never becomes readable is dropped
                 # once it is stale, so it cannot stay for good.
-                if _is_stale(run, now):
-                    warned = _warn_dropped(read.failed, warned)
-                    decided.append((run, 0))
+                if _is_stale(run, settling.now):
+                    settling.drop(run, read.failed)
                 continue
             if not read.complete and not fresh:
                 # Cut short by what earlier records used. The next command
@@ -727,14 +764,9 @@ def _settle(state_dir: Path, ledger: Path) -> None:
             # A record that had the full budget and still did not finish is
             # settled with what was read. Keeping it would block every later
             # command on the same read.
-            decided.append((run, read.charge))
+            settling.decided.append((run, read.charge))
         except Exception as exc:
-            warned = _warn_dropped(type(exc).__name__, warned)
-            decided.append((run, 0))
-    with _locked(state_dir):
-        if decided:
-            _apply(state_dir, ledger, decided, now)
-        _remove_leftovers(state_dir)
+            settling.drop(run, type(exc).__name__)
 
 
 def _remove_leftovers(state_dir: Path) -> None:

@@ -13,7 +13,8 @@ from enmaas_cli.budget import (
     metered,
     rolling_spend,
 )
-from enmaas_cli.dialect import Usage, parse_response
+from enmaas_cli.dialect import parse_response
+from enmaas_cli.tokens import Usage
 from enmaas_cli.usage import UsageEvent
 
 

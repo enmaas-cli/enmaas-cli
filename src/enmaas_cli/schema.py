@@ -1,11 +1,10 @@
 """JSON Schema loading and response validation.
 
-One implementation, shared by `ask` and `map`. These functions previously
-existed as near-copies in cli.py and runner.py, and the copies had already
-drifted: the same malformed schema file raised FileNotFoundError or ValueError
-from one command and ValidationError from the other. Both happened to surface
-the same way to a user, so nothing was visibly broken, which is exactly how a
-latent divergence survives long enough to become a real one.
+One implementation, shared by `ask` and `map`. Two copies drift apart: the
+same malformed schema file can raise FileNotFoundError or ValueError from one
+command and ValidationError from the other. When both surface the same way to
+a user, nothing looks broken, which is how a hidden difference survives long
+enough to become a real one.
 
 Validation runs on every dialect, not only where the gateway enforces a schema.
 The OpenAI dialect genuinely constrains output to the supplied schema. The

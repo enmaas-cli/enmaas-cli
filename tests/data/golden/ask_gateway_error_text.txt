@@ -1,0 +1,10 @@
+=== exit 1
+=== stdout
+
+=== stderr
+enmaas ask FAILED
+  model     rits/zai-org/glm-5-3  (openai dialect)
+  error     500: the gateway is down
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": null, "cached_tokens": null, "output_tokens": null, "reasoning_tokens": null, "elapsed": <ELAPSED>, "status": "error", "schema_used": false, "error_kind": "GatewayError", "items_total": null, "items_ok": null, "items_failed": null, "charge": 0}

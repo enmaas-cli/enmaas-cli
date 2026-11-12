@@ -4,7 +4,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from enmaas_cli.cli import ExitCode, run_ask, run_models
+from enmaas_cli.ask import run_ask
+from enmaas_cli.cli import run_models
+from enmaas_cli.errors import ExitCode
 
 
 def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:

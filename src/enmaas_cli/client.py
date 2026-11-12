@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import math
 import random
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,8 +17,10 @@ from .auth import cut_redacted, printable, redact
 from .dialect import Request
 from .errors import BadReplyError
 
-# Re-exported so existing importers of this name from this module keep working.
+# Also importable from this module. test_errors.py checks that it is the same
+# object as in errors.py.
 from .errors import GatewayError as GatewayError
+from .gateway import is_loopback
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 # 90% of the measured ~300s gateway ceiling.
@@ -33,6 +35,16 @@ ERROR_BODY_CHARS = 500
 CONTENT_TYPE_CHARS = 80
 
 SleepFn = Callable[[float], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class CallSettings:
+    """How every request of a command reaches the gateway."""
+
+    base_url: str
+    key: str
+    timeout: float
+    retries: int
 
 
 def is_retryable(status: int, elapsed: float = 0.0) -> bool:
@@ -105,6 +117,28 @@ def _backoff(attempt: int) -> float:
     return delay + random.uniform(0.0, delay * JITTER_FRACTION)
 
 
+CEILING_HINT = (
+    " (the gateway's own ~300s ceiling; set --thinking off, "
+    "shorten the prompt, or lower --max-tokens)"
+)
+
+
+def _wait_or_refuse(response: httpx.Response, detail: str, attempt: int, elapsed: float) -> float:
+    """The wait before the next attempt after a reply that is not 200.
+
+    Raises GatewayError when the status is not worth retrying.
+    """
+    if not is_retryable(response.status_code, elapsed):
+        hint = CEILING_HINT if response.status_code == 504 else ""
+        raise GatewayError(
+            f"{response.status_code}: {detail}{hint}",
+            status=response.status_code,
+            attempts=attempt,
+        )
+    wait = _retry_after(response)
+    return _backoff(attempt) if wait is None else wait
+
+
 async def call(
     client: httpx.AsyncClient,
     base_url: str,
@@ -119,8 +153,8 @@ async def call(
     """POST a built request, retrying service faults. Returns the parsed JSON.
 
     When `secret` is set, every copy of it in an error body is replaced
-    before the body is cut to length. Redacting after the cut missed a key
-    that straddled the cut, and the part before it survived.
+    before the body is cut to length. Redacting after the cut would miss a
+    key that straddles the cut, and the part before the cut would survive.
     """
     last_status: int | None = None
     last_detail = ""
@@ -140,12 +174,8 @@ async def call(
         except httpx.TransportError as exc:
             last_status, last_detail = None, f"{type(exc).__name__}: {exc}"
             if _elapsed() >= GATEWAY_CEILING_NEAR:
-                hint = (
-                    " (the gateway's own ~300s ceiling; set --thinking off, "
-                    "shorten the prompt, or lower --max-tokens)"
-                )
                 raise GatewayError(
-                    f"{last_detail}{hint}",
+                    f"{last_detail}{CEILING_HINT}",
                     status=None,
                     attempts=attempt,
                 ) from None
@@ -162,21 +192,7 @@ async def call(
                 return _reply_object(response, secret)
             last_status = response.status_code
             last_detail = _error_detail(response.text, secret)
-            if not is_retryable(response.status_code, _elapsed()):
-                hint = ""
-                if response.status_code == 504:
-                    hint = (
-                        " (the gateway's own ~300s ceiling; set --thinking off, "
-                        "shorten the prompt, or lower --max-tokens)"
-                    )
-                raise GatewayError(
-                    f"{response.status_code}: {last_detail}{hint}",
-                    status=response.status_code,
-                    attempts=attempt,
-                )
-            wait = _retry_after(response)
-            if wait is None:
-                wait = _backoff(attempt)
+            wait = _wait_or_refuse(response, last_detail, attempt, _elapsed())
             if attempt <= retries:
                 await sleep(wait)
                 continue
@@ -189,19 +205,6 @@ async def call(
         status=last_status,
         attempts=retries + 1,
     )
-
-
-def is_loopback(host: str | None) -> bool:
-    """Whether a host names this machine: localhost or a loopback address."""
-    if host is None:
-        # A missing host is reported by the URL check itself.
-        return True
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 def make_client(base_url: str) -> httpx.AsyncClient:

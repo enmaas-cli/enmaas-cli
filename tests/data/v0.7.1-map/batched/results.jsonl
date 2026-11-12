@@ -1,0 +1,8 @@
+{"type": "request", "charge": 92, "items": 2}
+{"id": "a", "status": "ok", "path": "batched/a.md", "tokens": null, "batch_size": 2, "error": null}
+{"id": "b", "status": "ok", "path": "batched/b.md", "tokens": null, "batch_size": 2, "error": null}
+{"type": "request", "charge": 66, "items": 2}
+{"id": "c", "status": "error", "path": null, "tokens": null, "error": "no answer for c in the batched reply"}
+{"id": "d", "status": "ok", "path": "batched/d.md", "tokens": null, "batch_size": 2, "error": null}
+{"type": "request", "charge": 35, "items": 1}
+{"id": "e", "status": "ok", "path": "batched/e.md", "tokens": null, "batch_size": 1, "replaced_in_request": 1, "error": null}

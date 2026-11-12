@@ -7,13 +7,17 @@ unpriced-model case that makes `pricing.cost_for` return None.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
-from enmaas_cli.dialect import Usage
-from enmaas_cli.tokens import MAX_RECORDED
-from enmaas_cli.usage import UsageEvent
+from enmaas_cli.auth import printable
+from enmaas_cli.config import Config
+from enmaas_cli.tokens import MAX_RECORDED, Usage
+from enmaas_cli.usage import UsageEvent, load_events_strict
 
 
 def metered(usage: Usage) -> int:
@@ -24,9 +28,9 @@ def metered(usage: Usage) -> int:
 
     No reasoning term, deliberately. `output_tokens` is OpenAI's
     `completion_tokens`, which already includes reasoning; `reasoning_tokens`
-    is a breakdown of it (dialect.py:228). On the Anthropic dialect it is
-    always None (dialect.py:269) because thinking is folded into
-    `output_tokens`. Adding it would double-charge.
+    is a breakdown of it (see `_openai_usage` in dialect.py). On the
+    Anthropic dialect it is always None (see `_anthropic_usage`) because
+    thinking is folded into `output_tokens`. Adding it would double-charge.
 
     Cached input is excluded: it is the saving that batching exists to
     produce, and a ceiling blind to it would make the tool's main
@@ -67,7 +71,7 @@ def _count(value: object) -> int:
 
 
 def charge_from_rows(rows: Iterable[dict[str, Any]]) -> int:
-    """Sum the charge rows run_map wrote to results.jsonl.
+    """Sum the charge rows a map run wrote to results.jsonl.
 
     Exact, because it reads what each request actually cost rather than
     recomputing from aggregates. Recomputing would clamp in the wrong
@@ -161,8 +165,8 @@ def event_charge(event: UsageEvent) -> int:
     - Clamping after aggregation is not the sum of per-request clamps.
       Two requests of (10 in, 100 cached, 1 out) and (100 in, 0 cached,
       1 out) cost 102, but their combined event derives 12.
-    - The aggregate counters record successful requests only, so a map
-      run's failures, which were still charged, vanish between runs.
+    - In a row with no charge, the aggregate counters of a map run can
+      leave out failed requests that were still charged.
     - `output_tokens` can be absent where a reasoning breakdown is not.
 
     The fallback exists for rows written before `charge` was recorded. It
@@ -173,3 +177,96 @@ def event_charge(event: UsageEvent) -> int:
         return _count(event.charge)
     uncached = max(0, _count(event.input_tokens) - _count(event.cached_tokens))
     return uncached + (_count(event.output_tokens) or _count(event.reasoning_tokens))
+
+
+MAX_PROBLEMS_SHOWN = 5
+
+
+@dataclass(frozen=True)
+class RollingCheck:
+    """Whether a standing budget permits this invocation, and where it stands."""
+
+    spent: int
+    ceiling: int | None
+    message: str | None  # set when the command must refuse
+
+
+def rolling_check(config: Config, ledger: Path) -> RollingCheck:
+    """Decide whether a configured rolling budget allows more work.
+
+    Returns the spend as well as the verdict, because a map run needs to
+    carry the remaining allowance into the run rather than recompute it.
+
+    A function returning a message is testable without capturing stdout,
+    which is why the decision is made here rather than by the command line.
+    """
+    # Imported here: openruns imports runner, which imports this module.
+    from . import openruns
+
+    if config.budget_tokens is None or config.budget_window_days is None:
+        return RollingCheck(spent=0, ceiling=None, message=None)
+
+    if os.environ.get("ENMAAS_NO_USAGE_LOG"):
+        # Nothing is being recorded, so the ceiling could never bind and
+        # every run would see zero spent. Enforcement that cannot observe
+        # itself must say so rather than wave the work through.
+        return RollingCheck(
+            0,
+            config.budget_tokens,
+            message=(
+                "a token budget is configured but ENMAAS_NO_USAGE_LOG disables "
+                "the ledger, so spend cannot be tracked"
+            ),
+        )
+
+    # Runs with a record still present have not written their ledger event
+    # yet. Their spend so far counts, so two runs side by side cannot each
+    # see the whole allowance. Read before the ledger: a run that ends
+    # between the two reads is then counted twice for this one check, never
+    # zero times.
+    opened = openruns.open_charge(ledger.parent)
+    if not opened.complete:
+        # Some spend could not be read. Sending on a guess could pass the
+        # ceiling, so the command refuses.
+        return RollingCheck(
+            0,
+            config.budget_tokens,
+            message=(
+                f"open-run records in {ledger.parent / openruns.OPEN_RUNS_FILE} could not "
+                "all be read, so the token budget cannot be checked; run the command "
+                "again, or delete that file if you did not create it"
+            ),
+        )
+    live = opened.charge
+    events, problems = load_events_strict(ledger)
+    if problems:
+        # An unreadable ledger is indistinguishable from one showing zero
+        # spend. Without a budget configured this would only warn. A few
+        # problems are enough to find the file, and the count bounds the
+        # message.
+        shown = "; ".join(problems[:MAX_PROBLEMS_SHOWN])
+        if len(problems) > MAX_PROBLEMS_SHOWN:
+            shown += f"; and {len(problems) - MAX_PROBLEMS_SHOWN} more"
+        return RollingCheck(
+            0,
+            config.budget_tokens,
+            message=(
+                f"a token budget is configured but the usage ledger {printable(str(ledger))} "
+                f"could not be read: {shown}"
+            ),
+        )
+
+    spent = rolling_spend(events, window_days=config.budget_window_days) + live
+    if spent >= config.budget_tokens:
+        message = (
+            f"{spent:,} of {config.budget_tokens:,} tokens spent in the last "
+            f"{config.budget_window_days} days"
+        )
+        if live:
+            # The path lets the user find a record that should not be there.
+            message += (
+                f", including {live:,} in runs still open "
+                f"({ledger.parent / openruns.OPEN_RUNS_FILE})"
+            )
+        return RollingCheck(spent, config.budget_tokens, message=message)
+    return RollingCheck(spent, config.budget_tokens, message=None)

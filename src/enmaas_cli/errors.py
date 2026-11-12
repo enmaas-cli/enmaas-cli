@@ -1,20 +1,30 @@
-"""Failures of a single request to the gateway.
+"""Failures of a single request to the gateway, and the exit codes of a command.
 
-Every class derives from CallError, so a caller can catch one type and still
-read the usage the reply reported. Tokens that were billed count against the
-budget even when the request failed.
+Every failure class derives from CallError, so a caller can catch one type
+and still read the usage the reply reported. Tokens that were billed count
+against the budget even when the request failed.
 """
 
 from __future__ import annotations
 
+import enum
 import traceback
 from pathlib import Path
 
 from .tokens import Usage
 
 
+class ExitCode(enum.IntEnum):
+    """How a command ended. Defined here, a leaf module, so every command module can use it."""
+
+    OK = 0
+    ERROR = 1
+    PARTIAL = 2
+    ABORTED = 3
+
+
 def where(exc: BaseException) -> str:
-    """Class name and the innermost frame: `TypeError at runner.py:123`. Never the exception text.
+    """Class name and innermost frame, as `TypeError at <file>:<line>`. Never the exception text.
 
     An error that no handler expected can carry any text, including part of
     a reply or a prompt, so only where it happened is reported. With no

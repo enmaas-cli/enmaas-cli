@@ -14,9 +14,9 @@ import httpx
 import pytest
 
 from enmaas_cli import dialect as dialect_module
-from enmaas_cli.cli import ExitCode, run_ask
+from enmaas_cli.ask import run_ask
 from enmaas_cli.dialect import Completion, parse_response
-from enmaas_cli.errors import BadReplyError, CallError
+from enmaas_cli.errors import BadReplyError, CallError, ExitCode
 from enmaas_cli.tokens import Usage
 
 OPENAI_USAGE = {"prompt_tokens": 11, "completion_tokens": 7}

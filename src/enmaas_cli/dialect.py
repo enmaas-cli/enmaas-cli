@@ -9,9 +9,10 @@ from typing import Any, Literal
 
 from .errors import BadReplyError, CallError, where
 
-# Re-exported so existing importers of these names from this module keep working.
+# Also importable from this module. test_errors.py checks that they are the
+# same objects as in errors.py and tokens.py.
 from .errors import EmptyResponseError as EmptyResponseError
-from .tokens import MAX_TOKEN_COUNT as MAX_TOKEN_COUNT
+from .tokens import MAX_TOKEN_COUNT
 from .tokens import Usage as Usage
 
 Dialect = Literal["anthropic", "openai"]
@@ -45,6 +46,9 @@ def resolve_dialect(model: str, override: Dialect | None = None) -> Dialect:
     )
 
 
+# Flat, with or without reasoning. Raising it for reasoning was measured not
+# to help: 32768 still produced zero text on a 45 KB prompt, it just took five
+# minutes to fail.
 DEFAULT_MAX_TOKENS = 8192
 
 # Measured 2026-10-24. No single knob is portable: chat_template_kwargs does not
@@ -105,17 +109,6 @@ class Request:
             f"Request(path={self.path!r}, headers={safe_headers!r}, "
             f"body={self.body!r}, warnings={self.warnings!r})"
         )
-
-
-def default_max_tokens(*, thinking: bool) -> int:
-    """Flat default.
-
-    Raising this for reasoning was measured not to help: 32768 still produced
-    zero text on a 45 KB prompt, it just took five minutes to fail. The
-    parameter is kept so callers need not special-case it.
-    """
-    del thinking  # Kept for API consistency but not used
-    return DEFAULT_MAX_TOKENS
 
 
 def thinking_off_payload(dialect: Dialect, model: str) -> tuple[dict[str, Any], str | None]:
@@ -269,9 +262,9 @@ def _count(value: object) -> int | None:
     """Return a token count only when it is an integer from 0 to MAX_TOKEN_COUNT.
 
     The gateway's usage numbers flow into error messages, receipts, the
-    --json object and the usage ledger. A string there was copied through
-    unchanged, so a 9,000 character value grew every one of those, and
-    "abc" was recorded as an input count. A bool is an int subclass in
+    --json object and the usage ledger. A string copied through unchanged
+    would make a 9,000 character value grow every one of those, and would
+    record "abc" as an input count. A bool is an int subclass in
     Python, so it is excluded by name. A value above the cap reads as not
     reported, the same as a negative one.
     """

@@ -10,19 +10,26 @@ import os
 import resource
 import secrets
 import stat
+from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from enmaas_cli.auth import printable
+from enmaas_cli.errors import ExitCode
 from enmaas_cli.pricing import (
     OPUS_REFERENCE,
     ModelPrice,
     cost_for,
     opus_equivalent,
 )
-from enmaas_cli.tokens import MAX_RECORDED
+from enmaas_cli.tokens import MAX_RECORDED, Usage
+
+if TYPE_CHECKING:  # pragma: no cover
+    # Types only: both modules reach this one through their own imports.
+    from enmaas_cli.ask import AskResult
+    from enmaas_cli.runner import MapOutcome
 
 
 @dataclass(frozen=True)
@@ -50,12 +57,104 @@ class UsageEvent:
     # the sum of the per-request clamps. Measured at 102 versus 12 on two
     # requests of (10 in, 100 cached) and (100 in, 0 cached).
     #
-    # Also the only field that sees requests which consumed tokens and
-    # then failed, since the counters above record successes only.
-    #
     # Optional because rows written before this field existed have none;
     # rolling_spend falls back to deriving one for those.
     charge: int | None = None
+
+
+def recorded_event(
+    *,
+    command: str,
+    model: str,
+    dialect: str,
+    usage: Usage,
+    elapsed: float,
+    status: Literal["ok", "error"],
+    error_kind: str | None,
+    charge: int,
+) -> UsageEvent:
+    """The event for a run this CLI did not make, from what `record` was told."""
+    return UsageEvent(
+        timestamp=datetime.now(UTC),
+        command=command,
+        model=model,
+        dialect=dialect,
+        input_tokens=usage.input_tokens,
+        cached_tokens=usage.cached_tokens,
+        output_tokens=usage.output_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        elapsed=elapsed,
+        status=status,
+        schema_used=False,
+        error_kind=error_kind,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
+        charge=charge,
+    )
+
+
+def ask_event(result: AskResult, *, schema_used: bool, charge: int) -> UsageEvent:
+    """The event for one `ask`. `charge` is the metered cost of its reply."""
+    usage = result.usage
+    return UsageEvent(
+        timestamp=datetime.now(UTC),
+        command="ask",
+        model=result.model,
+        dialect=result.dialect,
+        input_tokens=usage.input_tokens if usage else None,
+        cached_tokens=usage.cached_tokens if usage else None,
+        output_tokens=usage.output_tokens if usage else None,
+        reasoning_tokens=usage.reasoning_tokens if usage else None,
+        elapsed=result.elapsed,
+        status="ok" if result.exit_code == ExitCode.OK else "error",
+        schema_used=schema_used,
+        error_kind=result.error_kind,
+        items_total=None,
+        items_ok=None,
+        items_failed=None,
+        charge=charge,
+    )
+
+
+# The error kind a map event records for each reason a run can stop early.
+# Each reason has its own kind, so a budget stop is never filed as a
+# breaker trip. A run with failures that did not stop is PartialFailure.
+_MAP_STOP_KINDS = {
+    "breaker": "CircuitBreakerError",
+    "budget": "TokenBudgetExceeded",
+    "interrupted": "Interrupted",
+    "index": "IndexWriteError",
+}
+
+
+def map_event(outcome: MapOutcome, *, model: str, dialect: str, schema_used: bool) -> UsageEvent:
+    """The event for one `map` invocation."""
+    error_kind = None
+    if outcome.abort_reason is not None or outcome.failed > 0:
+        error_kind = _MAP_STOP_KINDS.get(outcome.abort_reason or "", "PartialFailure")
+    return UsageEvent(
+        timestamp=datetime.now(UTC),
+        command="map",
+        model=model,
+        dialect=dialect,
+        input_tokens=outcome.input_tokens,
+        cached_tokens=outcome.cached_tokens,
+        output_tokens=outcome.output_tokens,
+        reasoning_tokens=outcome.reasoning_tokens,
+        elapsed=outcome.elapsed,
+        status="error" if outcome.abort_reason is not None else "ok",
+        schema_used=schema_used,
+        error_kind=error_kind,
+        items_total=outcome.total,
+        items_ok=outcome.ok,
+        items_failed=outcome.failed,
+        # The sum of each request's metered charge. The token counts above
+        # count every reply too, failures included, but the charge cannot
+        # be derived from them: it is clamped per request, and clamping the
+        # sums gives a different number.
+        charge=outcome.charged,
+    )
 
 
 @dataclass(frozen=True)
@@ -309,11 +408,45 @@ def _is_text(value: object) -> bool:
     return isinstance(value, str) and len(value) <= MAX_TEXT_CHARS
 
 
+def _is_timestamp(value: object) -> bool:
+    """An ISO time with a time zone. A naive one raises when compared with the window cutoff."""
+    if not isinstance(value, str):
+        return False
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return moment.tzinfo is not None
+
+
+def _is_count(value: object) -> bool:
+    # bool is refused: it subclasses int, so True would pass as 1. Bounded
+    # so that sums stay printable.
+    if value is None:
+        return True
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_RECORDED
+
+
+# The checks a row must pass, in order, each with the reason a failure
+# reports. A row is a JSON object with string keys. Text is used as a
+# dictionary key and printed, and elapsed is summed, so a value of any other
+# type would raise in `enmaas usage`.
+_ROW_RULES: tuple[tuple[str, Callable[[dict[str, Any]], bool]], ...] = (
+    ("unknown field", lambda row: set(row) <= _FIELDS),
+    ("missing field", lambda row: set(row) >= _REQUIRED),
+    ("bad timestamp", lambda row: _is_timestamp(row["timestamp"])),
+    ("bad text field", lambda row: all(_is_text(row[name]) for name in _TEXT_FIELDS)),
+    ("bad text field", lambda row: row["error_kind"] is None or _is_text(row["error_kind"])),
+    ("bad elapsed", lambda row: _is_elapsed(row["elapsed"])),
+    ("bad count", lambda row: all(_is_count(row.get(name)) for name in _COUNT_FIELDS)),
+)
+
+
 def _event_from_row(data: object) -> UsageEvent:
     """Parse one ledger row, rejecting what must not be trusted.
 
-    Validation matters here in a way it did not when this was purely a
-    reporting path. A negative count subtracts from recorded spend, a
+    Validation matters here because a budget reads these rows, not only a
+    report. A negative count subtracts from recorded spend, a
     string count breaks the arithmetic downstream, and a timezone-naive
     timestamp raises when compared against an aware window cutoff. A
     budget that read any of those would be wrong rather than merely
@@ -321,42 +454,11 @@ def _event_from_row(data: object) -> UsageEvent:
     """
     if not isinstance(data, dict):
         raise RowError("not an object")
-    keys = set(data)
-    if not keys <= _FIELDS:
-        raise RowError("unknown field")
-    if not keys >= _REQUIRED:
-        raise RowError("missing field")
-
-    raw = data["timestamp"]
-    if not isinstance(raw, str):
-        raise RowError("bad timestamp")
-    try:
-        timestamp = datetime.fromisoformat(raw)
-    except ValueError:
-        raise RowError("bad timestamp") from None
-    if timestamp.tzinfo is None:
-        raise RowError("bad timestamp")
-
-    # Text is used as a dictionary key and printed, and elapsed is summed, so
-    # a value of any other type would raise in `enmaas usage`.
-    if not all(_is_text(data[name]) for name in _TEXT_FIELDS):
-        raise RowError("bad text field")
-    if data["error_kind"] is not None and not _is_text(data["error_kind"]):
-        raise RowError("bad text field")
-    if not _is_elapsed(data["elapsed"]):
-        raise RowError("bad elapsed")
-
-    for name in _COUNT_FIELDS:
-        count = data.get(name)
-        if count is None:
-            continue
-        # bool first: it subclasses int, so True would pass as 1. Bounded so
-        # that sums stay printable.
-        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= MAX_RECORDED:
-            raise RowError("bad count")
-
+    for reason, rule in _ROW_RULES:
+        if not rule(data):
+            raise RowError(reason)
     row = dict(data)
-    row.pop("timestamp")
+    timestamp = datetime.fromisoformat(row.pop("timestamp"))
     return UsageEvent(timestamp=timestamp, **row)
 
 
@@ -365,7 +467,7 @@ def _open_for_read(ledger: Path) -> int | None:
 
     Raises NotRegularFile for a link, a FIFO or any other path that is not a
     regular file. A FIFO would block the read until some other process
-    wrote to it, which hung every command that reads the ledger. The open
+    wrote to it, which would hang every command that reads the ledger. The open
     is nonblocking and the type is checked on the descriptor, so nothing
     waits. A link is refused because the writer never writes through one.
     """
@@ -507,46 +609,6 @@ def summarize_usage(events: list[UsageEvent]) -> UsageSummary:
     total_reasoning_tokens = sum(e.reasoning_tokens or 0 for e in events)
     total_elapsed = sum(e.elapsed for e in events)
 
-    by_model: dict[str, dict[str, int | float]] = {}
-    by_command: dict[str, dict[str, int | float]] = {}
-
-    for event in events:
-        # By model
-        if event.model not in by_model:
-            by_model[event.model] = {
-                "calls": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cached_tokens": 0,
-                "reasoning_tokens": 0,
-                "elapsed": 0.0,
-            }
-        model_stats = by_model[event.model]
-        model_stats["calls"] += 1
-        model_stats["input_tokens"] += event.input_tokens or 0
-        model_stats["output_tokens"] += event.output_tokens or 0
-        model_stats["cached_tokens"] += event.cached_tokens or 0
-        model_stats["reasoning_tokens"] += event.reasoning_tokens or 0
-        model_stats["elapsed"] += event.elapsed
-
-        # By command
-        if event.command not in by_command:
-            by_command[event.command] = {
-                "calls": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cached_tokens": 0,
-                "reasoning_tokens": 0,
-                "elapsed": 0.0,
-            }
-        cmd_stats = by_command[event.command]
-        cmd_stats["calls"] += 1
-        cmd_stats["input_tokens"] += event.input_tokens or 0
-        cmd_stats["output_tokens"] += event.output_tokens or 0
-        cmd_stats["cached_tokens"] += event.cached_tokens or 0
-        cmd_stats["reasoning_tokens"] += event.reasoning_tokens or 0
-        cmd_stats["elapsed"] += event.elapsed
-
     return UsageSummary(
         total_calls=total_calls,
         total_input_tokens=total_input_tokens,
@@ -554,9 +616,35 @@ def summarize_usage(events: list[UsageEvent]) -> UsageSummary:
         total_cached_tokens=total_cached_tokens,
         total_reasoning_tokens=total_reasoning_tokens,
         total_elapsed=total_elapsed,
-        by_model=by_model,
-        by_command=by_command,
+        by_model=_breakdown(events, lambda event: event.model),
+        by_command=_breakdown(events, lambda event: event.command),
     )
+
+
+def _breakdown(
+    events: list[UsageEvent], key: Callable[[UsageEvent], str]
+) -> dict[str, dict[str, int | float]]:
+    """Totals per value of `key`, in the order each value first appears."""
+    totals: dict[str, dict[str, int | float]] = {}
+    for event in events:
+        stats = totals.setdefault(
+            key(event),
+            {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "elapsed": 0.0,
+            },
+        )
+        stats["calls"] += 1
+        stats["input_tokens"] += event.input_tokens or 0
+        stats["output_tokens"] += event.output_tokens or 0
+        stats["cached_tokens"] += event.cached_tokens or 0
+        stats["reasoning_tokens"] += event.reasoning_tokens or 0
+        stats["elapsed"] += event.elapsed
+    return totals
 
 
 def format_summary(
@@ -655,8 +743,8 @@ def compute_costs(
     """Return (spend, unpriced models, Opus-equivalent).
 
     One computation behind both the text and the JSON renderings. Two
-    copies would drift, which is how a hand-maintained summary of this
-    very ledger went stale in the first place.
+    copies would drift apart, the way a summary of this ledger kept by
+    hand goes stale.
     """
     table = table or {}
     spend = 0.0

@@ -9,20 +9,20 @@ import stat
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
 from .auth import redact
 from .batching import PER_ITEM_MARKER, build_batch_prompt, split_batch_response, split_template
 from .budget import TokenBudget, charge_from_rows, metered
-from .client import call
+from .client import CallSettings, call
 from .dialect import (
+    DEFAULT_MAX_TOKENS,
     Dialect,
     build_request,
-    default_max_tokens,
     parse_response,
     resolve_dialect,
     thinking_off_payload,
@@ -30,10 +30,12 @@ from .dialect import (
 from .errors import CallError, where
 from .outputs import protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
-from .tokens import MAX_RECORDED
+from .tokens import MAX_RECORDED, Usage
 
-# ValidationError moved to .schema; re-exported so existing importers keep working.
-__all__ = ["ValidationError", "load_schema", "run_map", "validate_against_schema"]
+# Why a run stopped before its last item.
+AbortReason = Literal["breaker", "budget", "interrupted", "index"]
+# Which ceiling stopped a run.
+BudgetName = Literal["per_run", "rolling"]
 
 
 class CircuitBreaker:
@@ -309,11 +311,10 @@ class MapOutcome:
     skipped: int
     attempted: int
     total: int
-    # Not a bool. A second way to abort arrived with token budgets, and a
-    # receipt saying only "ABORTED" sends people hunting for failures that
-    # never happened. One of None, "breaker", "budget", "interrupted",
-    # "index".
-    abort_reason: str | None
+    # Not a bool. A run can stop for several reasons, and a receipt saying
+    # only "ABORTED" sends people hunting for failures that never happened.
+    # None when the run did not stop early.
+    abort_reason: AbortReason | None
     input_tokens: int
     output_tokens: int
     # Carried because caching is the largest cost lever on bulk work, and it
@@ -327,14 +328,13 @@ class MapOutcome:
     # The per-run budget's running total, job-wide when resumed. Not
     # derivable from input_tokens/cached_tokens above: clamping after
     # aggregation gives a different answer than summing per-request
-    # clamps, and those counters exclude requests that failed after
-    # consuming tokens. Defaulted so existing constructions still work.
+    # clamps.
     spent: int = 0
     # Which ceiling stopped the run: "per_run", "rolling" or None.
     # abort_reason only says "budget", which would make a rolling stop
     # look like the per-run flag and send the user to raise the wrong
     # number.
-    tripped_budget: str | None = None
+    tripped_budget: BudgetName | None = None
     # Exact tokens this invocation's requests cost, failures
     # included. What the ledger records, so the rolling window and
     # the charge rows cannot disagree.
@@ -365,6 +365,531 @@ class MapOutcome:
         return 0
 
 
+@dataclass(frozen=True)
+class MapJob:
+    """What one `map` invocation was asked to do."""
+
+    model: str
+    items_path: Path
+    template_path: Path
+    outdir: Path
+    concurrency: int
+    thinking: bool
+    max_tokens: int | None
+    dialect: Dialect | None
+    resume: bool
+    schema_file: Path | None = None
+    schema_name: str | None = None
+    batch: int | None = None
+    token_budget: int | None = None
+    rolling_budget: TokenBudget | None = None
+    run_id: str | None = None
+
+
+@dataclass
+class Tally:
+    """The counters of one invocation.
+
+    `charged` is the budget's running total: the sum of each request's
+    metered charge, failures included.
+
+    The four token counters add up every usage block the gateway returned,
+    whether or not the answer was usable, because every such reply was
+    billed. The budget still keeps its own total: a charge is clamped per
+    request, and clamping the sums gives a different number.
+    """
+
+    ok: int = 0
+    failed: int = 0
+    attempted: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+    charged: int = 0
+    internal: int = 0
+    failures: list[tuple[str, str]] = field(default_factory=list)
+
+    def add(self, result: SendResult) -> None:
+        """Count one request's rows and the usage its reply reported."""
+        if result.usage is not None:
+            self.input_tokens += result.usage.input_tokens or 0
+            self.output_tokens += result.usage.output_tokens or 0
+            self.cached_tokens += result.usage.cached_tokens or 0
+            self.reasoning_tokens += result.usage.reasoning_tokens or 0
+        for row in result.rows:
+            if row["status"] == "ok":
+                self.ok += 1
+            else:
+                self.failed += 1
+                self.failures.append((row["id"], row["error"]))
+        self.internal += result.internal
+
+
+@dataclass(frozen=True)
+class SendResult:
+    """What one request produced, ready to be recorded.
+
+    `rows` holds one index row per item, in item order. `usage` is the usage
+    the reply reported, or None when no reply arrived. `charge` is the
+    metered cost of the request, failures included.
+    `internal` counts the rows failed by an error no handler expected.
+    """
+
+    rows: list[dict[str, Any]]
+    usage: Usage | None
+    charge: int
+    internal: int = 0
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """A job after its inputs are read and checked, before any request."""
+
+    job: MapJob
+    items: list[dict[str, Any]]
+    pending: list[dict[str, Any]]
+    template: str
+    batch: int
+    preamble: str
+    per_item: str
+    schema: dict[str, Any] | None
+    dialect: Dialect
+    max_tokens: int
+
+
+@dataclass
+class _RunState:
+    """Everything `record` reads and changes while a run is in progress."""
+
+    index: Path
+    run_id: str | None
+    key: str
+    budget: TokenBudget | None
+    rolling_budget: TokenBudget | None
+    breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
+    tally: Tally = field(default_factory=Tally)
+    # The first cause wins, apart from "index" and "interrupted", which end
+    # the run however it was stopping.
+    abort_reason: AbortReason | None = None
+    tripped_budget: BudgetName | None = None
+    index_error: str | None = None
+
+
+def _error_row(item_id: str, message: str) -> dict[str, Any]:
+    return {"id": item_id, "status": "error", "path": None, "tokens": None, "error": message}
+
+
+def _failed(
+    ids: list[str], message: str, usage: Usage | None, *, internal: bool = False
+) -> SendResult:
+    """A request that failed as a whole. Every item in it fails with its message.
+
+    Attributing the error to each item keeps the breaker counting items. A
+    reply that arrived was billed, so its usage is still counted and
+    charged.
+    """
+    return SendResult(
+        rows=[_error_row(item_id, message) for item_id in ids],
+        usage=usage,
+        charge=metered(usage) if usage is not None else 0,
+        internal=len(ids) if internal else 0,
+    )
+
+
+async def send_single(
+    client: httpx.AsyncClient, settings: CallSettings, plan: _Plan, item: dict[str, Any]
+) -> SendResult:
+    """Send one item in its own request and write its answer."""
+    item_id = str(item["id"])
+    request = build_request(
+        model=plan.job.model,
+        prompt=render(plan.template, item),
+        dialect=plan.dialect,
+        max_tokens=plan.max_tokens,
+        thinking=plan.job.thinking,
+        system=None,
+        key=settings.key,
+        schema=plan.schema,
+        schema_name=plan.job.schema_name,
+    )
+    usage: Usage | None = None
+    try:
+        data = await call(
+            client,
+            settings.base_url,
+            request,
+            timeout=settings.timeout,
+            retries=settings.retries,
+            secret=settings.key,
+        )
+        completion = parse_response(data, plan.dialect)
+        # Kept before validation and the file write. A large answer a
+        # validator rejects still cost its tokens.
+        usage = completion.usage
+        if plan.schema is not None:
+            validate_against_schema(completion.text, plan.schema)
+        path = plan.job.outdir / f"{item_id}.md"
+        write_output(path, completion.text)
+    except (CallError, ValidationError, OSError) as exc:
+        if isinstance(exc, CallError):
+            # A failed request can still have been billed, for example
+            # reasoning that ate the budget and returned nothing. Count
+            # what the reply reported.
+            usage = exc.usage
+        return _failed([item_id], redact(str(exc), settings.key), usage)
+    except Exception as exc:
+        # One unexpected error fails this item only, so the rest of the run
+        # and its charge rows survive. `usage` keeps what it held when the
+        # error was raised.
+        return _failed([item_id], _internal_message(exc), usage, internal=True)
+    row = {
+        "id": item_id,
+        "status": "ok",
+        "path": str(path),
+        "tokens": {
+            "in": completion.usage.input_tokens,
+            "out": completion.usage.output_tokens,
+        },
+        # Only present when the answer had to be altered to be writable. A
+        # bulk run prints no per-item receipt, so without this the repair
+        # would leave no trace.
+        **({"replaced": completion.replaced} if completion.replaced else {}),
+        "error": None,
+    }
+    return SendResult(rows=[row], usage=usage, charge=metered(completion.usage))
+
+
+def _batch_item(
+    plan: _Plan, item_id: str, text: str | None, *, size: int, replaced: int, key: str
+) -> tuple[dict[str, Any], bool]:
+    """Check and write one answer of a batched reply.
+
+    Returns the item's row and whether it failed on an unexpected error.
+    """
+    if text is None:
+        # Not ok. A missing output file that nothing flags would be skipped
+        # forever by --resume.
+        return _error_row(item_id, f"no answer for {item_id} in the batched reply"), False
+    try:
+        if plan.schema is not None:
+            validate_against_schema(text, plan.schema)
+        path = plan.job.outdir / f"{item_id}.md"
+        write_output(path, text)
+    except (ValidationError, OSError) as exc:
+        return _error_row(item_id, redact(str(exc), key)), False
+    except Exception as exc:
+        return _error_row(item_id, _internal_message(exc)), True
+    row = {
+        "id": item_id,
+        "status": "ok",
+        "path": str(path),
+        "tokens": None,
+        "batch_size": size,
+        # Request-level, not item-level: one reply covered the whole group
+        # and was repaired before it could be split, so the count cannot be
+        # attributed to a single item.
+        **({"replaced_in_request": replaced} if replaced else {}),
+        "error": None,
+    }
+    return row, False
+
+
+async def send_batch(
+    client: httpx.AsyncClient, settings: CallSettings, plan: _Plan, group: list[dict[str, Any]]
+) -> SendResult:
+    """Send several items in one request. Answers are matched back by id."""
+    ids = [str(i["id"]) for i in group]
+    request = build_request(
+        model=plan.job.model,
+        prompt=build_batch_prompt(plan.preamble, plan.per_item, group),
+        dialect=plan.dialect,
+        max_tokens=plan.max_tokens * len(group),
+        thinking=plan.job.thinking,
+        system=None,
+        key=settings.key,
+        schema=None,
+        schema_name=None,
+    )
+    usage: Usage | None = None
+    try:
+        data = await call(
+            client,
+            settings.base_url,
+            request,
+            timeout=settings.timeout,
+            retries=settings.retries,
+            secret=settings.key,
+        )
+        completion = parse_response(data, plan.dialect)
+        # Before split_batch_response, so a reply this group cannot be split
+        # out of is still counted and charged.
+        usage = completion.usage
+        answers = split_batch_response(completion.text, ids)
+    except (CallError, ValidationError, OSError) as exc:
+        if isinstance(exc, CallError):
+            usage = exc.usage
+        return _failed(ids, redact(str(exc), settings.key), usage)
+    except Exception as exc:
+        # An unexpected error fails this group only. `usage` keeps what it
+        # held when the error was raised.
+        return _failed(ids, _internal_message(exc), usage, internal=True)
+    rows: list[dict[str, Any]] = []
+    internal = 0
+    for item_id in ids:
+        row, unexpected = _batch_item(
+            plan,
+            item_id,
+            answers.get(item_id),
+            size=len(group),
+            replaced=completion.replaced,
+            key=settings.key,
+        )
+        rows.append(row)
+        internal += int(unexpected)
+    return SendResult(rows=rows, usage=usage, charge=metered(completion.usage), internal=internal)
+
+
+def _index_failed(run: _RunState, exc: OSError, charge: int) -> None:
+    """End the run in order after the index could not be written.
+
+    The request was billed, so its charge counts toward the ledger event
+    and both budgets. Requests still waiting for the semaphore see the
+    abort reason and return without sending, because a request that cannot
+    be recorded must not be sent.
+    """
+    run.abort_reason = "index"
+    run.tripped_budget = None
+    if run.index_error is None:
+        run.index_error = redact(str(exc), run.key)
+    for limit in (run.budget, run.rolling_budget):
+        if limit is not None:
+            limit.record(charge)
+
+
+def _charge_budgets(run: _RunState, charge: int) -> None:
+    """Add a charge to both budgets. Either one is sufficient to stop the run.
+
+    The `abort_reason is None` guard makes the first cause win. Without it
+    a run that tripped the breaker and then went over budget would report
+    "budget", hiding the more actionable failure. Nothing here awaits, so
+    no other request can run between these statements.
+    """
+    limits: tuple[tuple[BudgetName, TokenBudget | None], ...] = (
+        ("per_run", run.budget),
+        ("rolling", run.rolling_budget),
+    )
+    for name, limit in limits:
+        if limit is not None:
+            limit.record(charge)
+            if limit.should_abort() and run.abort_reason is None:
+                run.abort_reason = "budget"
+                run.tripped_budget = name
+
+
+def record(run: _RunState, result: SendResult) -> None:
+    """Record one request: index rows, counters, breaker, budgets, the stop reason.
+
+    Synchronous on purpose. Nothing awaits between the reply arriving and
+    these rows being written, so a cancel cannot separate an answer file
+    from its rows. An await added here would break that.
+    """
+    run.tally.add(result)
+    run.tally.charged += result.charge
+    try:
+        # One append per request, charge row first. If the process dies
+        # mid-write, an orphaned charge row over-counts, which is safe, while
+        # an item row whose charge never landed lets a resumed run spend that
+        # budget twice. One charge row per request, not per item: a group is
+        # one call, and batched item rows carry "tokens": None.
+        _append_index(
+            run.index,
+            _charge_row(result.charge, items=len(result.rows), run=run.run_id)
+            + "\n"
+            + "".join(json.dumps(row) + "\n" for row in result.rows),
+        )
+    except OSError as exc:
+        _index_failed(run, exc, result.charge)
+        return
+    for row in result.rows:
+        run.breaker.record(ok=row["status"] == "ok")
+    if run.breaker.should_abort() and run.abort_reason is None:
+        run.abort_reason = "breaker"
+    _charge_budgets(run, result.charge)
+
+
+def _pending(job: MapJob, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The items still to send, each answer file marked protected first."""
+    skips = resume_skips(job.outdir) if job.resume else set()
+    pending = [i for i in items if str(i["id"]) not in skips]
+    for item in pending:
+        target = job.outdir / f"{item['id']}.md"
+        # A link here would stop the whole run before any request. Leave it
+        # unprotected; write_output refuses it later and only that item fails.
+        if not target.is_symlink():
+            protect(target)
+    return pending
+
+
+def _warn_thinking_off(job: MapJob, dialect: Dialect) -> None:
+    """Print the note about turning reasoning off once per run.
+
+    build_request computes the same note per request, but a bulk run would
+    print it once per group.
+    """
+    if job.thinking:
+        return
+    _, note = thinking_off_payload(dialect, job.model)
+    if note is not None:
+        print(f"warning: {note}", file=sys.stderr)
+
+
+def _prepare(job: MapJob) -> _Plan:
+    """Read and check every input before any request is sent."""
+    items = load_items(job.items_path)
+    template = job.template_path.read_text(encoding="utf-8")
+    validate_all(template, items)
+    batch = job.batch
+    if batch is None:
+        # The marker is the template author's declaration that the template
+        # is batch-safe. Without it, one item per call is the only shape
+        # that is known to work.
+        batch = 10 if PER_ITEM_MARKER in template else 1
+    # Split once, up front. A template that cannot be batched should fail
+    # before any request, not after the first group has been paid for.
+    preamble, per_item = split_template(template) if batch > 1 else ("", "")
+    schema = load_schema(job.schema_file) if job.schema_file is not None else None
+    job.outdir.mkdir(parents=True, exist_ok=True)
+    # Before resume reads the index and before any request is sent.
+    _check_index(job.outdir / "results.jsonl")
+    pending = _pending(job, items)
+    dialect = resolve_dialect(job.model, job.dialect)
+    _warn_thinking_off(job, dialect)
+    return _Plan(
+        job=job,
+        items=items,
+        pending=pending,
+        template=template,
+        batch=batch,
+        preamble=preamble,
+        per_item=per_item,
+        schema=schema,
+        dialect=dialect,
+        max_tokens=job.max_tokens or DEFAULT_MAX_TOKENS,
+    )
+
+
+def _start(job: MapJob, key: str, prior_spend: int) -> _RunState:
+    """The state of a run before its first request, both ceilings checked.
+
+    The per-run budget is seeded from the charge rows of earlier
+    invocations, so the ceiling belongs to the job rather than to one
+    command. Resetting it per run would make the cap bypassable by
+    pressing up-arrow and Enter. Checking both ceilings here keeps an
+    already-exhausted budget from paying for one request per concurrency
+    slot before noticing.
+    """
+    budget = TokenBudget(job.token_budget, spent=prior_spend) if job.token_budget else None
+    run = _RunState(
+        index=job.outdir / "results.jsonl",
+        run_id=job.run_id,
+        key=key,
+        budget=budget,
+        rolling_budget=job.rolling_budget,
+    )
+    limits: tuple[tuple[BudgetName, TokenBudget | None], ...] = (
+        ("per_run", budget),
+        ("rolling", job.rolling_budget),
+    )
+    for name, limit in limits:
+        if limit is not None and limit.should_abort():
+            run.abort_reason = "budget"
+            run.tripped_budget = name
+            break
+    return run
+
+
+async def _schedule(
+    client: httpx.AsyncClient, settings: CallSettings, plan: _Plan, run: _RunState
+) -> None:
+    """Send every pending item, at most `concurrency` requests at a time.
+
+    The send mode comes from the run's batch setting, never from the size
+    of a group: a last group of one in a batched run is still batched.
+    """
+    semaphore = asyncio.Semaphore(plan.job.concurrency)
+    size = plan.batch
+
+    async def send(group: list[dict[str, Any]]) -> None:
+        async with semaphore:
+            if run.abort_reason is not None:
+                return
+            run.tally.attempted += len(group)
+            if size > 1:
+                result = await send_batch(client, settings, plan, group)
+            else:
+                result = await send_single(client, settings, plan, group[0])
+            record(run, result)
+
+    if size > 1:
+        groups = [plan.pending[n : n + size] for n in range(0, len(plan.pending), size)]
+    else:
+        groups = [[item] for item in plan.pending]
+    try:
+        await asyncio.gather(*(send(group) for group in groups))
+    except asyncio.CancelledError:
+        # The stop arrived by signal. Rows already written are complete,
+        # because recording never awaits, so the counts are final here.
+        # Requests still in flight are dropped and not recorded. This reason
+        # replaces any earlier one, because the process is about to end by
+        # the signal.
+        run.abort_reason = "interrupted"
+        run.tripped_budget = None
+
+
+def _outcome(plan: _Plan, run: _RunState, prior_spend: int, elapsed: float) -> MapOutcome:
+    tally = run.tally
+    rolling = run.rolling_budget
+    return MapOutcome(
+        ok=tally.ok,
+        failed=tally.failed,
+        skipped=len(plan.items) - len(plan.pending),
+        attempted=tally.attempted,
+        total=len(plan.items),
+        abort_reason=run.abort_reason,
+        tripped_budget=run.tripped_budget,
+        charged=tally.charged,
+        rolling_spent=rolling.spent if rolling is not None else None,
+        # Job-wide either way. Without a ceiling there is no accumulator to
+        # read, so add this invocation's charge to what earlier ones left in
+        # the index rather than reporting only what this run spent.
+        spent=run.budget.spent if run.budget is not None else prior_spend + tally.charged,
+        input_tokens=tally.input_tokens,
+        output_tokens=tally.output_tokens,
+        cached_tokens=tally.cached_tokens,
+        reasoning_tokens=tally.reasoning_tokens,
+        elapsed=elapsed,
+        outdir=plan.job.outdir,
+        failures=tally.failures,
+        batch=plan.batch,
+        internal_errors=tally.internal,
+        index_error=run.index_error if run.abort_reason == "index" else None,
+    )
+
+
+async def run_job(client: httpx.AsyncClient, settings: CallSettings, job: MapJob) -> MapOutcome:
+    """Set up a map run, send its items and report the outcome."""
+    plan = _prepare(job)
+    # Read once and reused: it seeds the per-run budget and feeds the
+    # reported total, so a resumed run without a ceiling still tells the
+    # truth about the job.
+    prior_spend = spent_tokens(job.outdir) if job.resume else 0
+    run = _start(job, settings.key, prior_spend)
+    started = time.monotonic()
+    await _schedule(client, settings, plan, run)
+    return _outcome(plan, run, prior_spend, time.monotonic() - started)
+
+
 async def run_map(
     *,
     client: httpx.AsyncClient,
@@ -388,455 +913,23 @@ async def run_map(
     rolling_budget: TokenBudget | None = None,
     run_id: str | None = None,
 ) -> MapOutcome:
-    items = load_items(items_path)
-    template = template_path.read_text(encoding="utf-8")
-    validate_all(template, items)
-    # Split once, up front. A template that cannot be batched should fail
-    # before any request, not after the first group has been paid for.
-    if batch is None:
-        # The marker is the template author's declaration that the
-        # template is batch-safe. Without it, one item per call is the
-        # only shape that is known to work.
-        batch = 10 if PER_ITEM_MARKER in template else 1
-    preamble, per_item = split_template(template) if batch > 1 else ("", "")
-
-    schema = load_schema(schema_file) if schema_file is not None else None
-
-    outdir.mkdir(parents=True, exist_ok=True)
-    index = outdir / "results.jsonl"
-    # Before resume reads the index and before any request is sent.
-    _check_index(index)
-    skips = resume_skips(outdir) if resume else set()
-    pending = [i for i in items if str(i["id"]) not in skips]
-    for item in pending:
-        target = outdir / f"{item['id']}.md"
-        # A link here would stop the whole run before any request. Leave it
-        # unprotected; write_output refuses it later and only that item fails.
-        if target.is_symlink():
-            continue
-        protect(target)
-
-    resolved = resolve_dialect(model, dialect)
-    if not thinking:
-        # Printed once here. build_request computes the same note per
-        # request, but a bulk run would print it per group, and ask is
-        # the only path that printed it at all.
-        _, note = thinking_off_payload(resolved, model)
-        if note is not None:
-            print(f"warning: {note}", file=sys.stderr)
-    tokens = max_tokens or default_max_tokens(thinking=thinking)
-    breaker = CircuitBreaker()
-    semaphore = asyncio.Semaphore(concurrency)
-    abort_reason: str | None = None
-    # Seeded from the charge rows of earlier invocations, so the ceiling
-    # belongs to the job rather than to one command. Resetting it per run
-    # would make the cap bypassable by pressing up-arrow and Enter.
-    # Read once and reuse: it also feeds the reported total below, so a
-    # resumed run without a ceiling still tells the truth about the job.
-    prior_spend = spent_tokens(outdir) if resume else 0
-    budget = TokenBudget(token_budget, spent=prior_spend) if token_budget else None
-    # Both ceilings, checked before anything is sent. Omitting the rolling
-    # one here would let an already-exhausted budget still pay for one
-    # request per concurrency slot before noticing.
-    tripped_budget: str | None = None
-    for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
-        if limit is not None and limit.should_abort():
-            abort_reason = "budget"
-            tripped_budget = name
-            break
-    started = time.monotonic()
-    # "charge" is the budget's running total, counted uniformly: every
-    # request that consumed tokens, including ones that then failed.
-    #
-    # in/out/cached/reasoning are not that, and are not consistent either.
-    # The batched path adds them before per-item validation while the
-    # single-item path adds them after, so a schema-rejected response is
-    # counted by one and not the other. That predates budgets and is left
-    # alone here; it is the reason the budget keeps its own total rather
-    # than deriving one from these.
-    counts = {
-        "ok": 0,
-        "failed": 0,
-        "attempted": 0,
-        "in": 0,
-        "out": 0,
-        "cached": 0,
-        "reasoning": 0,
-        "charge": 0,
-        "internal": 0,
-    }
-    failures: list[tuple[str, str]] = []
-    index_error: str | None = None
-
-    def index_failed(exc: OSError, charge: int) -> None:
-        """End the run in order after the index could not be written.
-
-        The request was billed, so its charge counts toward the ledger event
-        and both budgets. Tasks still waiting for the semaphore see the
-        abort reason and return without sending, because a request that
-        cannot be recorded must not be sent.
-        """
-        nonlocal abort_reason, tripped_budget, index_error
-        abort_reason = "index"
-        tripped_budget = None
-        if index_error is None:
-            index_error = redact(str(exc), key)
-        counts["charge"] += charge
-        for limit in (budget, rolling_budget):
-            if limit is not None:
-                limit.record(charge)
-
-    async def process(item: dict[str, Any]) -> None:
-        nonlocal abort_reason, tripped_budget
-        item_id = str(item["id"])
-        async with semaphore:
-            if abort_reason is not None:
-                return
-            counts["attempted"] += 1
-            request = build_request(
-                model=model,
-                prompt=render(template, item),
-                dialect=resolved,
-                max_tokens=tokens,
-                thinking=thinking,
-                system=None,
-                key=key,
-                schema=schema,
-                schema_name=schema_name,
-            )
-            row: dict[str, Any]
-            # Charged tokens, tracked separately from `counts` because this
-            # must include requests that cost money and then failed.
-            charge = 0
-            try:
-                data = await call(
-                    client, base_url, request, timeout=timeout, retries=retries, secret=key
-                )
-                completion = parse_response(data, resolved)
-                # Charge before validation and the file write. A large
-                # response a validator rejects still cost its tokens, and
-                # the batch path below already accounts at this point.
-                charge = metered(completion.usage)
-                if schema is not None:
-                    validate_against_schema(completion.text, schema)
-                path = outdir / f"{item_id}.md"
-                write_output(path, completion.text)
-                counts["in"] += completion.usage.input_tokens or 0
-                counts["out"] += completion.usage.output_tokens or 0
-                counts["cached"] += completion.usage.cached_tokens or 0
-                counts["reasoning"] += completion.usage.reasoning_tokens or 0
-                row = {
-                    "id": item_id,
-                    "status": "ok",
-                    "path": str(path),
-                    "tokens": {
-                        "in": completion.usage.input_tokens,
-                        "out": completion.usage.output_tokens,
-                    },
-                    # Only present when the response had to be altered to
-                    # be writable. A bulk run prints no per-item receipt,
-                    # so without this the repair would leave no trace.
-                    **({"replaced": completion.replaced} if completion.replaced else {}),
-                    "error": None,
-                }
-                counts["ok"] += 1
-                ok = True
-            except (CallError, ValidationError, OSError) as exc:
-                if isinstance(exc, CallError):
-                    # A failed request can still have been billed, for
-                    # example reasoning that ate the budget and returned
-                    # nothing. Charge what the reply reported.
-                    charge = metered(exc.usage)
-                message = redact(str(exc), key)
-                row = {
-                    "id": item_id,
-                    "status": "error",
-                    "path": None,
-                    "tokens": None,
-                    "error": message,
-                }
-                failures.append((item_id, message))
-                counts["failed"] += 1
-                ok = False
-            except Exception as exc:
-                # One unexpected error fails this item only, so the rest of
-                # the run and its charge rows survive. `charge` keeps what it
-                # held when the error was raised.
-                message = _internal_message(exc)
-                row = {
-                    "id": item_id,
-                    "status": "error",
-                    "path": None,
-                    "tokens": None,
-                    "error": message,
-                }
-                failures.append((item_id, message))
-                counts["failed"] += 1
-                counts["internal"] += 1
-                ok = False
-
-            # Nothing awaits between the reply arriving and these rows being
-            # written, so a cancel cannot separate an answer file from its
-            # rows. An await added here would break that.
-            try:
-                # Charge first. If the process dies mid-write, the asymmetry
-                # matters: an orphaned charge row over-counts, which is safe,
-                # while an item row whose charge never landed lets a resumed
-                # run spend that budget twice.
-                _append_index(
-                    index,
-                    _charge_row(charge, items=1, run=run_id) + "\n" + json.dumps(row) + "\n",
-                )
-            except OSError as exc:
-                index_failed(exc, charge)
-                return
-            counts["charge"] += charge
-            breaker.record(ok=ok)
-            if breaker.should_abort() and abort_reason is None:
-                abort_reason = "breaker"
-            # Both budgets, one block, written identically in both
-            # execution paths so they cannot drift. Either is
-            # sufficient to stop the run, the way the breaker carries
-            # two independent signals.
-            #
-            # The `abort_reason is None` guard makes first cause win.
-            # Without it a run that tripped the breaker and then went
-            # over budget would report "budget", hiding the more
-            # actionable failure. This is not a data race: asyncio
-            # coroutines do not interleave between these statements,
-            # because nothing here awaits. It is overwrite policy.
-            for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
-                if limit is not None:
-                    limit.record(charge)
-                    if limit.should_abort() and abort_reason is None:
-                        abort_reason = "budget"
-                        tripped_budget = name
-
-    async def process_batch(group: list[dict[str, Any]]) -> None:
-        """One call covering several items, answers matched back by id."""
-        nonlocal abort_reason, tripped_budget
-        ids = [str(i["id"]) for i in group]
-        async with semaphore:
-            if abort_reason is not None:
-                return
-            counts["attempted"] += len(group)
-            request = build_request(
-                model=model,
-                prompt=build_batch_prompt(preamble, per_item, group),
-                dialect=resolved,
-                max_tokens=tokens * len(group),
-                thinking=thinking,
-                system=None,
-                key=key,
-                schema=None,
-                schema_name=None,
-            )
-            rows: list[dict[str, Any]] = []
-            charge = 0
-            try:
-                data = await call(
-                    client, base_url, request, timeout=timeout, retries=retries, secret=key
-                )
-                completion = parse_response(data, resolved)
-                # Before split_batch_response, so a reply this group cannot
-                # be split out of is still charged.
-                charge = metered(completion.usage)
-                answers = split_batch_response(completion.text, ids)
-                counts["in"] += completion.usage.input_tokens or 0
-                counts["out"] += completion.usage.output_tokens or 0
-                counts["cached"] += completion.usage.cached_tokens or 0
-                counts["reasoning"] += completion.usage.reasoning_tokens or 0
-            except (CallError, ValidationError, OSError) as exc:
-                # The call failed, so every item in it failed. Attributing
-                # the error to each one keeps the breaker counting items.
-                if isinstance(exc, CallError):
-                    charge = metered(exc.usage)
-                message = redact(str(exc), key)
-                answers = {}
-                for item_id in ids:
-                    rows.append(
-                        {
-                            "id": item_id,
-                            "status": "error",
-                            "path": None,
-                            "tokens": None,
-                            "error": message,
-                        }
-                    )
-                    failures.append((item_id, message))
-                    counts["failed"] += 1
-            except Exception as exc:
-                # An unexpected error fails this group only. `charge` keeps
-                # what it held when the error was raised.
-                message = _internal_message(exc)
-                answers = {}
-                for item_id in ids:
-                    rows.append(
-                        {
-                            "id": item_id,
-                            "status": "error",
-                            "path": None,
-                            "tokens": None,
-                            "error": message,
-                        }
-                    )
-                    failures.append((item_id, message))
-                    counts["failed"] += 1
-                    counts["internal"] += 1
-
-            for item_id in ids:
-                if any(r["id"] == item_id for r in rows):
-                    continue
-                text = answers.get(item_id)
-                if text is None:
-                    # Not ok. A missing output file that nothing flags would
-                    # be skipped forever by --resume.
-                    message = f"no answer for {item_id} in the batched reply"
-                    rows.append(
-                        {
-                            "id": item_id,
-                            "status": "error",
-                            "path": None,
-                            "tokens": None,
-                            "error": message,
-                        }
-                    )
-                    failures.append((item_id, message))
-                    counts["failed"] += 1
-                    continue
-                try:
-                    if schema is not None:
-                        validate_against_schema(text, schema)
-                    path = outdir / f"{item_id}.md"
-                    write_output(path, text)
-                except (ValidationError, OSError) as exc:
-                    message = redact(str(exc), key)
-                    rows.append(
-                        {
-                            "id": item_id,
-                            "status": "error",
-                            "path": None,
-                            "tokens": None,
-                            "error": message,
-                        }
-                    )
-                    failures.append((item_id, message))
-                    counts["failed"] += 1
-                    continue
-                except Exception as exc:
-                    message = _internal_message(exc)
-                    rows.append(
-                        {
-                            "id": item_id,
-                            "status": "error",
-                            "path": None,
-                            "tokens": None,
-                            "error": message,
-                        }
-                    )
-                    failures.append((item_id, message))
-                    counts["failed"] += 1
-                    counts["internal"] += 1
-                    continue
-                rows.append(
-                    {
-                        "id": item_id,
-                        "status": "ok",
-                        "path": str(path),
-                        "tokens": None,
-                        "batch_size": len(group),
-                        # Request-level, not item-level: one reply
-                        # covered the whole group and was repaired
-                        # before it could be split, so the count
-                        # cannot be attributed to a single item.
-                        **(
-                            {"replaced_in_request": completion.replaced}
-                            if completion.replaced
-                            else {}
-                        ),
-                        "error": None,
-                    }
-                )
-                counts["ok"] += 1
-
-            # Nothing awaits between the reply arriving and these rows being
-            # written, so a cancel cannot separate an answer file from its
-            # rows. An await added here would break that.
-            try:
-                # One charge row per request, not per item: the group was one
-                # call. Per-item rows carry "tokens": None here, which is why
-                # the budget cannot be rebuilt from them. Written first, so a
-                # crash over-counts rather than letting a resumed run respend
-                # the group's budget.
-                _append_index(
-                    index,
-                    _charge_row(charge, items=len(group), run=run_id)
-                    + "\n"
-                    + "".join(json.dumps(row) + "\n" for row in rows),
-                )
-            except OSError as exc:
-                index_failed(exc, charge)
-                return
-            counts["charge"] += charge
-            for row in rows:
-                breaker.record(ok=row["status"] == "ok")
-            if breaker.should_abort() and abort_reason is None:
-                abort_reason = "breaker"
-            # Both budgets, one block, written identically in both
-            # execution paths so they cannot drift. Either is
-            # sufficient to stop the run, the way the breaker carries
-            # two independent signals.
-            #
-            # The `abort_reason is None` guard makes first cause win.
-            # Without it a run that tripped the breaker and then went
-            # over budget would report "budget", hiding the more
-            # actionable failure. This is not a data race: asyncio
-            # coroutines do not interleave between these statements,
-            # because nothing here awaits. It is overwrite policy.
-            for name, limit in (("per_run", budget), ("rolling", rolling_budget)):
-                if limit is not None:
-                    limit.record(charge)
-                    if limit.should_abort() and abort_reason is None:
-                        abort_reason = "budget"
-                        tripped_budget = name
-
-    try:
-        if batch > 1:
-            groups = [pending[n : n + batch] for n in range(0, len(pending), batch)]
-            await asyncio.gather(*(process_batch(g) for g in groups))
-        else:
-            await asyncio.gather(*(process(item) for item in pending))
-    except asyncio.CancelledError:
-        # The stop arrived by signal. Rows already written are complete,
-        # because recording never awaits, so the counts are final here.
-        # Requests still in flight are dropped and not recorded. This
-        # reason replaces any earlier one, because the process is about
-        # to end by the signal.
-        abort_reason = "interrupted"
-        tripped_budget = None
-
-    return MapOutcome(
-        ok=counts["ok"],
-        failed=counts["failed"],
-        skipped=len(items) - len(pending),
-        attempted=counts["attempted"],
-        total=len(items),
-        abort_reason=abort_reason,
-        tripped_budget=tripped_budget,
-        charged=counts["charge"],
-        rolling_spent=rolling_budget.spent if rolling_budget is not None else None,
-        # Job-wide either way. Without a ceiling there is no accumulator to
-        # read, so add this invocation's charge to what earlier ones left
-        # in the index rather than reporting only what this run spent.
-        spent=budget.spent if budget is not None else prior_spend + counts["charge"],
-        input_tokens=counts["in"],
-        output_tokens=counts["out"],
-        cached_tokens=counts["cached"],
-        reasoning_tokens=counts["reasoning"],
-        elapsed=time.monotonic() - started,
+    """run_job with its settings and job given as keyword arguments."""
+    settings = CallSettings(base_url=base_url, key=key, timeout=timeout, retries=retries)
+    job = MapJob(
+        model=model,
+        items_path=items_path,
+        template_path=template_path,
         outdir=outdir,
-        failures=failures,
+        concurrency=concurrency,
+        thinking=thinking,
+        max_tokens=max_tokens,
+        dialect=dialect,
+        resume=resume,
+        schema_file=schema_file,
+        schema_name=schema_name,
         batch=batch,
-        internal_errors=counts["internal"],
-        index_error=index_error if abort_reason == "index" else None,
+        token_budget=token_budget,
+        rolling_budget=rolling_budget,
+        run_id=run_id,
     )
+    return await run_job(client, settings, job)

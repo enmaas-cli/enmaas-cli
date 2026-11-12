@@ -1,0 +1,20 @@
+=== exit 3
+=== stdout
+{
+  "status": "refused",
+  "abort_reason": "budget",
+  "budget": {
+    "per_run": null,
+    "rolling": {
+      "ceiling": 100,
+      "spent": 500
+    },
+    "tripped": "rolling"
+  },
+  "error": "500 of 100 tokens spent in the last 7 days"
+}
+
+=== stderr
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 400, "cached_tokens": 0, "output_tokens": 100, "reasoning_tokens": 0, "elapsed": <ELAPSED>, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 500}

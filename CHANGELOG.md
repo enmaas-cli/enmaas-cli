@@ -212,6 +212,19 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `models`, `ask` and `map` refuse a gateway URL with an empty port, such as
+  `https://host:`, with `gateway URL is not valid (empty port)`. Before, the
+  URL was used as typed. The installer already refused it.
+- The token totals of a `map` run count every usage block the gateway
+  returned. The totals in the receipt, in `map --json` and in the ledger event
+  now also count replies that were cut off, replies that could not be read,
+  answers that failed validation and answers that could not be written, for
+  items sent alone and for batched requests. The charge, the budgets and the
+  exit codes did not change.
+- An invalid value in `dialect_overrides` is now reported when the config
+  loads, so `models`, `ask` and `map` all print the warning, with the same
+  wording as before. Before, only an `ask` or `map` of that model without
+  `--dialect` printed it.
 - `map --json` has a new `internal_errors` field, and the `map` receipt shows an
   `internal` line when it is above zero. Those items are already counted in
   `failed`. Please report them.
