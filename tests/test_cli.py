@@ -1,16 +1,27 @@
-import json
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
+"""Tests for the cli module: the parser, helpers and the checks before a request."""
 
+import json
+import sys
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
 import pytest
 
 from enmaas_cli.budget import rolling_check
 from enmaas_cli.cli import (
+    _resolve_dialect_override,
+    _resolve_model,
     assemble_prompt,
     build_parser,
+    main,
     resolve_thinking,
+    run_models,
 )
-from enmaas_cli.config import Config
+from enmaas_cli.config import Config, load_config
 from enmaas_cli.errors import ExitCode
 
 
@@ -228,3 +239,167 @@ def test_disabled_logging_blocks_a_configured_budget(
     assert "ENMAAS_NO_USAGE_LOG" in message
     # Without a budget it is merely a preference, so it must not block.
     assert rolling_check(Config(), ledger).message is None
+
+
+# Model and dialect resolution shared by ask and map.
+
+
+def test_explicit_model_wins() -> None:
+    model, defaulted = _resolve_model("gpt-6-sol", Config())
+    assert model == "gpt-6-sol"
+    assert defaulted is False
+
+
+def test_missing_model_uses_config_default() -> None:
+    # Not the built-in default: a resolver that ignored config and
+    # hardcoded GLM would pass otherwise.
+    cfg = Config(default_model="claude-haiku-5-5")
+    model, defaulted = _resolve_model(None, cfg)
+    assert model == "claude-haiku-5-5"
+    assert defaulted is True
+
+
+def test_dialect_flag_wins_over_override() -> None:
+    cfg = Config(dialect_overrides={"m": "anthropic"})
+    assert _resolve_dialect_override("m", "openai", cfg) == "openai"
+
+
+def test_dialect_override_applies_when_flag_absent() -> None:
+    cfg = Config(dialect_overrides={"m": "anthropic"})
+    assert _resolve_dialect_override("m", None, cfg) == "anthropic"
+
+
+def test_invalid_override_is_ignored_with_warning(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[dialect_overrides]\nm = "cobol"\n', encoding="utf-8")
+    cfg = load_config(path)
+    assert _resolve_dialect_override("m", None, cfg) is None
+    assert cfg.warnings == ["invalid dialect override 'cobol' for m, ignoring"]
+
+
+def test_invalid_override_is_reported_when_the_config_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The warning comes before the gateway URL is resolved, so it is printed
+    # even though the command stops there and never resolves a dialect.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("ENMAAS_BASE_URL", raising=False)
+    path = tmp_path / "config.toml"
+    path.write_text('[dialect_overrides]\nm = "cobol"\n', encoding="utf-8")
+    assert main(["--config", str(path), "ask", "-m", "m", "--dialect", "openai", "-p", "hi"]) == 1
+    err = capsys.readouterr().err.splitlines()
+    assert err[0] == "warning: invalid dialect override 'cobol' for m, ignoring"
+
+
+# Tests for numeric flag validation.
+
+
+def test_timeout_zero_exits_1() -> None:
+    """--timeout 0 should exit 1 with a message."""
+    parser = build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["ask", "-p", "hi", "--timeout", "0"])
+    assert exc_info.value.code == 1
+
+
+def test_concurrency_zero_exits_1() -> None:
+    """--concurrency 0 should exit 1 with a message."""
+    parser = build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            [
+                "map",
+                "-m",
+                "x",
+                "--items",
+                "i",
+                "--template",
+                "t",
+                "--outdir",
+                "o",
+                "--concurrency",
+                "0",
+            ]
+        )
+    assert exc_info.value.code == 1
+
+
+def test_max_tokens_zero_exits_1() -> None:
+    """--max-tokens 0 should exit 1 with a message."""
+    parser = build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["ask", "-p", "hi", "--max-tokens", "0"])
+    assert exc_info.value.code == 1
+
+
+def test_positive_values_work() -> None:
+    """Valid positive values should work."""
+    parser = build_parser()
+    args = parser.parse_args(["ask", "-p", "hi", "--timeout", "5.0", "--max-tokens", "100"])
+    assert args.timeout == 5.0
+    assert args.max_tokens == 100
+
+
+# Tests for models command error handling.
+
+
+def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_models_401_raises_http_error() -> None:
+    """Verify that a 401 response raises HTTPError (to be caught by _dispatch)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="unauthorized")
+
+    async with _client(handler) as client:
+        try:
+            await run_models(
+                client=client,
+                base_url="https://g.test",
+                key="sk-test",
+                dialect="both",
+                timeout=5.0,
+            )
+            raise AssertionError("Expected HTTPError to be raised")
+        except httpx.HTTPError:
+            pass  # Expected
+
+
+# Tests for filesystem error handling.
+
+
+def test_permission_error_exits_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PermissionError should exit 1 with an error message, not a traceback."""
+    # The CLI reads ENMAAS_KEY. This previously set ENMAAS_API_KEY, which it
+    # ignores, so the test only passed on a machine that happened to have a key
+    # at the ~/.secrets/enmaas fallback. On a clean runner it failed with "no
+    # key found" long before reaching the permission error it meant to check.
+    monkeypatch.setenv("ENMAAS_KEY", "sk-test-key")
+
+    # Create a config file
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+base_url = "https://mock.example.com"
+default_model = "rits/zai-org/glm-5-3"
+""",
+        encoding="utf-8",
+    )
+
+    # Capture stderr
+    stderr_capture = StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr_capture)
+
+    # Simulate a permission error when creating the output directory
+    output_path = str(tmp_path / "ro" / "out.md")
+    with patch("pathlib.Path.mkdir", side_effect=PermissionError("Permission denied")):
+        exit_code = main(["--config", str(config), "ask", "-p", "hi", "-o", output_path])
+
+    assert exit_code == 1
+    stderr_output = stderr_capture.getvalue()
+    assert "error:" in stderr_output
+    assert "Permission denied" in stderr_output
+    # Should not contain Python traceback markers
+    assert "Traceback" not in stderr_output
