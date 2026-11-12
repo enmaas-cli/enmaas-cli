@@ -8,7 +8,6 @@ import os
 import stat
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -39,13 +38,11 @@ ENTRY = {
         }
     ],
 }
-# A typed boundary lets the file tests precede the helper's strict annotations.
-_main: Callable[[list[str]], None] = hostconfig.main
 
 
 def invoke(action: str, target: Path, mode: str = "0", value: str = "") -> None:
     args = [value] if action.startswith("config-") else [MATCHER, GUARD]
-    _main(["install_helper.py", action, str(target), mode, *args])
+    hostconfig.main(["install_helper.py", action, str(target), mode, *args])
 
 
 def json_text(value: object) -> str:
@@ -565,7 +562,7 @@ def test_invalid_guard_path_is_refused_before_writing(tmp_path: Path) -> None:
     target.write_text("{}")
     before = target.stat()
     with pytest.raises(SystemExit):
-        _main(["install_helper.py", "claude-add", str(target), "0", MATCHER, "bad\udcff"])
+        hostconfig.main(["install_helper.py", "claude-add", str(target), "0", MATCHER, "bad\udcff"])
     unchanged(target, b"{}", before)
 
 

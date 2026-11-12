@@ -212,6 +212,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Installer settings edits now live in a Python module covered by strict type
+  checks, lint and tests that compare complete files. The installer shares
+  gateway URL rules with the CLI and keeps its existing error messages.
 - `models`, `ask` and `map` refuse a gateway URL with an empty port, such as
   `https://host:`, with `gateway URL is not valid (empty port)`. Before, the
   URL was used as typed. The installer already refused it.

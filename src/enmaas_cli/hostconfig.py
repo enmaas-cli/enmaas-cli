@@ -1,3 +1,7 @@
+"""Edit host settings while preserving unrelated content and installer messages."""
+
+from __future__ import annotations
+
 import contextlib
 import copy
 import json
@@ -7,8 +11,12 @@ import runpy
 import shlex
 import sys
 import tempfile
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import ModuleType
+from typing import Any, NoReturn, cast
 
+tomllib: ModuleType | None
 try:
     import tomllib
 except ImportError:
@@ -17,18 +25,26 @@ except ImportError:
     tomllib = None
 
 GATEWAY = runpy.run_path(str(Path(__file__).with_name("gateway.py")))
+_check_gateway: Callable[[str], tuple[str, str | None, str | None]] = GATEWAY["check_installer"]
+
+action: str
+path: str
+mode: str
+value: str
+matcher: str
+guard_script: str
 
 GUARD_ID = "enmaas/guard/hooks/pre-tool-use.py"
 BEGIN = "# >>> enmaas guard (managed by enmaas-cli install.sh)"
 END = "# <<< enmaas guard"
 
 
-def fail(message):
+def fail(message: str) -> NoReturn:
     print(message, file=sys.stderr)
     sys.exit(1)
 
 
-def hook_command():
+def hook_command() -> str:
     try:
         guard_script.encode("utf-8")
     except UnicodeEncodeError:
@@ -39,20 +55,22 @@ def hook_command():
     return "python3 -I -S " + shlex.quote(guard_script)
 
 
-def same(a, b):
+def same(a: object, b: object) -> bool:
     """Compare parsed documents by type and value. NaN equals NaN here."""
     if type(a) is not type(b):
         return False
     if isinstance(a, dict):
-        return a.keys() == b.keys() and all(same(a[key], b[key]) for key in a)
+        other_dict = cast(dict[object, object], b)
+        return a.keys() == other_dict.keys() and all(same(a[key], other_dict[key]) for key in a)
     if isinstance(a, list):
-        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        other_list = cast(list[object], b)
+        return len(a) == len(other_list) and all(same(x, y) for x, y in zip(a, other_list))
     if isinstance(a, float) and a != a:
         return b != b
     return a == b
 
 
-def read_text():
+def read_text() -> str | None:
     if os.path.islink(path) and not os.path.exists(path):
         fail(
             f"{path} is a symbolic link to {os.readlink(path)}, which does not exist "
@@ -71,7 +89,7 @@ def read_text():
         fail(f"Cannot read {path} ({exc.strerror}). Fix its permissions, then run this again.")
 
 
-def check_writable():
+def check_writable() -> None:
     # Write through a symbolic link to its target, so the link stays a link.
     real = os.path.realpath(path)
     directory = os.path.dirname(real)
@@ -84,7 +102,7 @@ def check_writable():
         fail(f"{path} is read-only. Make it writable, then run this again.")
 
 
-def write_text(old, new, done, planned):
+def write_text(old: str | None, new: str, done: str, planned: str) -> None:
     """Write new in place of old. A dry run prints the path and planned instead.
 
     The file can hold tokens and provider headers that are not ours, so no
@@ -133,7 +151,7 @@ def write_text(old, new, done, planned):
     print(f"  {path}: {done}")
 
 
-def is_ours(handler):
+def is_ours(handler: object) -> bool:
     return (
         isinstance(handler, dict)
         and isinstance(handler.get("command"), str)
@@ -141,7 +159,7 @@ def is_ours(handler):
     )
 
 
-def holds_ours(group):
+def holds_ours(group: object) -> bool:
     return (
         isinstance(group, dict)
         and isinstance(group.get("hooks"), list)
@@ -149,10 +167,10 @@ def holds_ours(group):
     )
 
 
-# --- settings.json ---
+# settings.json
 
 
-def strip_ours(groups):
+def strip_ours(groups: list[Any]) -> tuple[list[Any], int | None]:
     """Drop our handlers from every group, and any group that only held ours.
 
     Returns the groups that remain and the index, among them, where the first
@@ -178,8 +196,8 @@ class DuplicateKey(ValueError):
     """An object names one key twice. The key is not kept, so no message can show it."""
 
 
-def load_json(text):
-    def no_duplicates(pairs):
+def load_json(text: str) -> Any:
+    def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         seen = set()
         for key, _ in pairs:
             if key in seen:
@@ -190,7 +208,7 @@ def load_json(text):
     return json.loads(text, object_pairs_hook=no_duplicates)
 
 
-def json_problem(exc):
+def json_problem(exc: BaseException) -> str:
     """Say where a JSON file stops parsing, without quoting any of it."""
     if isinstance(exc, json.JSONDecodeError):
         return f" ({exc.msg} at line {exc.lineno} column {exc.colno})"
@@ -199,7 +217,7 @@ def json_problem(exc):
     return ""
 
 
-def dump_json(value):
+def dump_json(value: object) -> str:
     try:
         text = json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
     except ValueError:
@@ -217,7 +235,7 @@ def dump_json(value):
     return text
 
 
-def claude(add):
+def claude(add: bool) -> None:
     old = read_text()
     if old is None and not add:
         if mode != "check":
@@ -269,26 +287,27 @@ def claude(add):
         hooks["PreToolUse"] = kept
         done = "removed the enmaas guard entry"
         planned = "remove the enmaas guard registration"
-    new = old if same(settings, original) else dump_json(settings)
+    # Adding a registration always changes a document that did not exist.
+    new = cast(str, old) if same(settings, original) else dump_json(settings)
     write_text(old, new, done, planned)
 
 
-# --- config.toml ---
+# config.toml
 
 
-def toml_string(value):
+def toml_string(value: str) -> str:
     # A JSON string is a TOML basic string, except that TOML wants DEL escaped.
     return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
-def pre_tool_use(doc):
+def pre_tool_use(doc: object) -> list[Any]:
     hooks = doc.get("hooks") if isinstance(doc, dict) else None
     if isinstance(hooks, dict) and isinstance(hooks.get("PreToolUse"), list):
-        return hooks["PreToolUse"]
+        return cast(list[Any], hooks["PreToolUse"])
     return []
 
 
-def tidy(doc):
+def tidy(doc: dict[str, Any]) -> dict[str, Any]:
     hooks = doc.get("hooks")
     if isinstance(hooks, dict):
         if hooks.get("PreToolUse") == []:
@@ -298,7 +317,7 @@ def tidy(doc):
     return doc
 
 
-def is_rest_plus(full, entry, rest):
+def is_rest_plus(full: dict[str, Any], entry: object, rest: dict[str, Any]) -> bool:
     """True if full is rest plus one hooks.PreToolUse entry equal to entry."""
     rest = tidy(copy.deepcopy(rest))
     for index, candidate in enumerate(pre_tool_use(full)):
@@ -311,7 +330,7 @@ def is_rest_plus(full, entry, rest):
     return False
 
 
-def is_exactly_ours(entry):
+def is_exactly_ours(entry: object) -> bool:
     """True if entry is one PreToolUse table: a matcher and our one handler."""
     return (
         isinstance(entry, dict)
@@ -325,35 +344,129 @@ def is_exactly_ours(entry):
     )
 
 
-def parse_toml(text, problem):
+def parse_toml(text: str, problem: str) -> dict[str, Any]:
+    parser = cast(ModuleType, tomllib)
     try:
-        return tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+        return cast(dict[str, Any], parser.loads(text))
+    except parser.TOMLDecodeError as exc:
         fail(problem.replace("{exc}", toml_position(exc)))
 
 
-def toml_position(exc):
+def toml_position(exc: BaseException) -> str:
     """Say where TOML stops parsing. The parser's own message can quote a key."""
     found = re.search(r"\((at line \d+, column \d+|at end of document)\)$", str(exc))
     return found[1] if found else "at an unknown position"
 
 
-def codex(add):
-    old = read_text()
-    if old is None and not add:
-        if mode != "check":
-            print(f"  {path}: not present, nothing to remove")
-        return
-    text = old or ""
-    lines = text.splitlines(keepends=True)
+def _status(message: str) -> None:
+    if mode != "check":
+        print(f"  {path}: {message}")
+
+
+def _codex_markers(lines: list[str]) -> tuple[int, int] | None:
     starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == BEGIN]
     ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == END]
     if len(starts) > 1 or len(ends) != len(starts) or (starts and ends[0] < starts[0]):
         fail(f"{path}: the enmaas guard markers are broken. Remove the block by hand.")
+    return (starts[0], ends[0]) if starts else None
+
+
+def _refuse_unmarked(doc: dict[str, Any]) -> None:
+    if any(holds_ours(entry) for entry in pre_tool_use(doc)):
+        fail(
+            f"{path}: the enmaas guard is registered in config.toml without the enmaas "
+            "markers. Remove that [[hooks.PreToolUse]] table by hand, then run this again."
+        )
+
+
+def _managed_codex_block(
+    lines: list[str], span: tuple[int, int], old_doc: dict[str, Any]
+) -> tuple[str, str, dict[str, Any]]:
+    begin, end = span
+    head = "".join(lines[:begin])
+    tail = "".join(lines[end + 1 :])
+    if not any(holds_ours(entry) for entry in pre_tool_use(old_doc)):
+        fail(
+            f"{path}: the enmaas guard marker lines appear inside other content, "
+            "such as a multi-line string, and no guard hook is registered. "
+            "Fix the file by hand, then run this again."
+        )
+    parser = cast(ModuleType, tomllib)
+    try:
+        block_doc = parser.loads("".join(lines[begin : end + 1]))
+    except parser.TOMLDecodeError:
+        block_doc = {}
+    entries = pre_tool_use(block_doc)
+    if not any(holds_ours(entry) for entry in entries):
+        fail(
+            f"{path}: the text between the enmaas guard markers is not the block "
+            "this installer writes. Remove the block by hand, then run this again."
+        )
+    # Rewriting a managed block would drop anything added inside it.
+    if (
+        list(block_doc) != ["hooks"]
+        or list(block_doc["hooks"]) != ["PreToolUse"]
+        or len(entries) != 1
+        or not is_exactly_ours(entries[0])
+    ):
+        fail(
+            f"{path}: the enmaas guard block was edited by hand. Restore it to the two "
+            "marker lines with only the guard's [[hooks.PreToolUse]] table between them, "
+            "or remove the block and its marker lines. Put any other hook in its own "
+            "table outside the markers, then run this again."
+        )
+    rest_doc = parse_toml(
+        head + tail,
+        f"{path}: removing the enmaas guard block would leave invalid TOML ({{exc}}). "
+        "Remove the block by hand, then run this again.",
+    )
+    _refuse_unmarked(rest_doc)
+    if not is_rest_plus(old_doc, entries[0], rest_doc):
+        fail(
+            f"{path}: removing the enmaas guard block would also change other settings. "
+            f'Lines below the "{END}" line belong to the '
+            "guard's table. Move them "
+            "above the block or under their own table header, then run this again."
+        )
+    return head, tail, rest_doc
+
+
+def _add_codex_block(head: str, tail: str, rest_doc: dict[str, Any], replacing: bool) -> str:
+    block = (
+        f"{BEGIN}\n"
+        "[[hooks.PreToolUse]]\n"
+        f"matcher = {toml_string(matcher)}\n"
+        f'hooks = [{{ type = "command", command = {toml_string(hook_command())}'
+        ", timeout = 5 }]\n"
+        f"{END}\n"
+    )
+    if replacing:
+        new = head + block + tail
+    else:
+        new = head + ("" if head == "" or head.endswith("\n") else "\n") + block
+    new_doc = parse_toml(
+        new,
+        f"{path}: adding the guard would make the file invalid ({{exc}}). "
+        "It may already define hooks.PreToolUse another way. Merge it by hand.",
+    )
+    parser = cast(ModuleType, tomllib)
+    entry = pre_tool_use(parser.loads(block))[0]
+    if not is_rest_plus(new_doc, entry, rest_doc):
+        fail(f"{path}: adding the guard block would also change other settings. Merge it by hand.")
+    return new
+
+
+def codex(add: bool) -> None:
+    old = read_text()
+    if old is None and not add:
+        _status("not present, nothing to remove")
+        return
+    text = old or ""
+    lines = text.splitlines(keepends=True)
+    span = _codex_markers(lines)
     # Without markers, a file that never names the guard holds no registration.
-    if not starts and not add and GUARD_ID not in text:
-        if mode != "check":
-            print(f"  {path}: no enmaas guard registered")
+    if span is None and not add and GUARD_ID not in text:
+        _status("no enmaas guard registered")
         return
     if tomllib is None:
         fail(
@@ -363,114 +476,39 @@ def codex(add):
     old_doc = parse_toml(
         text, f"{path} is not valid TOML ({{exc}}). Fix or move it, then run this again."
     )
-    unmarked = (
-        f"{path}: the enmaas guard is registered in config.toml without the enmaas "
-        "markers. Remove that [[hooks.PreToolUse]] table by hand, then run this again."
-    )
-
-    if starts:
-        begin, end = starts[0], ends[0]
-        head = "".join(lines[:begin])
-        tail = "".join(lines[end + 1 :])
-        if not any(holds_ours(entry) for entry in pre_tool_use(old_doc)):
-            fail(
-                f"{path}: the enmaas guard marker lines appear inside other content, "
-                "such as a multi-line string, and no guard hook is registered. "
-                "Fix the file by hand, then run this again."
-            )
-        try:
-            block_doc = tomllib.loads("".join(lines[begin : end + 1]))
-        except tomllib.TOMLDecodeError:
-            block_doc = None
-        entries = pre_tool_use(block_doc)
-        if not any(holds_ours(entry) for entry in entries):
-            fail(
-                f"{path}: the text between the enmaas guard markers is not the block "
-                "this installer writes. Remove the block by hand, then run this again."
-            )
-        # The block is ours. Rewriting or removing it would drop anything else
-        # added inside it, so refuse instead.
-        if (
-            list(block_doc) != ["hooks"]
-            or list(block_doc["hooks"]) != ["PreToolUse"]
-            or len(entries) != 1
-            or not is_exactly_ours(entries[0])
-        ):
-            fail(
-                f"{path}: the enmaas guard block was edited by hand. Restore it to the two "
-                "marker lines with only the guard's [[hooks.PreToolUse]] table between them, "
-                "or remove the block and its marker lines. Put any other hook in its own "
-                "table outside the markers, then run this again."
-            )
-        rest = head + tail
-        rest_doc = parse_toml(
-            rest,
-            f"{path}: removing the enmaas guard block would leave invalid TOML ({{exc}}). "
-            "Remove the block by hand, then run this again.",
-        )
-        if any(holds_ours(entry) for entry in pre_tool_use(rest_doc)):
-            fail(unmarked)
-        if not is_rest_plus(old_doc, entries[0], rest_doc):
-            fail(
-                f"{path}: removing the enmaas guard block would also change other settings. "
-                f'Lines below the "{END}" line belong to the guard\'s table. Move them '
-                "above the block or under their own table header, then run this again."
-            )
+    if span is not None:
+        head, tail, rest_doc = _managed_codex_block(lines, span, old_doc)
     else:
-        if any(holds_ours(entry) for entry in pre_tool_use(old_doc)):
-            fail(unmarked)
+        _refuse_unmarked(old_doc)
         if not add:
-            if mode != "check":
-                print(f"  {path}: no enmaas guard registered")
+            _status("no enmaas guard registered")
             return
-        head, tail, rest, rest_doc = text, "", text, old_doc
-
+        head, tail, rest_doc = text, "", old_doc
     if add:
-        block = (
-            f"{BEGIN}\n"
-            "[[hooks.PreToolUse]]\n"
-            f"matcher = {toml_string(matcher)}\n"
-            f'hooks = [{{ type = "command", command = {toml_string(hook_command())}'
-            ", timeout = 5 }]\n"
-            f"{END}\n"
-        )
-        planned = ("replace" if starts else "add") + " the enmaas guard registration"
-        if starts:
-            new = head + block + tail
-        else:
-            new = text + ("" if text == "" or text.endswith("\n") else "\n") + block
-        new_doc = parse_toml(
-            new,
-            f"{path}: adding the guard would make the file invalid ({{exc}}). "
-            "It may already define hooks.PreToolUse another way. Merge it by hand.",
-        )
-        entry = pre_tool_use(tomllib.loads(block))[0]
-        if not is_rest_plus(new_doc, entry, rest_doc):
-            fail(
-                f"{path}: adding the guard block would also change other settings. "
-                "Merge it by hand."
-            )
+        new = _add_codex_block(head, tail, rest_doc, span is not None)
         done = "registered the enmaas guard"
+        planned = ("replace" if span is not None else "add") + " the enmaas guard registration"
     else:
-        new = rest
+        new = head + tail
         done = "removed the enmaas guard block"
         planned = "remove the enmaas guard registration"
     write_text(old, new, done, planned)
 
 
-# --- enmaas config.toml ---
+# enmaas config.toml
 
 SETTINGS = {"config-set-gateway": "base_url", "config-set-key-file": "key_file"}
 HEADER = re.compile(r"^[ \t]*\[")
 
 
-def setting_line(name):
+def setting_line(name: str) -> re.Pattern[str]:
     quoted = re.escape(name)
     return re.compile(rf"""^[ \t]*(?:{quoted}|"{quoted}"|'{quoted}')[ \t]*=""")
 
 
-def trailing_comment(line):
+def trailing_comment(line: str) -> str:
     """The comment that ends a key = value line, with the spaces before it."""
+    parser = cast(ModuleType, tomllib)
     body = line.rstrip("\r\n")
     for at, char in enumerate(body):
         if char != "#":
@@ -478,8 +516,8 @@ def trailing_comment(line):
         # A # inside a string is part of the value. The first # after which
         # the line before it parses on its own starts the comment.
         try:
-            tomllib.loads(body[:at])
-        except tomllib.TOMLDecodeError:
+            parser.loads(body[:at])
+        except parser.TOMLDecodeError:
             continue
         return body[len(body[:at].rstrip(" \t")) :]
     return ""
@@ -497,27 +535,27 @@ URL_PROBLEMS = {
 }
 
 
-def check_url(label, url):
+def check_url(label: str, url: str) -> str:
     """Map shared URL checks to the installer's messages."""
-    checked = GATEWAY["check_installer"](url)
-    if checked.problem == GATEWAY["EMPTY"]:
+    checked_url, problem, detail = _check_gateway(url)
+    if problem == GATEWAY["EMPTY"]:
         fail(f"{label} is empty.")
-    if checked.detail is not None:
-        fail(f"{label} is not a valid URL ({checked.detail}): {checked.url}")
-    if checked.problem is not None:
-        fail(f"{label} {URL_PROBLEMS[checked.problem]}: {checked.url}")
-    return checked.url
+    if detail is not None:
+        fail(f"{label} is not a valid URL ({detail}): {checked_url}")
+    if problem is not None:
+        fail(f"{label} {URL_PROBLEMS[problem]}: {checked_url}")
+    return checked_url
 
 
-def is_blank(line):
+def is_blank(line: str) -> bool:
     return line.strip() == ""
 
 
-def is_comment(line):
+def is_comment(line: str) -> bool:
     return line.lstrip().startswith("#")
 
 
-def load_settings(text):
+def load_settings(text: str) -> dict[str, Any]:
     if tomllib is None:
         fail(
             f"Reading {path} safely needs Python 3.11 or newer. Put a newer python3 "
@@ -528,7 +566,7 @@ def load_settings(text):
     )
 
 
-def get_setting(name):
+def get_setting(name: str) -> None:
     text = read_text()
     if text is None:
         return
@@ -537,7 +575,7 @@ def get_setting(name):
         print(found)
 
 
-def ensure_directory():
+def ensure_directory() -> bool:
     """Make sure the directory for path exists. Returns False if it does not yet."""
     directory = os.path.dirname(os.path.realpath(path))
     if os.path.isdir(directory):
@@ -556,7 +594,7 @@ def ensure_directory():
     return True
 
 
-def set_setting(name):
+def set_setting(name: str) -> None:
     old = read_text()
     text = old or ""
     old_doc = load_settings(text)
@@ -607,7 +645,7 @@ def set_setting(name):
     write_text(old, new, f"set {name}", f"set {name}")
 
 
-def main(argv):
+def main(argv: Sequence[str]) -> None:
     global action, path, mode, value, matcher, guard_script
     action, path, mode = argv[1:4]
     if action.startswith("config-"):

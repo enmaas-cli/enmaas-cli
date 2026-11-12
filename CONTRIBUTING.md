@@ -39,11 +39,22 @@ make check
 ```
 
 That runs `ruff check`, `ruff format --check`, `mypy` in strict mode, and
-`pytest`. All four must pass. If you touched `install.sh` or anything it copies,
-also run `make check-install`; it installs into a throwaway home and checks every
+`pytest`. All four must pass. If you touched `install.sh`, its settings helper,
+or anything it copies, also run `make check-install`; it installs into a throwaway home and checks every
 step, including a second run and `--uninstall`. Run it without redirecting output: a chain of
 checks whose failure is hidden is worse than no chain, and that mistake has
 already been made once in this repository's history.
+
+Installer settings edits live in `src/enmaas_cli/hostconfig.py`.
+`scripts/install_helper.py` loads it by path without importing the CLI package.
+The helper shares URL rules with `gateway.py` and keeps the installer messages.
+`tests/test_hostconfig.py` checks complete files, refusals and repeated edits.
+To measure its branch coverage:
+
+```bash
+python -m coverage run --branch --source=enmaas_cli.hostconfig -m pytest tests/test_hostconfig.py
+python -m coverage report -m
+```
 
 Live tests hit the real gateway and need a credential. They are deselected by
 default and never run in CI:
