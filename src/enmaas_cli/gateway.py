@@ -9,7 +9,8 @@ its own way.
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from functools import partial
 from typing import NamedTuple
 from urllib.parse import SplitResult, urlsplit
 
@@ -24,6 +25,7 @@ CREDENTIALS = "credentials"
 HOST = "host"
 PORT = "port"
 EMPTY_PORT = "empty_port"
+EMPTY = "empty"
 
 
 class Checked(NamedTuple):
@@ -35,6 +37,14 @@ class Checked(NamedTuple):
 
     url: str
     problem: str | None
+
+
+class InstallerChecked(NamedTuple):
+    """A checked URL with parser detail for the installer's host error."""
+
+    url: str
+    problem: str | None
+    detail: str | None = None
 
 
 def choose(configured: str | None, env: Mapping[str, str]) -> str:
@@ -59,59 +69,109 @@ def is_loopback(host: str | None) -> bool:
 
 
 def check(url: str) -> Checked:
-    """Check a gateway URL and normalise it.
+    """Check and normalise a gateway URL in the CLI's error order."""
+    result = _check(url, _CLI_RULES)
+    return Checked(result.url, result.problem)
 
-    The URL is the gateway root. Requests append /v1/... to it, so a path in
-    it is kept as typed. The scheme is lowered, the host keeps its case, and
-    trailing slashes are removed. The rules run in a fixed order, and the
-    first one that fails names the problem.
-    """
+
+def check_installer(url: str) -> InstallerChecked:
+    """Use the installer's error order, whitespace trimming and parser detail."""
+    url = url.strip()
+    if not url:
+        return InstallerChecked(url, EMPTY)
+    return _check(url, _INSTALLER_RULES)
+
+
+def _check(
+    url: str, rules: tuple[Callable[[str, SplitResult], str | None], ...]
+) -> InstallerChecked:
     if any(ch.isspace() for ch in url):
-        return Checked(url, WHITESPACE)
+        return InstallerChecked(url, WHITESPACE)
     try:
         parts = urlsplit(url)
-    except ValueError:
-        # urlsplit only raises here for a malformed bracketed IPv6 host.
-        return Checked(url, HOST)
-    problem = _problem(url, parts)
-    if problem is not None:
-        return Checked(url, problem)
-    # Request paths start with a slash, so a trailing one here would double it.
-    return Checked(f"{parts.scheme.lower()}://{parts.netloc}{parts.path.rstrip('/')}", None)
+    except ValueError as exc:
+        return InstallerChecked(url, HOST, str(exc))
+    for rule in rules:
+        problem = rule(url, parts)
+        if problem is not None:
+            return InstallerChecked(url, problem)
+    # Requests append /v1/... to the root. Keep the path and host case,
+    # lower the scheme, and remove slashes that would double the separator.
+    normal = f"{parts.scheme.lower()}://{parts.netloc}{parts.path.rstrip('/')}"
+    return InstallerChecked(normal, None)
 
 
-def _problem(url: str, parts: SplitResult) -> str | None:
-    scheme = parts.scheme.lower()
-    if scheme not in {"http", "https"}:
+def _scheme_problem(url: str, parts: SplitResult, *, require_separator: bool = False) -> str | None:
+    if parts.scheme.lower() not in {"http", "https"}:
         return SCHEME
-    # The key travels in a header, so cleartext http would send it across
-    # the network readable to anyone on the path. A local gateway or
-    # tunnel is the only place where that is safe.
-    if scheme == "http" and not is_loopback(parts.hostname):
+    if require_separator and not url.lower().startswith(parts.scheme + "://"):
+        return SCHEME
+    return None
+
+
+def _cleartext_problem(url: str, parts: SplitResult) -> str | None:
+    # The key, prompts and answers would cross the network in clear text.
+    # Only a gateway on this machine may use plain HTTP.
+    if parts.scheme.lower() == "http" and not is_loopback(parts.hostname):
         return CLEARTEXT
-    # Checked on the raw text: "https://h?" has an empty query, yet the
-    # appended request path would still land after the "?".
+    return None
+
+
+def _query_problem(url: str, parts: SplitResult) -> str | None:
+    # Even an empty query would put an appended request path after the '?'.
     if "?" in url or "#" in url:
         return QUERY
-    # The key travels in a header. Credentials in the URL would be a
-    # second secret that ends up in logs and error messages.
+    return None
+
+
+def _credentials_problem(url: str, parts: SplitResult) -> str | None:
+    # The key travels in a header. URL credentials would add another secret
+    # that could reach logs and error messages.
     if "@" in parts.netloc:
         return CREDENTIALS
-    # Without a host, "https://" plus "/v1/models" would send the key to a
-    # host named "v1".
+    return None
+
+
+def _host_problem(url: str, parts: SplitResult) -> str | None:
+    # Appending /v1/models to a URL without a host could send the key to 'v1'.
     if not parts.hostname:
         return HOST
-    return _port_problem(parts)
+    return None
 
 
-def _port_problem(parts: SplitResult) -> str | None:
+def _numeric_port_problem(url: str, parts: SplitResult) -> str | None:
     try:
-        port = parts.port
+        _ = parts.port
     except ValueError:
-        # httpx would raise InvalidURL later, outside any handler.
+        # Reject it before the HTTP client can raise outside its handler.
         return PORT
-    # "https://host:" has no port number after its colon. urlsplit reads that
-    # as no port at all, so the URL would be sent on as typed.
-    if port is None and parts.netloc.endswith(":"):
+    return None
+
+
+def _empty_port_problem(url: str, parts: SplitResult) -> str | None:
+    # urlsplit treats a final colon as no port. Refuse that spelling too.
+    if parts.port is None and parts.netloc.endswith(":"):
         return EMPTY_PORT
     return None
+
+
+# Both callers use the same predicates. Their first reported problem is part
+# of the interface, so a URL with several faults keeps each caller's order.
+_CLI_RULES: tuple[Callable[[str, SplitResult], str | None], ...] = (
+    _scheme_problem,
+    _cleartext_problem,
+    _query_problem,
+    _credentials_problem,
+    _host_problem,
+    _numeric_port_problem,
+    _empty_port_problem,
+)
+_INSTALLER_RULES: tuple[Callable[[str, SplitResult], str | None], ...] = (
+    _numeric_port_problem,
+    partial(_scheme_problem, require_separator=True),
+    _host_problem,
+    _cleartext_problem,
+    _credentials_problem,
+    _empty_port_problem,
+    _query_problem,
+)

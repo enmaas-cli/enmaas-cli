@@ -1,13 +1,13 @@
 import contextlib
 import copy
-import ipaddress
 import json
 import os
 import re
+import runpy
 import shlex
 import sys
 import tempfile
-from urllib.parse import urlsplit, urlunsplit
+from pathlib import Path
 
 try:
     import tomllib
@@ -15,6 +15,8 @@ except ImportError:
     # Adding the guard checks the Python version first. Changing config.toml
     # without this module is refused below.
     tomllib = None
+
+GATEWAY = runpy.run_path(str(Path(__file__).with_name("gateway.py")))
 
 GUARD_ID = "enmaas/guard/hooks/pre-tool-use.py"
 BEGIN = "# >>> enmaas guard (managed by enmaas-cli install.sh)"
@@ -483,49 +485,28 @@ def trailing_comment(line):
     return ""
 
 
-def is_loopback(host):
-    """True for localhost, 127.0.0.0/8 and ::1. urlsplit has removed any brackets."""
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+URL_PROBLEMS = {
+    GATEWAY["WHITESPACE"]: "must not contain spaces",
+    GATEWAY["SCHEME"]: "must start with http:// or https://",
+    GATEWAY["HOST"]: "has no host name",
+    GATEWAY["PORT"]: "has a port that is not a number from 0 to 65535",
+    GATEWAY["CLEARTEXT"]: "must use https:// for a host other than localhost",
+    GATEWAY["CREDENTIALS"]: "must not contain credentials (user@host)",
+    GATEWAY["EMPTY_PORT"]: "has no port number after the colon",
+    GATEWAY["QUERY"]: "must not have a query (?) or a fragment (#)",
+}
 
 
 def check_url(label, url):
-    """Return url with a lower-case scheme and no trailing slashes, or stop."""
-    url = url.strip()
-    if not url:
+    """Map shared URL checks to the installer's messages."""
+    checked = GATEWAY["check_installer"](url)
+    if checked.problem == GATEWAY["EMPTY"]:
         fail(f"{label} is empty.")
-    if any(char.isspace() for char in url):
-        fail(f"{label} must not contain spaces: {url}")
-    try:
-        parts = urlsplit(url)
-        host = parts.hostname
-    except ValueError as exc:
-        fail(f"{label} is not a valid URL ({exc}): {url}")
-    try:
-        port = parts.port
-    except ValueError:
-        fail(f"{label} has a port that is not a number from 0 to 65535: {url}")
-    if parts.scheme not in ("http", "https") or not url.lower().startswith(parts.scheme + "://"):
-        fail(f"{label} must start with http:// or https://: {url}")
-    if not host:
-        fail(f"{label} has no host name: {url}")
-    # Over plain http, the key and every prompt and answer cross the network
-    # in clear text. That is only safe for a gateway on this machine.
-    if parts.scheme == "http" and not is_loopback(host):
-        fail(f"{label} must use https:// for a host other than localhost: {url}")
-    # The key travels in a header. A user:password in the URL would be a
-    # second secret that lands in logs, and the CLI refuses it too.
-    if "@" in parts.netloc:
-        fail(f"{label} must not contain credentials (user@host): {url}")
-    if port is None and parts.netloc.endswith(":"):
-        fail(f"{label} has no port number after the colon: {url}")
-    if "?" in url or "#" in url:
-        fail(f"{label} must not have a query (?) or a fragment (#): {url}")
-    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+    if checked.detail is not None:
+        fail(f"{label} is not a valid URL ({checked.detail}): {checked.url}")
+    if checked.problem is not None:
+        fail(f"{label} {URL_PROBLEMS[checked.problem]}: {checked.url}")
+    return checked.url
 
 
 def is_blank(line):

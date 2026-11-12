@@ -778,3 +778,217 @@ def test_removing_markers_cannot_leave_an_unterminated_toml_string(
     assert exc.value.code == 1
     assert "removing the enmaas guard block would leave invalid TOML" in capsys.readouterr().err
     unchanged(target, seed.encode(), metadata)
+
+
+@pytest.mark.parametrize(
+    ("url", "cli_problem", "installer_problem", "cli_reason", "installer_reason", "detail"),
+    [
+        (
+            "https://g.test/a b",
+            "whitespace",
+            "whitespace",
+            "whitespace inside the URL",
+            "must not contain spaces",
+            None,
+        ),
+        (
+            "ftp://g.test",
+            "scheme",
+            "scheme",
+            "scheme must be http or https",
+            "must start with http:// or https://",
+            None,
+        ),
+        (
+            "http://g.test",
+            "cleartext",
+            "cleartext",
+            "http is only allowed for localhost, use https",
+            "must use https:// for a host other than localhost",
+            None,
+        ),
+        (
+            "https://g.test?",
+            "query",
+            "query",
+            "query and fragment are not allowed",
+            "must not have a query (?) or a fragment (#)",
+            None,
+        ),
+        (
+            "https://user@g.test",
+            "credentials",
+            "credentials",
+            "credentials in the URL are not allowed",
+            "must not contain credentials (user@host)",
+            None,
+        ),
+        ("https://", "host", "host", "missing host", "has no host name", None),
+        (
+            "https://g.test:bad",
+            "port",
+            "port",
+            "invalid port",
+            "has a port that is not a number from 0 to 65535",
+            None,
+        ),
+        (
+            "https://g.test:",
+            "empty_port",
+            "empty_port",
+            "empty port",
+            "has no port number after the colon",
+            None,
+        ),
+        (
+            "http://g.test:bad",
+            "cleartext",
+            "port",
+            "http is only allowed for localhost, use https",
+            "has a port that is not a number from 0 to 65535",
+            None,
+        ),
+        (
+            "ftp://g.test:bad",
+            "scheme",
+            "port",
+            "scheme must be http or https",
+            "has a port that is not a number from 0 to 65535",
+            None,
+        ),
+        (
+            "https:user@g.test",
+            "host",
+            "scheme",
+            "missing host",
+            "must start with http:// or https://",
+            None,
+        ),
+        (
+            "https://user@g.test?",
+            "query",
+            "credentials",
+            "query and fragment are not allowed",
+            "must not contain credentials (user@host)",
+            None,
+        ),
+        (
+            "https://user@:bad",
+            "credentials",
+            "port",
+            "credentials in the URL are not allowed",
+            "has a port that is not a number from 0 to 65535",
+            None,
+        ),
+        (
+            "https://:bad",
+            "host",
+            "port",
+            "missing host",
+            "has a port that is not a number from 0 to 65535",
+            None,
+        ),
+        (
+            "https://g.test:?",
+            "query",
+            "empty_port",
+            "query and fragment are not allowed",
+            "has no port number after the colon",
+            None,
+        ),
+        (
+            "https://[::1",
+            "host",
+            "host",
+            "missing host",
+            "is not a valid URL (Invalid IPv6 URL)",
+            "Invalid IPv6 URL",
+        ),
+    ],
+)
+def test_gateway_callers_keep_their_messages_and_problem_order(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    url: str,
+    cli_problem: str,
+    installer_problem: str,
+    cli_reason: str,
+    installer_reason: str,
+    detail: str | None,
+) -> None:
+    from enmaas_cli import gateway
+    from enmaas_cli.cli import resolve_base_url
+
+    assert gateway.check(url) == gateway.Checked(url, cli_problem)
+    with pytest.raises(ValueError) as cli_exc:
+        resolve_base_url(None, {"ENMAAS_BASE_URL": url}, tmp_path / "config.toml")
+    assert str(cli_exc.value) == f"gateway URL is not valid ({cli_reason}): {url}"
+    with pytest.raises(SystemExit) as installer_exc:
+        invoke("config-check-url", Path("Gateway URL"), value=url)
+    assert installer_exc.value.code == 1
+    assert capsys.readouterr() == ("", f"Gateway URL {installer_reason}: {url}\n")
+    assert list(tmp_path.iterdir()) == []
+    assert gateway.check_installer(url) == gateway.InstallerChecked(url, installer_problem, detail)
+
+
+def test_installer_url_check_preserves_empty_input_and_parser_detail() -> None:
+    from urllib.parse import urlsplit
+
+    from enmaas_cli import gateway
+
+    assert gateway.check("") == gateway.Checked("", gateway.SCHEME)
+    assert gateway.check_installer(" \t ") == gateway.InstallerChecked("", gateway.EMPTY)
+    url = "https://[not-ip]"
+    with pytest.raises(ValueError) as parser_exc:
+        urlsplit(url)
+    assert gateway.check_installer(url) == gateway.InstallerChecked(
+        url, gateway.HOST, str(parser_exc.value)
+    )
+
+
+def test_isolated_installer_url_check_does_not_import_the_package(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    copy_root = tmp_path / "copy"
+    for relative in (
+        "scripts/install_helper.py",
+        "src/enmaas_cli/hostconfig.py",
+        "src/enmaas_cli/gateway.py",
+    ):
+        target = copy_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((repo / relative).read_bytes())
+    (copy_root / "src/enmaas_cli/__init__.py").write_text(
+        'raise AssertionError("the installer imported the CLI package")\n'
+    )
+    env = dict(os.environ)
+    for name in (
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+    ):
+        env[name] = str(tmp_path / name.lower())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(copy_root / "scripts/install_helper.py"),
+            "config-check-url",
+            "Gateway URL",
+            "0",
+            " HTTP://LOCALHOST:8080/ ",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "http://LOCALHOST:8080\n"
+    assert not list(copy_root.rglob("__pycache__"))
