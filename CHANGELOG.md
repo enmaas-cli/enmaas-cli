@@ -216,8 +216,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `https://host:`, with `gateway URL is not valid (empty port)`. Before, the
   URL was used as typed. The installer already refused it.
 - The token totals of a `map` run count every usage block the gateway
-  returned, so an item sent alone whose answer fails validation now counts in
-  the receipt, in `map --json` and in the ledger event.
+  returned. The totals in the receipt, in `map --json` and in the ledger event
+  now also count replies that were cut off, replies that could not be read,
+  answers that failed validation and answers that could not be written, for
+  items sent alone and for batched requests. The charge, the budgets and the
+  exit codes did not change.
 - `map --json` has a new `internal_errors` field, and the `map` receipt shows an
   `internal` line when it is above zero. Those items are already counted in
   `failed`. Please report them.
