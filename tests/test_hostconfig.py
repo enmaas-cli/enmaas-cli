@@ -436,6 +436,7 @@ def test_nonregular_or_invalid_text_is_refused_without_changes(
         target.symlink_to("absent")
     else:
         target.write_bytes(b"\xff")
+        os.utime(target, ns=(1, target.stat().st_mtime_ns))
     before = target.lstat()
     with pytest.raises(SystemExit) as exc:
         invoke(action, target, value="base_url")
@@ -449,7 +450,20 @@ def test_nonregular_or_invalid_text_is_refused_without_changes(
         "invalid-utf8": "is not valid UTF-8 text",
     }
     assert expected[kind] in output.err
-    assert target.lstat() == before
+    after = target.lstat()
+    # Reading invalid text can update access time without changing the file.
+    for field in (
+        "st_mode",
+        "st_ino",
+        "st_dev",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    ):
+        assert getattr(after, field) == getattr(before, field), field
     assert list(tmp_path.iterdir()) == [target]
     if kind == "invalid-utf8":
         assert target.read_bytes() == b"\xff"
