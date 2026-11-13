@@ -306,3 +306,80 @@ def test_actual_command_errors_are_strictly_bounded(
             assert len(message) > 200
             assert REDACTION in message
             assert encoded not in json.dumps(message)
+
+
+@pytest.mark.parametrize("command", ["ask", "map"])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_ledger_write_refusal_redacts_before_strict_cut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    as_json: bool,
+) -> None:
+    from enmaas_cli import cli
+    from enmaas_cli.budget import RollingCheck
+
+    key = "long-synthetic-key-" + "s" * 145
+    for name in os.environ:
+        if name.startswith("ENMAAS_"):
+            monkeypatch.delenv(name, raising=False)
+    for name in (
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+    ):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    state_home = tmp_path / key
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("ENMAAS_KEY", key)
+    monkeypatch.setenv("ENMAAS_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(cli, "rolling_check", lambda *a: RollingCheck(0, 5, None))
+    monkeypatch.setattr(cli, "can_append", lambda *a: False)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("ledger refusal must precede client creation")
+
+    monkeypatch.setattr(cli, "make_client", forbidden)
+    argv = [
+        "--config",
+        str(tmp_path / "none.toml"),
+        command,
+        "-m",
+        "gpt-6-sol",
+        "--dialect",
+        "openai",
+    ]
+    if as_json:
+        argv += ["--json"]
+    if command == "ask":
+        argv += ["-p", "hi"]
+    else:
+        argv += [
+            "--items",
+            str(tmp_path / "unused.jsonl"),
+            "--template",
+            str(tmp_path / "unused.txt"),
+            "--outdir",
+            str(tmp_path / "out"),
+        ]
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    message = (
+        json.loads(captured.out)["error"]
+        if as_json
+        else captured.err.removeprefix("error: ").rstrip("\n")
+    )
+    expected_full = (
+        f"the usage ledger {tmp_path}/{REDACTION}/enmaas/runs/usage.jsonl cannot be "
+        "written, so the token budget cannot be tracked; fix it or remove the [budget] "
+        "table from the config"
+    )
+    assert message == expected_full[:200]
+    assert len(message) <= 200
+    assert key[:32] not in message
+    assert key not in captured.out + captured.err
+    assert not (tmp_path / "out").exists()

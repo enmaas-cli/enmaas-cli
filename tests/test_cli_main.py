@@ -167,9 +167,8 @@ def test_gateway_url_without_a_scheme_exits_one(
     code = main(["--config", str(tmp_path / "none.toml"), "models"])
     captured = capsys.readouterr()
     assert code == 1
-    assert captured.err == (
-        "error: gateway URL is not valid (scheme must be http or https): gateway.example.test\n"
-    )
+    assert captured.err == ("error: gateway URL is not valid (scheme must be http or https)\n")
+    assert "gateway.example.test" not in captured.err
     assert seen == []
 
 

@@ -596,7 +596,7 @@ if [[ $WRITE_GATEWAY -eq 1 || $WRITE_KEY_FILE -eq 1 || -n "$GATEWAY_NOTE" ]]; th
     say "  gateway URL: $GATEWAY"
     edit_config config-set-gateway "$CONFIG_FILE" "$DRY_RUN" "$GATEWAY"
     if [[ -n "$ENV_GATEWAY" && "$ENV_GATEWAY" != "$GATEWAY" ]]; then
-      say "  note: \$ENMAAS_BASE_URL is set to $ENV_GATEWAY. The CLI uses it before config.toml."
+      say "  note: \$ENMAAS_BASE_URL is set. The CLI uses it before config.toml."
     fi
   fi
   if [[ $WRITE_KEY_FILE -eq 1 ]]; then

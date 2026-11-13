@@ -588,7 +588,7 @@ def test_invalid_guard_path_is_refused_before_writing(tmp_path: Path) -> None:
         ("ftp://g.test", "must start with http:// or https://"),
         ("https:g.test", "must start with http:// or https://"),
         ("https://", "has no host name"),
-        ("https://[::1", "is not a valid URL (Invalid IPv6 URL)"),
+        ("https://[::1", "is not a valid URL"),
         ("https://g.test:bad", "has a port that is not a number from 0 to 65535"),
         ("https://g.test:", "has no port number after the colon"),
         ("http://g.test", "must use https:// for a host other than localhost"),
@@ -604,8 +604,10 @@ def test_url_refusal_preserves_the_installer_message(
     with pytest.raises(SystemExit) as exc:
         invoke("config-check-url", label, value=url)
     assert exc.value.code == 1
-    ending = "\n" if not url else f": {url}\n"
-    assert capsys.readouterr().err == f"{label} {reason}{ending}"
+    message = capsys.readouterr().err
+    assert message == f"{label} {reason}\n"
+    if url:
+        assert url not in message
     assert list(tmp_path.iterdir()) == []
 
 
@@ -912,7 +914,7 @@ def test_removing_markers_cannot_leave_an_unterminated_toml_string(
             "host",
             "host",
             "missing host",
-            "is not a valid URL (Invalid IPv6 URL)",
+            "is not a valid URL",
             "Invalid IPv6 URL",
         ),
     ],
@@ -933,11 +935,14 @@ def test_gateway_callers_keep_their_messages_and_problem_order(
     assert gateway.check(url) == gateway.Checked(url, cli_problem)
     with pytest.raises(ValueError) as cli_exc:
         resolve_base_url(None, {"ENMAAS_BASE_URL": url}, tmp_path / "config.toml")
-    assert str(cli_exc.value) == f"gateway URL is not valid ({cli_reason}): {url}"
+    assert str(cli_exc.value) == f"gateway URL is not valid ({cli_reason})"
     with pytest.raises(SystemExit) as installer_exc:
         invoke("config-check-url", Path("Gateway URL"), value=url)
     assert installer_exc.value.code == 1
-    assert capsys.readouterr() == ("", f"Gateway URL {installer_reason}: {url}\n")
+    captured = capsys.readouterr()
+    assert captured == ("", f"Gateway URL {installer_reason}\n")
+    assert url not in str(cli_exc.value)
+    assert url not in captured.err
     assert list(tmp_path.iterdir()) == []
     assert gateway.check_installer(url) == gateway.InstallerChecked(url, installer_problem, detail)
 
@@ -1003,3 +1008,116 @@ def test_isolated_installer_url_check_does_not_import_the_package(tmp_path: Path
     assert result.returncode == 0, result.stderr
     assert result.stdout == "http://LOCALHOST:8080\n"
     assert not list(copy_root.rglob("__pycache__"))
+
+
+@pytest.mark.parametrize(
+    ("url", "cli_reason", "installer_reason"),
+    [
+        (
+            "https://UserSecret:PassSecret@g.test",
+            "credentials in the URL are not allowed",
+            "must not contain credentials (user@host)",
+        ),
+        (
+            "https://User%53ecret:Pass%53ecret@g.test",
+            "credentials in the URL are not allowed",
+            "must not contain credentials (user@host)",
+        ),
+        ("https://UserSecret:PassSecret@[broken", "missing host", "is not a valid URL"),
+        (
+            "https://UserSecret:PassSecret@g.test:bad",
+            "credentials in the URL are not allowed",
+            "has a port that is not a number from 0 to 65535",
+        ),
+        (
+            "ftp://UserSecret:PassSecret@g.test",
+            "scheme must be http or https",
+            "must start with http:// or https://",
+        ),
+        (
+            "http://UserSecret:PassSecret@g.test",
+            "http is only allowed for localhost, use https",
+            "must use https:// for a host other than localhost",
+        ),
+        (
+            "https://UserSecret:PassSecret@g.test?x=1",
+            "query and fragment are not allowed",
+            "must not contain credentials (user@host)",
+        ),
+        (
+            "https://UserSecret:PassSecret@g.test#part",
+            "query and fragment are not allowed",
+            "must not contain credentials (user@host)",
+        ),
+        (
+            "https://UserSecret:PassSecret@g.test/a b",
+            "whitespace inside the URL",
+            "must not contain spaces",
+        ),
+        (
+            "https://UserSecret:PassSecret@",
+            "credentials in the URL are not allowed",
+            "has no host name",
+        ),
+    ],
+)
+@pytest.mark.parametrize("as_json", [False, True])
+def test_url_refusals_never_echo_credentials_before_key_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    url: str,
+    cli_reason: str,
+    installer_reason: str,
+    as_json: bool,
+) -> None:
+    import os
+
+    from enmaas_cli import cli
+
+    for name in os.environ:
+        if name.startswith("ENMAAS_"):
+            monkeypatch.delenv(name, raising=False)
+    for name in (
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+    ):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    monkeypatch.setenv("ENMAAS_BASE_URL", url)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("URL refusal must precede keys, clients and writes")
+
+    monkeypatch.setattr(cli, "resolve_key", forbidden)
+    monkeypatch.setattr(cli, "make_client", forbidden)
+    argv = ["--config", str(tmp_path / "config.toml"), "models"]
+    if as_json:
+        argv += ["--json"]
+    assert cli.main(argv) == 1
+    captured = capsys.readouterr()
+    reason = f"gateway URL is not valid ({cli_reason})"
+    if as_json:
+        assert json.loads(captured.out) == {"status": "error", "error": reason}
+        assert captured.err == ""
+    else:
+        assert captured == ("", f"error: {reason}\n")
+    with pytest.raises(SystemExit) as caught:
+        invoke("config-check-url", Path("Gateway URL"), value=url)
+    assert caught.value.code == 1
+    helper = capsys.readouterr()
+    assert helper == ("", f"Gateway URL {installer_reason}\n")
+    diagnostics = captured.out + captured.err + helper.err
+    for secret in (
+        url,
+        "UserSecret",
+        "PassSecret",
+        "User%53ecret",
+        "Pass%53ecret",
+        "Invalid IPv6 URL",
+    ):
+        assert secret not in diagnostics
+    assert list(tmp_path.iterdir()) == []

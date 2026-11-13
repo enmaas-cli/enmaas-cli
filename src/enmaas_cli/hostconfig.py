@@ -541,9 +541,9 @@ def check_url(label: str, url: str) -> str:
     if problem == GATEWAY["EMPTY"]:
         fail(f"{label} is empty.")
     if detail is not None:
-        fail(f"{label} is not a valid URL ({detail}): {checked_url}")
+        fail(f"{label} is not a valid URL")
     if problem is not None:
-        fail(f"{label} {URL_PROBLEMS[problem]}: {checked_url}")
+        fail(f"{label} {URL_PROBLEMS[problem]}")
     return checked_url
 
 

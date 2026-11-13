@@ -469,8 +469,9 @@ def test_cleartext_gateway_off_localhost_is_rejected() -> None:
     with pytest.raises(ValueError) as caught:
         cli.resolve_base_url(None, {"ENMAAS_BASE_URL": url}, Path("/nonexistent"))
     assert str(caught.value) == (
-        f"gateway URL is not valid (http is only allowed for localhost, use https): {url}"
+        "gateway URL is not valid (http is only allowed for localhost, use https)"
     )
+    assert url not in str(caught.value)
 
 
 @pytest.mark.parametrize(

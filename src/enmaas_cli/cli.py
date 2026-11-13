@@ -380,7 +380,7 @@ def resolve_base_url(configured: str | None, env: Mapping[str, str], config_path
         )
     checked = gateway.check(url)
     if checked.problem is not None:
-        raise ValueError(f"gateway URL is not valid ({GATEWAY_PROBLEMS[checked.problem]}): {url}")
+        raise ValueError(f"gateway URL is not valid ({GATEWAY_PROBLEMS[checked.problem]})")
     return checked.url
 
 
@@ -852,9 +852,12 @@ def _refused(
         final.code = int(ExitCode.ERROR)
         return _setup_error(
             args,
-            f"the usage ledger {printable(str(state_root() / 'usage.jsonl'))} cannot be "
-            "written, so the token budget cannot be tracked; fix it or remove the [budget] "
-            "table from the config",
+            _error_text(
+                f"the usage ledger {state_root() / 'usage.jsonl'} cannot be "
+                "written, so the token budget cannot be tracked; fix it or remove the [budget] "
+                "table from the config",
+                key,
+            ),
         )
     return None
 
