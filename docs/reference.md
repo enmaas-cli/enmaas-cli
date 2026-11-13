@@ -259,7 +259,7 @@ to stderr. No traceback is printed unless `ENMAAS_DEBUG=1` is set (see
 | `budget.tripped` | string or null | `per_run` or `rolling` when a ceiling stopped the run |
 | `failures` | list | The first 20 failed items |
 | `failures[].id` | string | The item id |
-| `failures[].error` | string | The first 200 characters of the error, with the key removed |
+| `failures[].error` | string | At most 200 characters of the error, with the key removed; a crossing redaction marker is omitted whole |
 | `failures_truncated` | boolean | True when more than 20 items failed |
 | `error` | string or null | Why the index could not be written, when `abort_reason` is `index` |
 

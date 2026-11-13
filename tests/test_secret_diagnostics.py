@@ -6,6 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ from enmaas_cli.cli import main
 @pytest.mark.parametrize("as_json", [False, True])
 @pytest.mark.parametrize("key", ["tiny-secret", 'slash/quote"back\\key', "q" * 145 + "/end"])
 @pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
 def test_schema_command_diagnostics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -26,6 +28,7 @@ def test_schema_command_diagnostics(
     as_json: bool,
     key: str,
     required: bool,
+    nested: bool,
 ) -> None:
     for name in os.environ:
         if name.startswith("ENMAAS_"):
@@ -44,9 +47,15 @@ def test_schema_command_diagnostics(
     schema = {"type": "object", "properties": {key: {"type": "integer"}}}
     if required:
         schema["required"] = [key]
+    payload: dict[str, Any] = {} if required else {key: "bad"}
+    if nested:
+        for index in range(3):
+            name = str(index) + "field" * 6
+            schema = {"type": "object", "properties": {name: schema}}
+            payload = {name: payload}
     schema_path = tmp_path / "schema.json"
     schema_path.write_text(json.dumps(schema), encoding="utf-8")
-    answer = json.dumps({} if required else {key: "bad"})
+    answer = json.dumps(payload)
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -104,7 +113,8 @@ def test_schema_command_diagnostics(
     captured = capsys.readouterr()
     assert calls
     visible = captured.out + captured.err
-    assert REDACTION in visible
+    if not (nested and required):
+        assert REDACTION in visible
     assert key[:32] not in visible
     if as_json:
         payload = json.loads(captured.out)
@@ -114,7 +124,9 @@ def test_schema_command_diagnostics(
             [payload["error"]] if command == "ask" else [x["error"] for x in payload["failures"]]
         )
         for message in errors:
-            assert REDACTION in message
+            assert len(message) <= 200
+            if not (nested and required):
+                assert REDACTION in message
             assert key[:32] not in message
     if command != "ask":
         rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
@@ -124,3 +136,173 @@ def test_schema_command_diagnostics(
             assert REDACTION in message
             assert key[:32] not in message
             assert key not in json.dumps(message)
+
+
+@pytest.mark.parametrize(
+    ("command", "failure"),
+    [
+        (command, failure)
+        for command in ("ask", "single", "batch")
+        for failure in ("transport", "http", "output", "refusal", "index")
+        if (command, failure) != ("ask", "index")
+    ],
+)
+@pytest.mark.parametrize("as_json", [False, True])
+def test_actual_command_errors_are_strictly_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    failure: str,
+    as_json: bool,
+) -> None:
+    from enmaas_cli import cli
+    from enmaas_cli.auth import redact
+    from enmaas_cli.budget import RollingCheck
+
+    for name in os.environ:
+        if name.startswith("ENMAAS_"):
+            monkeypatch.delenv(name, raising=False)
+    for name in (
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+    ):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    key = 'bounds/key"\\synthetic'
+    monkeypatch.setenv("ENMAAS_KEY", key)
+    monkeypatch.setenv("ENMAAS_BASE_URL", "http://127.0.0.1:1")
+    encoded = "".join(f"\\u{ord(char):04X}" for char in key)
+    original = "x" * 170 + encoded + "z" * 2000
+    expected_full = "x" * 170 + REDACTION + "z" * 2000
+    assert redact(original, key) == expected_full
+    calls = []
+    index_diagnostics = []
+
+    def fail_write(*args: object) -> None:
+        raise OSError(original)
+
+    if failure == "output":
+        monkeypatch.setattr(
+            "enmaas_cli.ask.write_output" if command == "ask" else "enmaas_cli.runner.write_output",
+            fail_write,
+        )
+    if failure == "index":
+        from enmaas_cli.runner import MapOutcome, run_job
+
+        real_run_map = run_job
+
+        async def capture_map(*args: Any, **kwargs: Any) -> MapOutcome:
+            outcome = await real_run_map(*args, **kwargs)
+            index_diagnostics.append(outcome.index_error)
+            return outcome
+
+        monkeypatch.setattr(cli, "run_job", capture_map)
+        monkeypatch.setattr("enmaas_cli.runner._append_index", fail_write)
+    if failure == "refusal":
+        monkeypatch.setattr(cli, "rolling_check", lambda *a: RollingCheck(10, 5, original))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if failure == "transport":
+            raise httpx.ConnectError(original)
+        if failure == "http":
+            return httpx.Response(400, text=original)
+        prompt = json.loads(request.content)["messages"][-1]["content"]
+        ids = re.findall(r"=== ITEM (\S+) ===", prompt)
+        content = "\n".join(f"=== ANSWER {item_id} ===\ndone" for item_id in ids) if ids else "done"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda *a, **kw: real_client(transport=httpx.MockTransport(handler))
+    )
+    argv = [
+        "--config",
+        str(tmp_path / "none.toml"),
+        "ask" if command == "ask" else "map",
+        "-m",
+        "gpt-6-sol",
+        "--dialect",
+        "openai",
+        "--retries",
+        "0",
+    ]
+    out = tmp_path / "out"
+    if as_json:
+        argv += ["--json"]
+    if command == "ask":
+        argv += ["-p", "hi", "--output", str(out / "answer.md")]
+    else:
+        items = tmp_path / "items.jsonl"
+        items.write_text('{"id":"a","x":1}\n{"id":"b","x":2}\n', encoding="utf-8")
+        template = tmp_path / "template.txt"
+        template.write_text("shared\n===PER ITEM===\ndo {x}", encoding="utf-8")
+        argv += [
+            "--items",
+            str(items),
+            "--template",
+            str(template),
+            "--outdir",
+            str(out),
+            "--batch",
+            "2" if command == "batch" else "1",
+            "--concurrency",
+            "1",
+        ]
+    expected_code = (
+        3 if failure == "refusal" else 1 if command == "ask" or failure == "index" else 2
+    )
+    assert main(argv) == expected_code
+    captured = capsys.readouterr()
+    if failure == "index":
+        assert index_diagnostics == [expected_full]
+    assert bool(calls) is (failure != "refusal")
+    visible = captured.out + captured.err
+    assert key not in visible
+    assert encoded not in visible
+    if as_json:
+        result = json.loads(captured.out)
+        messages = (
+            [result["error"]]
+            if command == "ask" or failure in ("refusal", "index")
+            else [entry["error"] for entry in result["failures"]]
+        )
+        for message in messages:
+            assert len(message) <= 200
+            assert "\\u" not in message
+        if failure in ("output", "index"):
+            assert result["tokens"]["input"] > 0
+    else:
+        messages = [
+            line.split("  ", 2)[-1].lstrip()
+            for line in visible.splitlines()
+            if line.startswith(("  error ", "  failure ", "  budget "))
+        ]
+        assert messages
+        for message in messages:
+            # A map failure line also carries its item id.
+            if message.startswith(("a  ", "b  ")):
+                message = message[3:]
+            assert len(message) <= 200
+    if command != "ask" and failure not in ("refusal", "index"):
+        rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+        errors = [row["error"] for row in rows if row.get("status") == "error"]
+        assert errors
+        if failure == "transport":
+            assert errors[0] == "transport error: ConnectError: " + expected_full
+        elif failure == "output":
+            assert errors[0] == expected_full
+        for message in errors:
+            assert len(message) > 200
+            assert REDACTION in message
+            assert encoded not in json.dumps(message)

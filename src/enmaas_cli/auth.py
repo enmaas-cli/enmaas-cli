@@ -346,6 +346,21 @@ def cut_redacted(text: str, limit: int) -> str:
     return text[:cut]
 
 
+def error_text(message: str, key: str = "", limit: int = 200, *, terminal: bool = True) -> str:
+    """Redact a complete diagnostic, format it safely, then apply a strict cap.
+
+    JSON callers keep controls because JSON encoding makes them safe.
+    """
+    safe = redact(message, key)
+    if terminal:
+        safe = printable(safe)
+    cut = limit
+    start = safe.find(REDACTION, max(0, limit - len(REDACTION) + 1))
+    if 0 <= start < limit and start + len(REDACTION) > limit:
+        cut = start
+    return safe[:cut]
+
+
 _LINE_BREAKS = frozenset("\n\r\t")
 
 

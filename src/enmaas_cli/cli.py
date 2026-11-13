@@ -22,7 +22,7 @@ import httpx
 
 from . import gateway, openruns
 from .ask import send_ask
-from .auth import AuthError, cut_redacted, printable, printable_block, redact, resolve_key
+from .auth import AuthError, error_text, printable, printable_block, redact, resolve_key
 from .budget import RollingCheck, TokenBudget, metered, rolling_check
 from .client import CallSettings, _reply_object, make_client
 from .config import Config, ConfigError, default_config_path, load_config
@@ -40,7 +40,6 @@ from .outputs import (
     state_root,
 )
 from .receipts import (
-    FAILURE_MESSAGE_CHARS,
     ask_json,
     map_json,
     map_receipt,
@@ -404,7 +403,7 @@ def _error_text(message: str, key: str) -> str:
     The key is removed first, then the text is made printable on one line,
     then cut. Redaction comes before the cut, or part of a key could survive.
     """
-    return cut_redacted(printable(redact(message, key)), FAILURE_MESSAGE_CHARS)
+    return error_text(message, key)
 
 
 def _emit(text: str, stream: TextIO | None = None) -> None:
@@ -836,14 +835,16 @@ def _usage(args: argparse.Namespace, config: Config, final: Final) -> int:
     return int(ExitCode.OK)
 
 
-def _refused(args: argparse.Namespace, rolling: RollingCheck, final: Final) -> int | None:
+def _refused(
+    args: argparse.Namespace, rolling: RollingCheck, final: Final, key: str = ""
+) -> int | None:
     """Refuse a spending command the budget does not allow. None when it may go on."""
     if rolling.message:
         final.code = int(ExitCode.ABORTED)
         if getattr(args, "json", False):
-            print(json.dumps(refusal_json(rolling), indent=2))
+            print(json.dumps(refusal_json(rolling, key=key), indent=2))
         else:
-            print(refusal_receipt(args.command, rolling), file=sys.stderr)
+            print(refusal_receipt(args.command, rolling, key=key), file=sys.stderr)
         return int(ExitCode.ABORTED)
     if rolling.ceiling is not None and not can_append(state_root() / "usage.jsonl"):
         # A ledger that cannot be written reads as no spend on the next run,
@@ -1049,7 +1050,7 @@ async def _dispatch(
     # is opened, so an over-budget invocation costs nothing at all.
     rolling = rolling_check(config, state_root() / "usage.jsonl")
     if args.command in SPENDING_COMMANDS:
-        refused = _refused(args, rolling, final)
+        refused = _refused(args, rolling, final, key)
         if refused is not None:
             return refused
 

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from .auth import cut_redacted, printable, redact
+from .auth import cut_redacted, error_text, printable, redact
 from .dialect import Completion, Dialect
 from .errors import ExitCode
 
@@ -88,7 +88,7 @@ def failure_line_text(message: str) -> str:
     Printable comes before the cut, so the cut counts what is shown. The cut
     never splits the redaction placeholder.
     """
-    return cut_redacted(printable(message), FAILURE_MESSAGE_CHARS)
+    return error_text(message)
 
 
 def _count(value: int | None) -> str:
@@ -241,7 +241,7 @@ def map_receipt(
     model_mark = "  (default)" if model_defaulted else ""
     lines = [_MAP_HEADERS.get(outcome.abort_reason or "", "enmaas map ok")]
     if outcome.abort_reason == "index":
-        lines.append(f"  error     {printable(outcome.index_error or 'unknown')}")
+        lines.append(f"  error     {error_text(outcome.index_error or 'unknown')}")
     lines += [
         f"  model     {model}{model_mark}",
         f"  batch     {outcome.batch}{_batch_mark(outcome, batch_defaulted)}",
@@ -284,7 +284,7 @@ def ask_json(result: AskResult) -> dict[str, Any]:
         # would look untouched to a caller that only reads the
         # machine-readable output.
         "replaced": (result.completion.replaced if result.completion else 0),
-        "error": result.error,
+        "error": error_text(result.error, terminal=False) if result.error is not None else None,
     }
 
 
@@ -346,24 +346,26 @@ def map_json(
             ),
             "tripped": outcome.tripped_budget,
         },
-        # Bounded like the receipt; the index keeps every message whole. Not
-        # made printable: JSON encoding escapes control characters already.
+        # Bounded like the receipt; the index keeps every message whole.
+        # JSON encoding keeps controls safe; the display cap is strict.
         "failures": [
-            {"id": item_id, "error": cut_redacted(message, FAILURE_MESSAGE_CHARS)}
+            {"id": item_id, "error": error_text(message, terminal=False)}
             for item_id, message in outcome.failures[:FAILURE_LIMIT]
         ],
         "failures_truncated": len(outcome.failures) > FAILURE_LIMIT,
         # Why the run stopped when the index could not be written.
-        "error": outcome.index_error,
+        "error": error_text(outcome.index_error, terminal=False)
+        if outcome.index_error is not None
+        else None,
     }
 
 
-def refusal_receipt(command: str, rolling: RollingCheck) -> str:
+def refusal_receipt(command: str, rolling: RollingCheck, *, key: str = "") -> str:
     """The text printed when the rolling budget refuses a command before any request."""
-    return f"enmaas {command} refused\n  budget    {rolling.message}"
+    return f"enmaas {command} refused\n  budget    {error_text(rolling.message or '', key)}"
 
 
-def refusal_json(rolling: RollingCheck) -> dict[str, Any]:
+def refusal_json(rolling: RollingCheck, *, key: str = "") -> dict[str, Any]:
     """The --json object for the same refusal.
 
     Exit 3 already means "stopped early", so a bare exit code cannot
@@ -379,5 +381,7 @@ def refusal_json(rolling: RollingCheck) -> dict[str, Any]:
             "rolling": {"ceiling": rolling.ceiling, "spent": rolling.spent},
             "tripped": "rolling",
         },
-        "error": rolling.message,
+        "error": error_text(rolling.message, key, terminal=False)
+        if rolling.message is not None
+        else None,
     }

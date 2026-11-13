@@ -8,6 +8,7 @@ read it without printing the file.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,7 @@ def _run_map(
     count: int,
     *extra: str,
     detail: str = LONG,
+    batch: bool = False,
 ) -> int:
     """A map over `count` items where every odd item fails with a transport error.
 
@@ -54,8 +56,14 @@ def _run_map(
 
     def handler(request: httpx.Request) -> httpx.Response:
         prompt = json.loads(request.content)["messages"][-1]["content"]
-        if int(prompt.removeprefix("do ")) % 2:
+        ids = re.findall(r"=== ITEM (\S+) ===", prompt) if batch else []
+        fails = int(ids[0][1:]) % 4 == 2 if batch else bool(int(prompt.removeprefix("do ")) % 2)
+        if fails:
             raise httpx.ConnectError(detail)
+        if batch:
+            text = "\n".join(f"=== ANSWER {item_id} ===\ndone" for item_id in ids)
+            reply = {**REPLY, "choices": [{"finish_reason": "stop", "message": {"content": text}}]}
+            return httpx.Response(200, json=reply)
         return httpx.Response(200, json=REPLY)
 
     real_client = httpx.AsyncClient
@@ -70,10 +78,12 @@ def _run_map(
         encoding="utf-8",
     )
     template = tmp_path / "t.txt"
-    template.write_text("do {x}", encoding="utf-8")
+    template.write_text(("shared\n===PER ITEM===\n" if batch else "") + "do {x}", encoding="utf-8")
     argv = ["--config", str(tmp_path / "none.toml"), "map", "-m", "rits/zai-org/glm-5-3"]
     argv += ["--dialect", "openai", "--items", str(items), "--template", str(template)]
     argv += ["--outdir", str(tmp_path / "out"), "--retries", "0", "--concurrency", "1", *extra]
+    if batch:
+        argv += ["--batch", "2"]
     return main(argv)
 
 
@@ -132,10 +142,10 @@ def test_the_receipt_cuts_each_message_after_making_it_printable() -> None:
     assert message.startswith("x y")
 
 
-def test_the_receipt_keeps_a_placeholder_at_the_cut_whole() -> None:
+def test_the_receipt_ends_before_a_crossing_placeholder() -> None:
     message = "x" * 195 + REDACTION + "tail"
     (line,) = _failure_lines(map_receipt(_outcome([("a", message)]), model="m"))
-    assert line.endswith(REDACTION)
+    assert line == "  failure   a  " + "x" * 195
 
 
 @pytest.mark.parametrize(("count", "truncated"), [(50, True), (40, False)])
@@ -175,7 +185,8 @@ def test_a_key_at_the_cut_never_shows_in_part(
     detail = "x" * 160 + KEY + "y" * 100
     assert _run_map(tmp_path, monkeypatch, 2, "--json", detail=detail) == 2
     (failure,) = json.loads(capsys.readouterr().out)["failures"]
-    assert failure["error"].endswith(REDACTION)
+    assert failure["error"] == "transport error: ConnectError: " + "x" * 160
+    assert len(failure["error"]) <= 200
     assert KEY[:4] not in failure["error"].removesuffix(REDACTION)
     assert KEY not in _index_errors(tmp_path)["i01"]
 
@@ -297,3 +308,51 @@ def test_the_skill_listing_shows_at_most_twenty_rows(tmp_path: Path) -> None:
     index.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     _, listing = _skill_commands()
     assert len(_run_skill_command(listing, index)) == 20
+
+
+@pytest.mark.parametrize("length", [199, 200, 201])
+def test_error_field_strict_lengths(length: int) -> None:
+    from enmaas_cli.receipts import failure_line_text
+
+    assert failure_line_text("x" * length) == "x" * min(length, 200)
+
+
+@pytest.mark.parametrize("start", range(200 - len(REDACTION) + 1, 201))
+def test_error_field_never_splits_or_extends_placeholder(start: int) -> None:
+    from enmaas_cli.receipts import failure_line_text
+
+    message = "x" * start + REDACTION + "tail"
+    result = failure_line_text(message)
+    assert len(result) <= 200
+    assert result == ("x" * start if start + len(REDACTION) > 200 else message[:200])
+
+
+def test_index_error_display_is_bounded_but_outcome_keeps_original() -> None:
+    from dataclasses import replace
+
+    from enmaas_cli.receipts import map_json
+
+    original = "independent full diagnostic " * 40 + REDACTION
+    outcome = replace(_outcome([]), abort_reason="index", index_error=original)
+    obj = map_json(outcome, model="m")
+    receipt = map_receipt(outcome, model="m")
+    error_line = next(line for line in receipt.splitlines() if line.startswith("  error"))
+    assert len(obj["error"]) == 200
+    assert len(error_line.removeprefix("  error     ")) == 200
+    assert outcome.index_error == original
+    assert len(outcome.index_error) > 1000
+
+
+def test_batched_failures_keep_list_limit_and_full_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _run_map(tmp_path, monkeypatch, 52, "--json", batch=True) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["batch"] == 2
+    assert result["failed"] == 26
+    assert result["failures_truncated"] is True
+    assert len(result["failures"]) == 20
+    errors = _index_errors(tmp_path)
+    assert len(errors) == 26
+    assert set(errors.values()) == {"transport error: ConnectError: " + LONG}
+    assert all(len(item["error"]) == 200 for item in result["failures"])
