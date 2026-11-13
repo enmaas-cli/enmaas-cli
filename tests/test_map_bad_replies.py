@@ -188,6 +188,37 @@ async def test_text_parts_reply_completes(tmp_path: Path, mode: str) -> None:
     assert (tmp_path / "out" / f"{only}.md").read_text(encoding="utf-8") == f"done {only}"
 
 
+def _empty_object(ids: list[str], batched: bool) -> httpx.Response:
+    return httpx.Response(200, json={})
+
+
+def _usage_without_choices(ids: list[str], batched: bool) -> httpx.Response:
+    return httpx.Response(200, json={"usage": BAD_USAGE})
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    ("bad", "charge"),
+    [(_empty_object, 0), (_usage_without_choices, 34)],
+    ids=["empty-object", "usage-without-choices"],
+)
+async def test_a_reply_without_its_answer_structure_fails_only_its_own_items(
+    tmp_path: Path, mode: str, bad: ReplyFn, charge: int
+) -> None:
+    outcome = await _run(tmp_path, mode, bad)
+    rows = _item_rows(tmp_path)
+    (only,) = SECOND[mode]
+    for item_id in IDS:
+        expected = "error" if item_id == only else "ok"
+        assert rows[item_id]["status"] == expected, item_id
+    assert "choices" in rows[only]["error"]
+    assert not (tmp_path / "out" / f"{only}.md").exists()
+    assert (outcome.ok, outcome.failed, outcome.internal_errors) == (2, 1, 0)
+    assert _charges(tmp_path)[1] == charge
+    good_requests = 2 if mode == SINGLE else 1
+    assert outcome.charged == 7 * good_requests + charge
+
+
 def _validator_that_breaks_on_b(monkeypatch: pytest.MonkeyPatch) -> None:
     def validate(text: str, schema: dict[str, Any], *, key: str = "") -> None:
         if text == "done b":

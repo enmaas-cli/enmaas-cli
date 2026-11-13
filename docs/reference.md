@@ -34,6 +34,8 @@ The full response is written to the file shown in the `output` line. The receipt
 
 An answer is never written through a symbolic link, and only to a regular file. If the output path already exists as a link, `ask` fails and `map` marks that item failed with `refusing to write through a symbolic link`. A FIFO, a device or anything else that is not a regular file at the output path is refused too, without blocking: `ask` fails and `map` marks that item failed. The reply's charge is still recorded.
 
+A reply with status 200 that holds no answer structure fails as `BadReplyError`: `ask` fails and `map` marks the items of that request failed. On the OpenAI dialect the answer structure is a non-empty `choices` list whose first item holds a `message` object. On the Anthropic dialect it is a `content` list. The tokens the reply reported are still charged. A missing, null or empty text inside that structure is an empty answer, unless the reply stopped at the token limit (see [Reasoning costs output budget](#reasoning-costs-output-budget)).
+
 On an ordinary request failure the receipt goes to stderr and the exit code is 1, so a shell script can branch on it. With `--json` the error object goes to stdout. A refusal under a rolling `[budget]` exits 3.
 
 ### Map over multiple items

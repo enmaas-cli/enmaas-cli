@@ -1,7 +1,8 @@
 """A reply field of the wrong type is a BadReplyError that keeps the charged usage.
 
-A missing or null field still reads as empty, as it always has. Every error
-carries the usage the reply reported, because those tokens were billed.
+A reply without the structure that holds the answer is a BadReplyError too.
+A missing or null text inside that structure still reads as empty. Every
+error carries the usage the reply reported, because those tokens were billed.
 """
 
 from __future__ import annotations
@@ -49,11 +50,9 @@ def _bad(data: dict[str, Any], dialect: str) -> BadReplyError:
 
 
 @pytest.mark.parametrize("choices", ["missing", None, []])
-def test_openai_choices_missing_null_or_empty_is_empty(choices: Any) -> None:
+def test_openai_choices_missing_null_or_empty_is_bad_reply(choices: Any) -> None:
     data = _openai() if choices == "missing" else _openai(choices=choices)
-    c = parse_response(data, "openai")
-    assert c.text == ""
-    assert c.usage == EXPECTED
+    _bad(data, "openai")
 
 
 def test_openai_choices_list_of_objects_is_parsed() -> None:
@@ -72,13 +71,11 @@ def test_openai_choices_of_any_other_shape_is_bad_reply(choices: Any) -> None:
 
 
 @pytest.mark.parametrize("message", ["missing", None])
-def test_openai_message_missing_or_null_is_empty(message: Any) -> None:
+def test_openai_message_missing_or_null_is_bad_reply(message: Any) -> None:
     choice: dict[str, Any] = {"finish_reason": "stop"}
     if message != "missing":
         choice["message"] = message
-    c = parse_response(_openai(choices=[choice]), "openai")
-    assert c.text == ""
-    assert c.usage == EXPECTED
+    _bad(_openai(choices=[choice]), "openai")
 
 
 def test_openai_message_object_is_parsed() -> None:
@@ -191,11 +188,9 @@ def test_openai_finish_reason_of_another_type_reads_as_null(stop: Any) -> None:
 
 
 @pytest.mark.parametrize("content", ["missing", None])
-def test_anthropic_content_missing_or_null_is_empty(content: Any) -> None:
+def test_anthropic_content_missing_or_null_is_bad_reply(content: Any) -> None:
     data = _anthropic() if content == "missing" else _anthropic(content=content)
-    c = parse_response(data, "anthropic")
-    assert c.text == ""
-    assert c.usage == EXPECTED
+    _bad(data, "anthropic")
 
 
 def test_anthropic_content_list_of_objects_is_parsed() -> None:
@@ -265,6 +260,75 @@ def test_anthropic_stop_reason_of_another_type_reads_as_null(stop: Any) -> None:
     data = _anthropic(content=[{"type": "text", "text": "x"}])
     data["stop_reason"] = stop
     assert parse_response(data, "anthropic").stop is None
+
+
+# The answer structure
+
+
+@pytest.mark.parametrize("dialect", ["openai", "anthropic"])
+def test_an_empty_object_is_bad_reply_with_no_usage(dialect: str) -> None:
+    with pytest.raises(BadReplyError) as exc:
+        parse_response({}, dialect)  # type: ignore[arg-type]
+    assert exc.value.usage == Usage()
+
+
+@pytest.mark.parametrize(
+    ("data", "dialect"),
+    [
+        (_openai(), "openai"),
+        ({"usage": ANTHROPIC_USAGE}, "anthropic"),
+        (_anthropic(), "anthropic"),
+    ],
+)
+def test_a_reply_with_usage_but_no_answer_structure_keeps_the_usage(
+    data: dict[str, Any], dialect: str
+) -> None:
+    _bad(data, dialect)
+
+
+@pytest.mark.parametrize(
+    ("data", "dialect"),
+    [
+        (_openai(choices=[{"finish_reason": "length"}]), "openai"),
+        ({"usage": ANTHROPIC_USAGE, "stop_reason": "max_tokens"}, "anthropic"),
+    ],
+)
+def test_a_missing_answer_structure_at_the_token_limit_is_bad_reply(
+    data: dict[str, Any], dialect: str
+) -> None:
+    exc = _bad(data, dialect)
+    assert type(exc) is BadReplyError
+
+
+def test_openai_explicit_empty_text_with_a_normal_stop_is_an_empty_answer() -> None:
+    c = parse_response(_openai_message({"content": ""}), "openai")
+    assert (c.text, c.stop) == ("", "stop")
+    assert c.usage == EXPECTED
+
+
+def test_anthropic_explicit_empty_text_with_a_normal_stop_is_an_empty_answer() -> None:
+    c = parse_response(_anthropic(content=[{"type": "text", "text": ""}]), "anthropic")
+    assert (c.text, c.stop) == ("", "end_turn")
+    assert c.usage == EXPECTED
+
+
+@pytest.mark.parametrize(
+    ("data", "dialect"),
+    [
+        (_openai(choices=[{"finish_reason": "length", "message": {}}]), "openai"),
+        (_openai(choices=[{"finish_reason": "length", "message": {"content": None}}]), "openai"),
+        (_anthropic(stop_reason="max_tokens", content=[]), "anthropic"),
+    ],
+)
+def test_no_text_inside_the_structure_at_the_token_limit_is_still_an_empty_response(
+    data: dict[str, Any], dialect: str
+) -> None:
+    from enmaas_cli.errors import EmptyResponseError
+
+    with pytest.raises(EmptyResponseError) as exc:
+        parse_response(data, dialect)  # type: ignore[arg-type]
+    assert exc.value.usage == EXPECTED
+    assert "raise --max-tokens" in str(exc.value)
 
 
 # Safety net

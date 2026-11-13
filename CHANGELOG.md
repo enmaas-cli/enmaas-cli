@@ -152,8 +152,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
   not retried, for the same reason.
 - A reply field of an unexpected type, such as a `choices` value that is not a
   list of objects, now fails the request with `BadReplyError` in place of a
-  traceback. A missing or null field still reads as an empty answer. The error
-  keeps the token counts the reply reported, so `ask` and `map` charge them.
+  traceback. The error keeps the token counts the reply reported, so `ask`
+  and `map` charge them.
+- A reply with status 200 that holds no answer structure now fails the request
+  with `BadReplyError`. Before, a body such as `{}` was saved as an empty answer
+  with status ok. On the OpenAI dialect the answer structure is a non-empty
+  `choices` list whose first item holds a `message` object. On the Anthropic
+  dialect it is a `content` list. The error keeps the token counts the reply
+  reported. A missing, null or empty text inside that structure still reads as
+  an empty answer, and at the token limit it still fails with a message to
+  raise `--max-tokens`.
 - An OpenAI reply whose `content` is a list of parts is now read: its text
   parts are joined in order. An empty list reads as an empty answer, the same
   as a missing `content`. A non-empty list with no text part fails as
