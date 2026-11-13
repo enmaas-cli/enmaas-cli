@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import stat
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -159,20 +159,177 @@ def resolve_key(
     return _from_file(default)
 
 
-def redact(text: str, key: str) -> str:
-    """Replace every occurrence of the key with a placeholder.
+REDACTION_OMITTED = "[diagnostic omitted: safe redaction work limit]"
+MAX_REDACTION_WORK = 10_000_000
 
-    The JSON-escaped form is replaced too. A gateway that echoes a key
-    holding a quote or a backslash in a JSON error body writes it escaped,
-    and the plain form would not match there.
+
+class _RedactionLimit(Exception):
+    """The deterministic safe-redaction work allowance was exhausted."""
+
+
+class _RedactionWork:
+    def __init__(self, key_chars: int) -> None:
+        self.remaining = MAX_REDACTION_WORK
+        self.digits = 1 + key_chars // sys.int_info.bits_per_digit
+
+    def charge(self, units: int) -> None:
+        self.remaining -= units
+        if self.remaining < 0:
+            raise _RedactionLimit
+
+    def step(self, operations: int) -> None:
+        self.charge(operations * self.digits)
+
+
+def _key_masks(key: str, work: _RedactionWork) -> dict[str, int]:
+    masks: dict[str, int] = {}
+    for index, char in enumerate(key):
+        work.charge(3 * (1 + index // sys.int_info.bits_per_digit))
+        masks[char] = masks.get(char, 0) | (1 << index)
+    return masks
+
+
+def _forward(
+    text: str,
+    masks: dict[str, int],
+    start: int,
+    end: int,
+    pending: list[int],
+    work: _RedactionWork,
+    *,
+    keep: bool = False,
+) -> tuple[list[int], list[int]]:
+    work.step(7)
+    pending = pending.copy()
+    prefixes = []
+    for pos in range(start, end):
+        work.step(10)
+        active = pending[pos % 7] | 1
+        pending[pos % 7] = 0
+        if keep:
+            prefixes.append(active)
+        for char, width in _json_edges(text, pos):
+            pending[(pos + width) % 7] |= (active & masks.get(char, 0)) << 1
+    return prefixes, pending
+
+
+class _SecretMatches:
+    """Find complete paths through raw and JSON-escape character edges."""
+
+    def __init__(self, text: str, key: str, work: _RedactionWork) -> None:
+        groups, tail = divmod(len(key), sys.int_info.bits_per_digit)
+        mask_work = 3 * (
+            sys.int_info.bits_per_digit * groups * (groups + 1) // 2 + tail * (groups + 1)
+        )
+        # Reject impossible work before allocating masks or text-sized arrays.
+        if mask_work + 2 * len(text) + 10 * work.digits > work.remaining:
+            raise _RedactionLimit
+        self.text = text
+        self.work = work
+        self.masks = _key_masks(key, work)
+        work.step(10)
+        work.charge(2 * len(text))
+        self.complete = 1 << len(key)
+        self.inner = self.complete - 2
+        self.backward = [self.complete] * 7
+        self.covered = bytearray(len(text))
+        self.joined = bytearray(len(text))
+        # Keep leaf prefix bitsets within about four MiB, excluding overhead.
+        self.block = max(1, min(1024, (4 * 1024 * 1024 * 8) // len(key)))
+
+    def scan(self, start: int, end: int, pending: list[int]) -> None:
+        self.work.step(7)
+        if end - start > self.block:
+            middle = (start + end) // 2
+            _, middle_pending = _forward(self.text, self.masks, start, middle, pending, self.work)
+            self.scan(middle, end, middle_pending)
+            self.scan(start, middle, pending)
+            return
+        prefixes, _ = _forward(self.text, self.masks, start, end, pending, self.work, keep=True)
+        for pos in range(end - 1, start - 1, -1):
+            self.work.step(20)
+            active = self.complete
+            prefix = prefixes[pos - start]
+            for char, width in _json_edges(self.text, pos):
+                suffix = (self.backward[(pos + width) % 7] >> 1) & self.masks.get(char, 0)
+                active |= suffix
+                if prefix & suffix:
+                    self.covered[pos : pos + width] = b"1" * width
+                    self.joined[pos + 1 : pos + width] = b"1" * (width - 1)
+            self.backward[pos % 7] = active
+            if prefix & active & self.inner:
+                self.joined[pos] = 1
+
+    def replace(self) -> str:
+        self.work.charge((3 + len(REDACTION)) * len(self.text))
+        pieces: list[str] = []
+        pos = 0
+        previous = 0
+        while pos < len(self.text):
+            if not self.covered[pos]:
+                pos += 1
+                continue
+            pieces.extend((self.text[previous:pos], REDACTION))
+            pos += 1
+            while pos < len(self.text) and self.covered[pos] and self.joined[pos]:
+                pos += 1
+            previous = pos
+        pieces.append(self.text[previous:])
+        return "".join(pieces)
+
+
+def redact(text: str, key: str) -> str:
+    """Remove raw and equivalent single-layer JSON spellings of a key.
+
+    Forward and backward integer bitsets identify complete match paths.
+    Recursive replay bounds memory without restricting accepted keys.
+    With n text characters, k key characters and b leaf positions, time is
+    O(n * ceil(k / word_bits) * (1 + log(n / b))); auxiliary space is
+    O(n + (b + log(n) + alphabet_size) * ceil(k / word_bits)).
+    The leaf prefix payload is limited to about four MiB. Match paths can
+    overlap; adjacent independent occurrences retain separate placeholders.
+    Every bigint step and allocation is charged before work begins. When
+    the fixed allowance is exhausted, omit the entire diagnostic. Never
+    return unchecked text or a partially processed diagnostic.
     """
-    if not key:
+    if not key or len(key) > len(text):
         return text
-    text = text.replace(key, REDACTION)
-    escaped = json.dumps(key)[1:-1]
-    if escaped != key:
-        text = text.replace(escaped, REDACTION)
-    return text
+    work = _RedactionWork(len(key))
+    try:
+        work.charge(len(text) + len(key))
+        if "\\" not in text:
+            work.charge(len(text) + len(text) * len(REDACTION) // len(key))
+            return text.replace(key, REDACTION)
+        matches = _SecretMatches(text, key, work)
+        matches.scan(0, len(text), [0] * 7)
+        return matches.replace()
+    except _RedactionLimit:
+        return REDACTION_OMITTED
+
+
+def _json_edges(text: str, pos: int) -> list[tuple[str, int]]:
+    """Read one raw character and, when present, one JSON escape."""
+    char = text[pos]
+    escapes = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+    edges = [(char, 1)]
+    if char == "\\" and pos + 1 < len(text):
+        following = text[pos + 1]
+        if following in escapes:
+            edges.append((escapes[following], 2))
+        elif following == "u" and pos + 6 <= len(text):
+            digits = text[pos + 2 : pos + 6]
+            if all(c in "0123456789abcdefABCDEF" for c in digits):
+                edges.append((chr(int(digits, 16)), 6))
+    return edges
 
 
 def cut_redacted(text: str, limit: int) -> str:

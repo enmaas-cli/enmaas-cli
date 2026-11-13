@@ -25,6 +25,8 @@ import jsonschema
 import referencing
 import referencing.exceptions
 
+from .auth import cut_redacted, redact
+
 _MAX_REASON_CHARS = 200
 # Real schemas nest a few dozen objects and lists at most. The limit bounds
 # the reference check below and keeps a hostile file from using it to recurse.
@@ -113,7 +115,7 @@ def _bounded(reason: str) -> str:
     return reason[: _MAX_REASON_CHARS - 3] + "..."
 
 
-def validate_against_schema(text: str, schema: dict[str, Any]) -> None:
+def validate_against_schema(text: str, schema: dict[str, Any], *, key: str = "") -> None:
     """Check model output against the schema. Raises ValidationError if it fails.
 
     Both the JSON decoder and the schema check recurse once per nesting
@@ -135,10 +137,10 @@ def validate_against_schema(text: str, schema: dict[str, Any]) -> None:
     except jsonschema.ValidationError as exc:
         # jsonschema's message can contain the entire rejected response.
         # Report the rule and a bounded field path without printing its value.
-        parts = [str(part)[:32] for part in islice(exc.absolute_path, 4)]
+        parts = [cut_redacted(redact(str(part), key), 32) for part in islice(exc.absolute_path, 4)]
         location = json.dumps(parts, ensure_ascii=True)
         if len(location) > 120:
-            location = location[:117] + "..."
+            location = cut_redacted(location, 117) + "..."
         rule = str(exc.validator or "schema")[:48]
         detail = ""
         if (
@@ -147,8 +149,13 @@ def validate_against_schema(text: str, schema: dict[str, Any]) -> None:
             and isinstance(exc.validator_value, list)
         ):
             missing = [name for name in exc.validator_value if name not in exc.instance]
-            names = json.dumps([name[:32] for name in missing[:4]], ensure_ascii=True)
-            detail = f"; missing fields: {names[:120]}"
+            names = json.dumps(
+                [cut_redacted(redact(name, key), 32) for name in missing[:4]], ensure_ascii=True
+            )
+            detail = f"; missing fields: {cut_redacted(names, 120)}"
         raise ValidationError(
-            f"response does not match schema at {location}: {rule} constraint failed{detail}"
+            redact(
+                f"response does not match schema at {location}: {rule} constraint failed{detail}",
+                key,
+            )
         ) from exc

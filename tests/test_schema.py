@@ -555,3 +555,20 @@ def test_validation_retrieves_nothing_even_without_the_load_check(
     with pytest.raises(ValidationError, match="cannot be resolved"):
         validate_against_schema('"ordinary answer"', schemas[form])
     assert seen == []
+
+
+@pytest.mark.parametrize("key", ["short-secret", "x" * 140 + '/"\\end'])
+@pytest.mark.parametrize("required", [False, True])
+def test_schema_names_redacted_before_limits(key: str, required: bool) -> None:
+    from enmaas_cli.auth import REDACTION
+
+    schema = {"type": "object", "properties": {key: {"type": "integer"}}}
+    if required:
+        schema["required"] = [key]
+    payload = {} if required else {key: "bad"}
+    with pytest.raises(ValidationError) as caught:
+        validate_against_schema(json.dumps(payload), schema, key=key)
+    message = str(caught.value)
+    assert REDACTION in message
+    assert key[:32] not in message
+    assert key not in json.dumps(message)

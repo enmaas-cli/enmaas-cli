@@ -164,7 +164,7 @@ async def send_ask(
     try:
         if schema is not None:
             try:
-                validate_against_schema(completion.text, schema)
+                validate_against_schema(completion.text, schema, key=key)
             except ValidationError as exc:
                 elapsed = time.monotonic() - started
                 error_msg = str(exc)

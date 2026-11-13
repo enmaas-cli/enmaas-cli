@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -263,3 +264,50 @@ def test_printable_keeps_ordinary_non_ascii_letters() -> None:
 def test_printable_output_holds_only_printable_characters() -> None:
     text = "".join(chr(n) for n in range(0x00, 0x300)) + "  ‮​﻿"
     assert printable(text).isprintable()
+
+
+@pytest.mark.parametrize("key", ["short/key", 'quote"slash\\key', "a" * 96 + "/end"])
+def test_redact_mixed_json_spellings(key: str) -> None:
+    from enmaas_cli.auth import REDACTION, redact
+
+    spelling = "".join(
+        f"\\u{ord(char):04X}" if i % 3 == 0 else ("\\/" if char == "/" else json.dumps(char)[1:-1])
+        for i, char in enumerate(key)
+    )
+    assert redact("before " + spelling + " after " + spelling, key) == (
+        "before " + REDACTION + " after " + REDACTION
+    )
+
+
+@pytest.mark.parametrize("text", ["\\u0", "\\uZZZZ", "\\", "aaaaab" * 2000])
+def test_redact_preserves_nonmatches(text: str) -> None:
+    from enmaas_cli.auth import redact
+
+    assert redact(text, "aaaaac") == text
+
+
+@pytest.mark.parametrize(
+    "key,text",
+    [
+        ("\\u005c", "\\u005cu005c"),
+        ("\\\\", "\\\\\\\\"),
+        ("a/a", "a\\/a\\/a"),
+    ],
+)
+def test_redact_covers_overlapping_raw_and_encoded_spellings(key: str, text: str) -> None:
+    assert redact(text, key) == REDACTION
+
+
+def test_redact_keeps_adjacent_occurrences_separate() -> None:
+    assert redact("a\\u0061", "a") == REDACTION * 2
+
+
+def test_redaction_work_limit_omits_whole_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+    from enmaas_cli import auth
+
+    monkeypatch.setattr(auth, "MAX_REDACTION_WORK", 100)
+    key = "synthetic/key"
+    spelling = "".join(f"\\u{ord(char):04x}" for char in key)
+    assert redact("prefix " + spelling + " suffix", key) == auth.REDACTION_OMITTED
+    assert redact("tiny", "") == "tiny"
+    assert redact("tiny", "longer-key") == "tiny"

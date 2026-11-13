@@ -528,7 +528,7 @@ async def send_single(
         # validator rejects still cost its tokens.
         usage = completion.usage
         if plan.schema is not None:
-            validate_against_schema(completion.text, plan.schema)
+            validate_against_schema(completion.text, plan.schema, key=settings.key)
         path = plan.job.outdir / f"{item_id}.md"
         write_output(path, completion.text)
     except (CallError, ValidationError, OSError) as exc:
@@ -573,7 +573,7 @@ def _batch_item(
         return _error_row(item_id, f"no answer for {item_id} in the batched reply"), False
     try:
         if plan.schema is not None:
-            validate_against_schema(text, plan.schema)
+            validate_against_schema(text, plan.schema, key=key)
         path = plan.job.outdir / f"{item_id}.md"
         write_output(path, text)
     except (ValidationError, OSError) as exc:

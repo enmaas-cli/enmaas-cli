@@ -189,7 +189,7 @@ async def test_text_parts_reply_completes(tmp_path: Path, mode: str) -> None:
 
 
 def _validator_that_breaks_on_b(monkeypatch: pytest.MonkeyPatch) -> None:
-    def validate(text: str, schema: dict[str, Any]) -> None:
+    def validate(text: str, schema: dict[str, Any], *, key: str = "") -> None:
         if text == "done b":
             raise TypeError("unreviewed text from deep inside a library")
 

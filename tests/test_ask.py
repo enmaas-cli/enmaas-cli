@@ -144,7 +144,7 @@ def test_an_unexpected_error_keeps_the_charge_and_never_its_text(
     capsys: pytest.CaptureFixture[str],
     as_json: bool,
 ) -> None:
-    def validate(text: str, schema: dict[str, Any]) -> None:
+    def validate(text: str, schema: dict[str, Any], *, key: str = "") -> None:
         raise RuntimeError("secret text")
 
     monkeypatch.setattr("enmaas_cli.ask.validate_against_schema", validate)

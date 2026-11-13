@@ -266,6 +266,8 @@ to stderr. No traceback is printed unless `ENMAAS_DEBUG=1` is set (see
 `results.jsonl` keeps every failure message whole. The skill gives commands
 that count the failures and list them from it.
 
+Diagnostic redaction covers raw keys and equivalent single-layer JSON string escapes. It has a fixed work limit. If safe redaction reaches that limit, the entire diagnostic becomes `[diagnostic omitted: safe redaction work limit]`, including in the index. This does not change which keys are accepted or alter saved answers.
+
 ### The refusal object
 
 `ask` and `map` print this when a rolling `[budget]` refuses the command before
