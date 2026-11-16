@@ -840,8 +840,12 @@ def test_the_budget_refusal_never_prints_ledger_content(
     assert all(ch.isprintable() for line in err.splitlines() for ch in line)
     assert "forged" not in err
     assert "9" * 20 not in err
-    assert "line 1: unknown field; line 2: bad timestamp; line 3: not JSON" in err
-    assert err.rstrip("\n").endswith("; and 3 more")
+    expected_message = (
+        f"a token budget is configured but the usage ledger {ledger} could not be read: "
+        "line 1: unknown field; line 2: bad timestamp; line 3: not JSON; line 4: not JSON; "
+        "line 5: not JSON; and 3 more"
+    )
+    assert err == f"enmaas ask refused\n  budget    {expected_message[:200]}\n"
 
 
 # Ledger rows are checked field by field, so no row can break a reader.

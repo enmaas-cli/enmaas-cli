@@ -161,7 +161,12 @@ def test_budgeted_commands_preserve_incomplete_state_and_recover_once(
     for _ in range(2):
         assert main(args) == 3
         output = capsys.readouterr()
-        assert "records were retained; restore accounting" in output.err
+        expected_message = (
+            f"open-run records in {record_file} could not all be read, so the token budget "
+            "cannot be checked; records were retained; restore accounting before budgeted "
+            "work can resume"
+        )
+        assert output.err == f"enmaas {command} refused\n  budget    {expected_message[:200]}\n"
         assert "private-content" not in output.err
         assert seen == []
         assert record_file.read_bytes() == raw

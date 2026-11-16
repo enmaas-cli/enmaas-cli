@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 
-from .auth import printable, redact
+from .auth import error_text, printable
 from .client import CallSettings, call
 from .dialect import (
     DEFAULT_MAX_TOKENS,
@@ -61,6 +61,7 @@ def _failed_after_reply(
     It keeps the reply's usage, because the request was billed. The answer
     may not have been saved, so the result carries no completion.
     """
+    error = error_text(error, terminal=False)
     return AskResult(
         receipt=(
             f"enmaas ask FAILED\n"
@@ -138,7 +139,7 @@ async def send_ask(
         completion = parse_response(data, resolved)
     except CallError as exc:
         elapsed = time.monotonic() - started
-        error_msg = redact(str(exc), key)
+        error_msg = error_text(str(exc), key, terminal=False)
         return AskResult(
             receipt=(
                 f"enmaas ask FAILED\n"
@@ -167,7 +168,7 @@ async def send_ask(
                 validate_against_schema(completion.text, schema, key=key)
             except ValidationError as exc:
                 elapsed = time.monotonic() - started
-                error_msg = str(exc)
+                error_msg = error_text(str(exc), key, terminal=False)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 write_output(path, completion.text)
                 # The altered response is still written to disk above, so the
@@ -211,7 +212,7 @@ async def send_ask(
             path,
             started,
             completion,
-            error=redact(str(exc), key),
+            error=error_text(str(exc), key, terminal=False),
             error_kind="OSError",
         )
     except Exception as exc:

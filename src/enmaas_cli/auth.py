@@ -346,6 +346,49 @@ def cut_redacted(text: str, limit: int) -> str:
     return text[:cut]
 
 
+# Receipt and --json error fields are cut to this length after redaction.
+ERROR_TEXT_CHARS = 200
+
+
+def _placeholder_across(text: str, cut: int) -> int:
+    """The start of the earliest placeholder that begins before `cut` and ends after it.
+
+    Returns -1 when no placeholder crosses `cut`. Overlapping placeholders
+    count: text after a key can repeat the placeholder's tail. The search
+    window holds only placeholders that start before `cut`, so the work does
+    not grow with the length of the text.
+    """
+    end = cut + len(REDACTION) - 1
+    start = text.find(REDACTION, max(0, cut - len(REDACTION)), end)
+    while start >= 0:
+        if start + len(REDACTION) > cut:
+            return start
+        start = text.find(REDACTION, start + 1, end)
+    return -1
+
+
+def error_text(
+    message: str, key: str = "", limit: int = ERROR_TEXT_CHARS, *, terminal: bool = True
+) -> str:
+    """Redact a complete diagnostic, format it safely, then apply a strict cap.
+
+    The cut never falls inside a placeholder. When one crosses it, the cut
+    moves to that placeholder's start, and again while another crosses the
+    new cut. The result is at most `limit` characters.
+
+    JSON callers keep controls because JSON encoding makes them safe.
+    """
+    safe = redact(message, key)
+    if terminal:
+        safe = printable(safe)
+    cut = limit
+    start = _placeholder_across(safe, cut)
+    while start >= 0:
+        cut = start
+        start = _placeholder_across(safe, cut)
+    return safe[:cut]
+
+
 _LINE_BREAKS = frozenset("\n\r\t")
 
 

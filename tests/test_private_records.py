@@ -399,7 +399,11 @@ def test_a_budgeted_ask_refuses_a_fifo_ledger_and_names_it(tmp_path: Path) -> No
     ledger = _fifo_ledger(tmp_path)
     done = _cli(tmp_path, *_budget(tmp_path), *ASK, "-o", str(tmp_path / "a.md"))
     assert done.returncode == 3
-    assert f"{ledger} is not a regular file" in done.stderr
+    expected_message = (
+        f"a token budget is configured but the usage ledger {ledger} could not be read: "
+        f"{ledger} is not a regular file"
+    )
+    assert done.stderr == f"enmaas ask refused\n  budget    {expected_message[:200]}\n"
     assert not (tmp_path / "a.md").exists()
 
 

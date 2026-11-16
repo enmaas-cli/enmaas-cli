@@ -1015,7 +1015,7 @@ cp "$FIXTURES/gateway-replace/home/.config/enmaas/config.toml" "$fx/home/.config
 snapshot "$fx" >"$TMP/gateway-bad.before"
 FX_HOME="$fx/home" FX_PATH="$NOOP_UV" fx_run gateway-bad 1 --cli-only --gateway not-a-url
 check "gateway bad: the refusal names the URL" \
-  log_says "Gateway URL must start with http:// or https://: not-a-url"
+  log_says "Gateway URL must start with http:// or https://"
 snapshot "$fx" >"$TMP/gateway-bad.after"
 check "gateway bad: nothing changed" cmp -s "$TMP/gateway-bad.before" "$TMP/gateway-bad.after"
 
@@ -1039,6 +1039,18 @@ check "gateway env: the install says the environment URL will be used" \
 snapshot "$fx" >"$TMP/gateway-env.after"
 check "gateway env: nothing written" cmp -s "$TMP/gateway-env.before" "$TMP/gateway-env.after"
 
+# An explicit gateway does not make an environment URL safe to print.
+fx="$FIXTURES/gateway-env-hidden"
+mkdir -p "$fx/home"
+ENMAAS_BASE_URL='https://UserSecret:PassSecret@g.test' FX_HOME="$fx/home" FX_PATH="$NOOP_UV" \
+  fx_run gateway-env-hidden 0 --cli-only --gateway https://explicit.example.test
+check "gateway precedence: explicit URL is saved" \
+  grep -qF 'base_url = "https://explicit.example.test"' "$fx/home/.config/enmaas/config.toml"
+check "gateway precedence: the fixed note explains the environment override" \
+  log_says '$ENMAAS_BASE_URL is set. The CLI uses it before config.toml.'
+check "gateway precedence: environment credentials are omitted" \
+  test "$(grep -cE -- 'UserSecret|PassSecret' "$FX_LOG" || true)" = 0
+
 # Gateway URLs that cannot be used are refused before anything changes, and
 # the refusal says what is wrong.
 fx="$FIXTURES/gateway-invalid"
@@ -1050,15 +1062,45 @@ BAD_URLS=("https://" "https://g.test:bad" "https://g.test:" "https://g.test/?x=1
 BAD_REASONS=("has no host name" "has a port that is not a number from 0 to 65535" \
   "has no port number after the colon" "must not have a query (?) or a fragment (#)" \
   "must not have a query (?) or a fragment (#)" "must start with http:// or https://" \
-  "is not a valid URL (Invalid IPv6 URL)" "must not contain credentials (user@host)" \
+  "is not a valid URL" "must not contain credentials (user@host)" \
   "must use https:// for a host other than localhost" \
   "must use https:// for a host other than localhost" \
   "must use https:// for a host other than localhost")
+BAD_URLS+=(
+  'https://UserSecret:PassSecret@g.test'
+  'https://User%53ecret:Pass%53ecret@g.test'
+  'https://UserSecret:PassSecret@[broken'
+  'https://UserSecret:PassSecret@g.test:bad'
+  'ftp://UserSecret:PassSecret@g.test'
+  'http://UserSecret:PassSecret@g.test'
+  'https://UserSecret:PassSecret@g.test?x=1'
+  'https://UserSecret:PassSecret@g.test#part'
+  'https://UserSecret:PassSecret@g.test/a b'
+  'https://UserSecret:PassSecret@'
+)
+BAD_REASONS+=(
+  'must not contain credentials (user@host)'
+  'must not contain credentials (user@host)'
+  'is not a valid URL'
+  'has a port that is not a number from 0 to 65535'
+  'must start with http:// or https://'
+  'must use https:// for a host other than localhost'
+  'must not contain credentials (user@host)'
+  'must not contain credentials (user@host)'
+  'must not contain spaces'
+  'has no host name'
+)
 for index in "${!BAD_URLS[@]}"; do
   FX_HOME="$fx/home" FX_PATH="$NOOP_UV" fx_run gateway-invalid 1 --cli-only \
     --gateway "${BAD_URLS[$index]}"
   check "gateway invalid: ${BAD_URLS[$index]} is refused with the reason" \
-    log_says "Gateway URL ${BAD_REASONS[$index]}: ${BAD_URLS[$index]}"
+    log_says "Gateway URL ${BAD_REASONS[$index]}"
+  check "gateway invalid: supplied URL stays out of diagnostics" \
+    test "$(grep -cF -- "${BAD_URLS[$index]}" "$FX_LOG" || true)" = 0
+  check "gateway invalid: parser details stay out of diagnostics" \
+    test "$(grep -cF -- "Invalid IPv6 URL" "$FX_LOG" || true)" = 0
+  check "gateway invalid: synthetic credentials stay out of diagnostics" \
+    test "$(grep -cE -- 'UserSecret|PassSecret|User%53ecret|Pass%53ecret' "$FX_LOG" || true)" = 0
 done
 snapshot "$fx" >"$TMP/gateway-invalid.after"
 check "gateway invalid: nothing changed" \
@@ -1125,7 +1167,7 @@ mkdir -p "$fx/home"
 ENMAAS_BASE_URL=https:// FX_HOME="$fx/home" FX_PATH="$NOOP_UV" \
   fx_run gateway-env-bad 1 --cli-only
 check "gateway env bad: the refusal names \$ENMAAS_BASE_URL and the problem" \
-  log_says "\$ENMAAS_BASE_URL has no host name: https://"
+  log_says "\$ENMAAS_BASE_URL has no host name"
 check "gateway env bad: the refusal says to fix or unset it" \
   log_says "Fix or unset \$ENMAAS_BASE_URL, then run this again."
 fx="$FIXTURES/gateway-config-bad"
@@ -1134,7 +1176,7 @@ printf '%s\n' 'base_url = "https://"' >"$fx/home/.config/enmaas/config.toml"
 snapshot "$fx" >"$TMP/gateway-config-bad.before"
 FX_HOME="$fx/home" FX_PATH="$NOOP_UV" fx_run gateway-config-bad 1 --cli-only
 check "gateway config bad: the refusal names base_url and the problem" \
-  log_says "base_url in ~/.config/enmaas/config.toml has no host name: https://"
+  log_says "base_url in ~/.config/enmaas/config.toml has no host name"
 check "gateway config bad: the refusal says how to fix it" \
   log_says "Run this again with --gateway URL, or fix base_url in ~/.config/enmaas/config.toml."
 snapshot "$fx" >"$TMP/gateway-config-bad.after"

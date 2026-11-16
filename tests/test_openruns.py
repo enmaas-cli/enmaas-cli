@@ -1796,7 +1796,8 @@ def test_an_unreadable_record_file_refuses_only_under_a_budget(
     if budgeted:
         assert code == 3
         assert seen == []
-        assert INCOMPLETE_REFUSAL.format(path=state / openruns.OPEN_RUNS_FILE) in err
+        expected = INCOMPLETE_REFUSAL.format(path=state / openruns.OPEN_RUNS_FILE)
+        assert err == f"enmaas ask refused\n  budget    {expected[:200]}\n"
     else:
         assert code == 0
         assert len(seen) == 1

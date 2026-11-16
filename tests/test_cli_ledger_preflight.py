@@ -110,7 +110,7 @@ def _refusal(ledger: Path) -> str:
     return (
         f"the usage ledger {ledger} cannot be written, so the token budget "
         "cannot be tracked; fix it or remove the [budget] table from the config"
-    )
+    )[:200]
 
 
 @pytest.fixture

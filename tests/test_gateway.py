@@ -129,18 +129,20 @@ def _resolve(url: str) -> str:
 def test_bad_gateway_urls_are_rejected_with_a_reason(url: str, reason: str) -> None:
     with pytest.raises(ValueError) as exc_info:
         _resolve(url)
-    assert str(exc_info.value) == f"gateway URL is not valid ({reason}): {url}"
+    assert str(exc_info.value) == f"gateway URL is not valid ({reason})"
+    assert url not in str(exc_info.value)
 
 
 @pytest.mark.parametrize("url", ["https://g.test:", "https://g.test:/v1", "http://[::1]:"])
 def test_a_url_with_an_empty_port_is_rejected(url: str) -> None:
     with pytest.raises(ValueError) as exc_info:
         _resolve(url)
-    assert str(exc_info.value) == f"gateway URL is not valid (empty port): {url}"
+    assert str(exc_info.value) == "gateway URL is not valid (empty port)"
+    assert url not in str(exc_info.value)
 
 
 def test_a_bad_configured_url_is_rejected_too() -> None:
-    with pytest.raises(ValueError, match=r"\(missing host\): https://$"):
+    with pytest.raises(ValueError, match=r"^gateway URL is not valid \(missing host\)$"):
         resolve_base_url("https://", {}, CONFIG)
 
 
@@ -214,7 +216,7 @@ def _command(name: str, tmp_path: Path) -> list[str]:
 
 
 @pytest.mark.parametrize("command", COMMANDS)
-def test_bad_url_without_a_key_reports_the_url_on_stderr(
+def test_bad_url_without_a_key_reports_the_fixed_reason_on_stderr(
     command: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -227,7 +229,7 @@ def test_bad_url_without_a_key_reports_the_url_on_stderr(
     captured = capsys.readouterr()
     assert code == 1
     assert captured.out == ""
-    assert captured.err == "error: gateway URL is not valid (missing host): https://\n"
+    assert captured.err == "error: gateway URL is not valid (missing host)\n"
 
 
 @pytest.mark.parametrize("command", COMMANDS)
@@ -247,7 +249,7 @@ def test_bad_url_without_a_key_emits_one_json_error_object(
     assert captured.err == ""
     assert json.loads(captured.out) == {
         "status": "error",
-        "error": "gateway URL is not valid (invalid port): https://g.test:bad",
+        "error": "gateway URL is not valid (invalid port)",
     }
 
 
