@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from .auth import cut_redacted, error_text, printable, redact
+from .auth import ERROR_TEXT_CHARS, cut_redacted, error_text, printable, redact
 from .dialect import Completion, Dialect
 from .errors import ExitCode
 
@@ -25,7 +25,7 @@ PREVIEW_LIMIT = 160
 # A run with many failures would otherwise print a receipt or a --json
 # object as long as its index. The index keeps every message whole.
 FAILURE_LIMIT = 20
-FAILURE_MESSAGE_CHARS = 200
+FAILURE_MESSAGE_CHARS = ERROR_TEXT_CHARS
 _RUN_NAME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{4}")
 
 

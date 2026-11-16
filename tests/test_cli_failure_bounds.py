@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
-from enmaas_cli.auth import REDACTION
+from enmaas_cli.auth import REDACTION, error_text, redact
 from enmaas_cli.cli import main
 from enmaas_cli.receipts import FAILURE_LIMIT, FAILURE_MESSAGE_CHARS, map_receipt
 from enmaas_cli.runner import MapOutcome
@@ -317,7 +317,8 @@ def test_error_field_strict_lengths(length: int) -> None:
     assert failure_line_text("x" * length) == "x" * min(length, 200)
 
 
-@pytest.mark.parametrize("start", range(200 - len(REDACTION) + 1, 201))
+# The first start puts the placeholder's end exactly at the cap, so it stays.
+@pytest.mark.parametrize("start", range(200 - len(REDACTION), 201))
 def test_error_field_never_splits_or_extends_placeholder(start: int) -> None:
     from enmaas_cli.receipts import failure_line_text
 
@@ -325,6 +326,41 @@ def test_error_field_never_splits_or_extends_placeholder(start: int) -> None:
     result = failure_line_text(message)
     assert len(result) <= 200
     assert result == ("x" * start if start + len(REDACTION) > 200 else message[:200])
+
+
+def _placeholder_starts(text: str) -> list[int]:
+    """Every start of the placeholder in `text`, overlapping ones included."""
+    starts = []
+    start = text.find(REDACTION)
+    while start >= 0:
+        starts.append(start)
+        start = text.find(REDACTION, start + 1)
+    return starts
+
+
+def test_error_text_ends_before_a_placeholder_that_overlapping_text_crosses() -> None:
+    # Gateway text after the key can repeat the placeholder's tail. The
+    # placeholder it forms overlaps the real one and crosses the cap.
+    key = "SECRETKEYVALUE"
+    message = "x" * 183 + key + "REDACTED***" + "y" * 50
+    assert error_text(message, key) == "x" * 183
+
+
+@pytest.mark.parametrize(
+    "follow",
+    ["REDACTED***", "*REDACTED***", "**REDACTED***", REDACTION, "REDACTED***REDACTED***"],
+)
+@pytest.mark.parametrize("start", range(200 - 3 * len(REDACTION), 201))
+def test_error_text_never_cuts_inside_any_placeholder(start: int, follow: str) -> None:
+    key = "SECRETKEYVALUE"
+    message = "x" * start + key + follow + "y" * 50
+    full = redact(message, key)
+    result = error_text(message, key)
+    assert len(result) <= 200
+    assert full.startswith(result)
+    assert key[:4] not in result
+    for begin in _placeholder_starts(full):
+        assert not begin < len(result) < begin + len(REDACTION), (begin, len(result))
 
 
 def test_index_error_display_is_bounded_but_outcome_keeps_original() -> None:

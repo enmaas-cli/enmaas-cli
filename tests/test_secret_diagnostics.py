@@ -138,6 +138,65 @@ def test_schema_command_diagnostics(
             assert key not in json.dumps(message)
 
 
+def test_ask_receipt_cuts_a_long_schema_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.schema import ValidationError, validate_against_schema
+
+    for name in os.environ:
+        if name.startswith("ENMAAS_"):
+            monkeypatch.delenv(name, raising=False)
+    for name in (
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+    ):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    monkeypatch.setenv("ENMAAS_KEY", "schema-length-synthetic-key")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "http://127.0.0.1:1")
+    # A long path and four long missing names give a diagnostic over 200.
+    schema: dict[str, Any] = {"type": "object", "required": ["n" * 40 + str(i) for i in range(4)]}
+    payload: dict[str, Any] = {}
+    for index in range(4):
+        name = "p" * 40 + str(index)
+        schema = {"type": "object", "properties": {name: schema}}
+        payload = {name: payload}
+    answer = json.dumps(payload)
+    with pytest.raises(ValidationError) as caught:
+        validate_against_schema(answer, schema)
+    full = str(caught.value)
+    assert len(full) > 200
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": answer}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda *a, **kw: real_client(transport=httpx.MockTransport(handler))
+    )
+    argv = ["--config", str(tmp_path / "none.toml"), "ask", "-m", "gpt-6-sol"]
+    argv += ["--dialect", "openai", "--retries", "0", "--schema", str(schema_path)]
+    argv += ["-p", "hi", "--output", str(tmp_path / "out" / "answer.md")]
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    lines = (captured.out + captured.err).splitlines()
+    (line,) = [line for line in lines if line.startswith("  error     ")]
+    message = line.removeprefix("  error     ")
+    assert len(message) == 200
+    assert message == full[:200]
+
+
 @pytest.mark.parametrize(
     ("command", "failure"),
     [
