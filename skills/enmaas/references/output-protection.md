@@ -36,11 +36,13 @@ alternatives, simple directory changes, pipelines, heredocs, and input
 redirection. A reader command with a `$'...'` string the hook cannot decode
 the way Bash does, such as one with an unknown escape or a NUL, is denied.
 The hook checks the command after a common shell keyword, such as `if` or
-`do`, and inside a command substitution. It reads through six execution
-wrappers: `env`, `command`, `builtin`, `time`, `sudo` and `xargs`. It does not
-check the command that another wrapper runs. `timeout`, `nice`, `nohup`,
-`stdbuf`, `exec`, `eval`, `bash -c` and `sh -c` are examples. Do not use a
-wrapper to get past a denial.
+`do`, and inside a command substitution. It reads through these execution
+wrappers: `env`, `command`, `builtin`, `time`, `sudo`, `xargs`, `timeout`,
+`nice`, `nohup`, `stdbuf`, `exec` and `setsid`. It reads shell text given to
+`eval`, or to `sh`, `bash`, `dash`, `zsh` or `ksh` with `-c`. It does not
+check the command that another launcher runs, such as `ionice`, `flock` or
+`find -exec`, or shell text in a script file. Do not use a wrapper to get
+past a denial.
 Filename-only searches and counts are allowed as metadata. A file that a
 reader loads as input, such as a pattern file (`-f`), a script file, or an
 ignore or exclude file, is checked first, in every output mode.

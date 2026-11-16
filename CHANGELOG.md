@@ -37,6 +37,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   opened, so an assistant could read a protected answer in full through either
   host. A reader command with a `$'...'` string the guard cannot decode, such as
   one with an unknown escape or a NUL, is now denied.
+- The output guard now checks the command that `timeout`, `nice`, `nohup`,
+  `stdbuf`, `exec` or `setsid` runs, and the shell text given to `eval` or to
+  `sh`, `bash`, `dash`, `zsh` or `ksh` with `-c`. Before, the guard stopped at
+  any of these, so `timeout 5 cat answer.md` read a protected answer in full,
+  and `enmaas allow-read` or `enmaas ask --stdout` behind one was not blocked.
+  A reader behind one of these with an option the guard does not know is
+  denied.
 - The output guard now checks a file that a reader loads as input before it
   allows a search that prints only file names or counts. Before,
   `rg -l -f answer.md other.txt` was allowed, and ripgrep printed the text of
@@ -346,12 +353,17 @@ of error text to 200 characters.
   are read incorrectly. A command that uses one can read a protected answer,
   or be denied by mistake. The guard protects against accidental reads. It is
   not a security boundary.
-- The guard reads through six wrapper commands only: `env`, `command`,
-  `builtin`, `time`, `sudo` and `xargs`. A reader behind `xargs` is denied.
-  The command that `timeout`, `nice`, `nohup`, `stdbuf`, `exec`, `eval`,
-  `bash -c` or `sh -c` runs is not checked. So `timeout 5 cat answer.md`
-  reads a protected answer in full, and `enmaas allow-read` or
-  `enmaas ask --stdout` behind such a wrapper is not blocked.
+- The guard reads through a fixed list of wrapper commands: `env`, `command`,
+  `builtin`, `time`, `sudo`, `xargs`, `timeout`, `nice`, `nohup`, `stdbuf`,
+  `exec` and `setsid`. It reads shell text given to `eval`, or to `sh`,
+  `bash`, `dash`, `zsh` or `ksh` with `-c`. The command that any other
+  launcher runs is not checked. `ionice`, `flock`, `watch`, `script -c` and
+  `find -exec` are examples. So `ionice cat answer.md` reads a protected
+  answer in full, and `enmaas allow-read` or `enmaas ask --stdout` behind
+  such a launcher is not blocked. Shell text that the guard cannot see is not
+  checked either: a script file, text piped to a shell, and text that a
+  variable or a command substitution produces. `command cat -v answer.md` is
+  allowed by mistake.
 - A very long command, of several hundred kilobytes, can take the guard
   longer than its 3 second budget, and its answer can come after the 5 second
   hook timeout that both hosts are given. On Claude Code the hook is
