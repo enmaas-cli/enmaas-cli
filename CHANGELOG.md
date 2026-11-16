@@ -145,6 +145,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - An answer is written only to a regular file. A FIFO or a device at the answer
   path fails that `ask` or `map` item without blocking, and the reply's charge
   is still recorded.
+- An answer is no longer written through an existing file that has more than
+  one hard link. Before, the file was emptied when it was opened, so a second
+  name planted in the output directory let an answer replace any file you can
+  write. Now that `ask` or `map` item fails with `refusing to write an answer
+  through a file with more than one hard link`, the other file is unchanged,
+  and the reply's charge is still recorded.
 - An API key echoed back JSON-escaped in a gateway error body, as happens for a
   key holding a quote or a backslash, is now removed from the error message.
 - A client error during a request, such as a reply that cannot be decoded, now

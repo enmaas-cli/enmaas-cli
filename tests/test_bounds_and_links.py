@@ -350,6 +350,193 @@ def test_ask_writes_a_new_output_with_mode_600(
     assert is_protected(output)
 
 
+# Output writes and hard links
+
+HARD_LINK_REFUSAL = "refusing to write an answer through a file with more than one hard link"
+
+
+def _open_flags(monkeypatch: pytest.MonkeyPatch, target: Path) -> list[int]:
+    """Record the flags of every os.open call on `target`."""
+    seen: list[int] = []
+    real_open = os.open
+
+    def spy(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if Path(path) == target:
+            seen.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy)
+    return seen
+
+
+def _open_descriptors() -> set[str]:
+    return set(os.listdir("/proc/self/fd"))
+
+
+def test_write_output_refuses_a_file_with_a_second_hard_link(tmp_path: Path) -> None:
+    target = tmp_path / "answer.md"
+    target.write_bytes(b"keep me\x00\xff")
+    other = tmp_path / "other.txt"
+    os.link(target, other)
+    with pytest.raises(OSError) as caught:
+        write_output(target, "overwrite")
+    assert str(caught.value) == f"{HARD_LINK_REFUSAL}: {target}"
+    assert other.read_bytes() == b"keep me\x00\xff"
+    assert other.stat().st_nlink == 2
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd")
+def test_write_output_closes_the_descriptor_when_it_refuses_a_hard_link(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "answer.md"
+    target.write_text("keep me")
+    os.link(target, tmp_path / "other.txt")
+    before = _open_descriptors()
+    with pytest.raises(OSError, match=HARD_LINK_REFUSAL):
+        write_output(target, "overwrite")
+    assert _open_descriptors() == before
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd")
+def test_write_output_closes_the_descriptor_when_the_truncate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "answer.md"
+    target.write_text("keep me")
+
+    def fail(fd: int, length: int) -> None:
+        raise OSError("truncate failed")
+
+    monkeypatch.setattr(os, "ftruncate", fail)
+    before = _open_descriptors()
+    with pytest.raises(OSError, match="truncate failed"):
+        write_output(target, "overwrite")
+    assert _open_descriptors() == before
+    assert target.read_text() == "keep me"
+
+
+def test_write_output_truncates_after_the_checks_for_a_new_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "answer.md"
+    flags = _open_flags(monkeypatch, target)
+    write_output(target, "hello é")
+    assert len(flags) == 1
+    assert not flags[0] & os.O_TRUNC
+    assert target.read_text(encoding="utf-8") == "hello é"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_write_output_truncates_after_the_checks_for_a_single_link_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "answer.md"
+    target.write_text("old contents that are much longer than the answer")
+    target.chmod(0o644)
+    flags = _open_flags(monkeypatch, target)
+    write_output(target, "new")
+    assert len(flags) == 1
+    assert not flags[0] & os.O_TRUNC
+    assert target.read_bytes() == b"new"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("as_json", [True, False], ids=["json", "receipt"])
+def test_ask_refuses_an_output_with_a_second_hard_link_and_keeps_its_charge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    as_json: bool,
+) -> None:
+    _ask_env(tmp_path, monkeypatch)
+
+    async def fake_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return OK
+
+    monkeypatch.setattr(ask, "call", fake_call)
+    output = tmp_path / "answer.md"
+    output.write_bytes(b"keep me")
+    other = tmp_path / "other.txt"
+    os.link(output, other)
+    argv = ["--config", str(tmp_path / "none.toml"), "ask", "-p", "x", "-m", "gpt-4o"]
+    argv += ["-o", str(output), *(["--json"] if as_json else [])]
+    code = cli.main(argv)
+    captured = capsys.readouterr()
+    assert code == 1
+    message = f"{HARD_LINK_REFUSAL}: {output}"
+    if as_json:
+        payload = json.loads(captured.out)
+        assert payload["error"] == message
+    else:
+        assert f"  error     {message}" in captured.err.splitlines()
+    assert other.read_bytes() == b"keep me"
+    (row,) = _ledger(tmp_path)
+    assert row["status"] == "error"
+    assert row["error_kind"] == "OSError"
+    assert (row["input_tokens"], row["output_tokens"]) == (5, 2)
+    assert row["charge"] == 7
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+async def test_map_fails_an_item_whose_output_has_a_second_hard_link(
+    tmp_path: Path, batch: int
+) -> None:
+    items = tmp_path / "items.jsonl"
+    items.write_text('{"id":"a"}\n{"id":"b"}\n')
+    template = tmp_path / "template.txt"
+    template.write_text("shared\n===PER ITEM===\n{id}")
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    (outdir / "a.md").write_bytes(b"keep me")
+    other = tmp_path / "other.txt"
+    os.link(outdir / "a.md", other)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if batch > 1:
+            text = "\n".join(f"=== ANSWER {name} ===\nanswer" for name in ("a", "b"))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"finish_reason": "stop", "message": {"content": text}}],
+                    "usage": OK["usage"],
+                },
+            )
+        return httpx.Response(200, json=OK)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        outcome = await run_map(
+            client=client,
+            base_url="https://mock.test",
+            key="local-fixture-key",
+            model="gpt-4o",
+            items_path=items,
+            template_path=template,
+            outdir=outdir,
+            concurrency=1,
+            retries=0,
+            timeout=2,
+            thinking=False,
+            max_tokens=50,
+            dialect="openai",
+            resume=False,
+            batch=batch,
+        )
+    message = f"{HARD_LINK_REFUSAL}: {outdir / 'a.md'}"
+    assert other.read_bytes() == b"keep me"
+    assert outcome.ok == 1
+    assert outcome.failed == 1
+    assert outcome.failures == [("a", message)]
+    assert outcome.charged == 7 * (2 if batch == 1 else 1)
+    assert (outdir / "b.md").read_text() == "answer"
+    rows = [json.loads(line) for line in (outdir / "results.jsonl").read_text().splitlines()]
+    failed = [row for row in rows if row.get("id") == "a"]
+    assert failed[0]["status"] == "error"
+    assert failed[0]["error"] == message
+    charges = [row["charge"] for row in rows if row.get("type") == "request"]
+    assert charges == [7] * (2 if batch == 1 else 1)
+
+
 def test_ask_passes_the_key_to_call_for_redaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

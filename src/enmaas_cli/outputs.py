@@ -102,10 +102,16 @@ def write_output(path: Path, text: str) -> None:
     sent to a FIFO and stop this one before its spend is recorded. The open
     is nonblocking, so a FIFO cannot hold it, and the type is checked on the
     open descriptor.
+
+    A file with more than one hard link is refused, because another name
+    for the same file could be any file its owner can write. The open does
+    not truncate: truncating at open time would empty that other file before
+    any check ran. The file is truncated only after both checks pass on the
+    open descriptor.
     """
     if path.is_symlink():
         raise _link_refusal(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         descriptor = os.open(path, flags, 0o600)
     except OSError as exc:
@@ -114,13 +120,19 @@ def write_output(path: Path, text: str) -> None:
             raise _link_refusal(path) from None
         raise
     try:
-        regular = stat.S_ISREG(os.fstat(descriptor).st_mode)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(
+                f"refusing to write an answer to a path that is not a regular file: {path}"
+            )
+        if info.st_nlink > 1:
+            raise OSError(
+                f"refusing to write an answer through a file with more than one hard link: {path}"
+            )
+        os.ftruncate(descriptor, 0)
     except BaseException:
         os.close(descriptor)
         raise
-    if not regular:
-        os.close(descriptor)
-        raise OSError(f"refusing to write an answer to a path that is not a regular file: {path}")
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(text.encode("utf-8"))
 
