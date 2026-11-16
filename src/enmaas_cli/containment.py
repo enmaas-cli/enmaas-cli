@@ -142,9 +142,51 @@ _PREFIX = "enmaas containment: "
 # Preserve quoted and escaped punctuation until command boundaries are checked.
 _QUOTED_PUNCTUATION = str.maketrans({char: chr(0xE000 + i) for i, char in enumerate(";&|()<>\n~")})
 _QUOTED_TILDE = str(_QUOTED_PUNCTUATION[ord("~")])
+# Stands in for a backslash that Bash removes inside double quotes, before a
+# dollar sign or a backquote. A word keeps it as a backslash. Shell source that
+# a nested shell reads drops it, as Bash does.
+_QUOTED_ESCAPE = "\ue0fe"
+_QUOTED_TEXT = {str(value): chr(key) for key, value in _QUOTED_PUNCTUATION.items()}
 _LITERAL_PUNCTUATION = str.maketrans(
-    {value: key for key, value in _QUOTED_PUNCTUATION.items() if key != ord("~")}
+    {
+        **{value: key for value, key in _QUOTED_TEXT.items() if key != "~"},
+        _QUOTED_ESCAPE: "\\",
+    }
 )
+# A nested shell reads the source again, so quoted punctuation is live in it.
+_SOURCE_TEXT = str.maketrans({**_QUOTED_TEXT, _QUOTED_ESCAPE: ""})
+# Wrappers that run the command that follows their own options. Each entry
+# lists the short options without a value, the short options with a value,
+# the long options without a value and the long options with a value.
+_WRAPPERS: dict[str, tuple[str, str, set[str], set[str]]] = {
+    "timeout": (
+        "fpv",
+        "ks",
+        {"--foreground", "--preserve-status", "--verbose"},
+        {"--kill-after", "--signal"},
+    ),
+    "nice": ("", "n", set(), {"--adjustment"}),
+    "nohup": ("", "", set(), set()),
+    "stdbuf": ("", "ioe", set(), {"--input", "--output", "--error"}),
+    "exec": ("cl", "a", set(), set()),
+    "setsid": ("cfw", "", {"--ctty", "--fork", "--wait"}, set()),
+}
+_NICE_ADJUSTMENT = re.compile(r"-[-+]?[0-9]+")
+_DURATION = re.compile(r"(?:[0-9]+\.?[0-9]*|\.[0-9]+)[smhd]?")
+# Shells that run their first operand as source when given -c. The letters are
+# options without a value that every listed shell reads the same way. Bash has
+# a few more, and reads its long options with one dash or two. The other
+# shells read the same word as a group of letters, so the names are Bash only.
+_SHELLS = {"sh", "bash", "dash", "zsh", "ksh"}
+_SHELL_FLAGS = "abefhiklmnprstuvxC"
+_BASH_FLAGS = "BDEHPT"
+_BASH_LONG_FLAGS = _words(
+    """
+debugger dump-po-strings dump-strings help login noediting noprofile norc posix
+pretty-print restricted verbose version
+"""
+)
+_BASH_LONG_VALUES = {"init-file", "rcfile"}
 
 
 # A sed r, R, w or W command takes the rest of its line as a file name. The
@@ -595,6 +637,83 @@ def _rg_scope(args: list[str], operands: list[str], cwd: Path) -> str | None:
     return None
 
 
+def _wrapped(name: str, tokens: list[str]) -> list[str]:
+    """Return the command a transparent wrapper runs, after the wrapper's own options."""
+    flags, valued, long_flags, long_valued = _WRAPPERS[name]
+    index = 0
+    while index < len(tokens) and tokens[index].startswith("-") and tokens[index] != "-":
+        option = tokens[index]
+        index += 1
+        if option == "--":
+            break
+        if option in {"--help", "--version"}:
+            # The wrapper prints its own text and runs nothing.
+            return []
+        if name == "nice" and _NICE_ADJUSTMENT.fullmatch(option):
+            continue
+        if option.startswith("--"):
+            long, equal, _ = option.partition("=")
+            if long in long_valued:
+                index += 0 if equal else 1
+            elif long not in long_flags or equal:
+                raise ValueError("unsupported execution wrapper option")
+            continue
+        for position, letter in enumerate(option[1:], start=2):
+            if letter in valued:
+                # The value is the rest of this word, or the next word.
+                index += 1 if position == len(option) else 0
+                break
+            if letter not in flags:
+                raise ValueError("unsupported execution wrapper option")
+    if name == "timeout":
+        # One word before the command is the duration.
+        if index < len(tokens) and not _DURATION.fullmatch(tokens[index]):
+            raise ValueError("unsupported timeout duration")
+        index += 1
+    return tokens[index:]
+
+
+def _shell_source(name: str, tokens: list[str]) -> str | None:
+    """Return the shell source that eval or a shell given -c runs, or None."""
+    if name == "eval":
+        words = tokens[1:] if tokens[:1] == ["--"] else tokens
+    else:
+        bash = name in {"sh", "bash"}
+        flags = _SHELL_FLAGS + (_BASH_FLAGS if bash else "")
+        command = False
+        index = 0
+        while index < len(tokens) and tokens[index][:1] in {"-", "+"}:
+            option = tokens[index]
+            index += 1
+            if option in {"-", "--"}:
+                break
+            long = option[2:] if option.startswith("--") else option[1:]
+            if option in {"--help", "--version"}:
+                continue
+            if bash and option[0] == "-" and long in _BASH_LONG_FLAGS:
+                continue
+            if bash and option[0] == "-" and long in _BASH_LONG_VALUES:
+                index += 1
+                continue
+            if option.startswith("--"):
+                raise ValueError("unsupported shell option")
+            for letter in option[1:]:
+                if letter == "c":
+                    command = True
+                elif letter == "o" or (letter == "O" and bash):
+                    # The option name is the next word.
+                    index += 1
+                elif letter not in flags:
+                    raise ValueError("unsupported shell option")
+        words = tokens[index : index + 1] if command else []
+    if not words:
+        return None
+    source = " ".join(words).translate(_SOURCE_TEXT)
+    if _UNRESOLVED in source:
+        raise ValueError("shell source the guard cannot read")
+    return source
+
+
 def _unwrap(tokens: list[str]) -> list[str]:
     """Expose commands behind common shell keywords and execution wrappers."""
     while tokens:
@@ -613,6 +732,9 @@ def _unwrap(tokens: list[str]) -> list[str]:
             continue
         if name in {"if", "then", "elif", "else", "do", "while", "until", "!", "{", "}"}:
             tokens = tokens[1:]
+            continue
+        if name in _WRAPPERS:
+            tokens = _wrapped(name, tokens[1:])
             continue
         if name not in {"command", "builtin", "time", "sudo", "xargs"}:
             return tokens
@@ -781,7 +903,9 @@ def _heredocs(command: str) -> tuple[str, list[str]]:
     return "".join(result), embedded
 
 
-def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | None, Path]:
+def _segment(
+    tokens: list[str], cwd: Path, stdin: bool = False, entered: set[Path] | None = None
+) -> tuple[str | None, Path]:
     if not tokens:
         return None, cwd
     words = tokens
@@ -821,6 +945,12 @@ def _segment(tokens: list[str], cwd: Path, stdin: bool = False) -> tuple[str | N
         return None, _path(args[0], cwd)
     if name == "enmaas":
         return _enmaas(args), cwd
+    if name == "eval" or name in _SHELLS:
+        source = _shell_source(name, tokens[index + 1 :])
+        if source is None:
+            return None, cwd
+        # eval runs in this shell, so a cd inside it also moves later commands.
+        return _shell(source, cwd, entered if name == "eval" else None), cwd
     if name not in _READERS:
         return None, cwd
     operands, pattern, metadata, program_paths, inputs = _reader_operands(name, args)
@@ -1062,7 +1192,8 @@ def _shell_syntax(command: str) -> str:
         elif char == "\\" and index + 1 < len(command):
             following = command[index + 1]
             if following != "\n":
-                result.extend((char, following.translate(_QUOTED_PUNCTUATION)))
+                escape = _QUOTED_ESCAPE if quote and following in "$`" else char
+                result.extend((escape, following.translate(_QUOTED_PUNCTUATION)))
                 word = True
             index += 1
         elif quote == '"':
@@ -1086,7 +1217,8 @@ def _shell_syntax(command: str) -> str:
     return "".join(result)
 
 
-def _shell(command: str, cwd: Path) -> str | None:
+def _shell(command: str, cwd: Path, entered: set[Path] | None = None) -> str | None:
+    """Check shell source. Add the directories it may end in to entered, when given."""
     command, embedded = _heredocs(_dollar_quotes(command))
     command, substitutions = _substitutions(command)
     lexer = shlex.shlex(_shell_syntax(command), posix=True, punctuation_chars=";&|()<>\n")
@@ -1102,7 +1234,7 @@ def _shell(command: str, cwd: Path) -> str | None:
             for candidate in list(directories):
                 if _remaining() <= 0:
                     return _narrow()
-                reason, next_cwd = _segment(segment, candidate, stdin)
+                reason, next_cwd = _segment(segment, candidate, stdin, directories)
                 if reason:
                     return reason
                 directories.add(next_cwd.resolve())
@@ -1122,6 +1254,8 @@ def _shell(command: str, cwd: Path) -> str | None:
             reason = _shell(nested, candidate)
             if reason:
                 return reason
+    if entered is not None:
+        entered.update(directories)
     return None
 
 
