@@ -69,6 +69,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   rows without a word. The reason names the path when it is not a regular
   file, and is the error class name otherwise. The exit code and `--json`
   output do not change.
+- After an upgrade, a state directory and a ledger made by an earlier version
+  keep the modes they had, because enmaas sets a mode only when it creates a
+  file or a directory. To make them private, run
+  `chmod 700 ~/.local/state/enmaas/runs` and
+  `chmod 600 ~/.local/state/enmaas/runs/usage.jsonl`. When `XDG_STATE_HOME`
+  is set, the directory is `$XDG_STATE_HOME/enmaas/runs`. A `results.jsonl`
+  from an earlier run also keeps its mode.
 - A malformed gateway reply, a stop signal or a crash no longer loses the
   spend of the requests a run already made. Before, a reply such as
   `{"choices": [1]}` ended a `map` run with a traceback before its ledger
@@ -96,7 +103,18 @@ and versions follow [Semantic Versioning](https://semver.org/).
   failed inside the request, and the transport error printed both lines of
   it with the newline escaped, where redaction did not find it. The first
   line can be a working key.
-- Text from a gateway reply or a file can no longer act on the terminal.
+- A gateway URL that is refused is no longer printed, by the CLI or by
+  `install.sh`. Before, the error ended with the URL, so a URL with
+  credentials in it, such as `https://user:password@host`, showed them on the
+  terminal and in any log the output was pasted into. The error now gives
+  only the reason, such as
+  `gateway URL is not valid (credentials in the URL are not allowed)`.
+- An API key that appears as a property name in a `--schema` file is now
+  removed from the error of a failed schema check. Before, `ask` named the
+  missing or failing field as written, up to 32 characters of it, in its
+  receipt and in `ask --json`.
+- Text from a gateway reply or a file can no longer act on the terminal,
+  except through `ask --stdout`.
   Before, a reply that held an escape sequence such as OSC 52, which asks
   the terminal to set the clipboard, reached the terminal through the receipt
   preview, and so could a model id in the `models` list, a file name in a
@@ -105,7 +123,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   character that cannot be printed as `?`, a newline or a tab in an error or
   a preview as a space, and `inspect` keeps newlines and tabs. Answer files,
   `ask --json` and `results.jsonl` keep the text as sent, and the `map --json`
-  failure list keeps it as sent up to 200 characters. The preview and both
+  failure list keeps it as sent up to 200 characters. `ask --stdout` also
+  prints the answer as the gateway sent it, escape sequences included, so
+  this fix does not cover it. See Known limits. The preview and both
   `models` outputs also remove the key, as typed or in its JSON escaped form,
   before the text is made printable and cut. Before, a reply that echoed the
   key printed it in the preview, and `models --json` printed a catalog id
@@ -221,7 +241,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - An error inside enmaas that no handler expected no longer prints a
   traceback. It is reported as `internal error (<class> at <file>:<line>)`,
   never with its text. `ENMAAS_DEBUG=1` adds the traceback on stderr, with the
-  key removed.
+  key removed. One case still prints a traceback: a config file that is not
+  valid UTF-8. See Known limits.
 - A model catalog that is not a JSON object with a `data` list of objects with
   a string `id`, such as an HTML page or a JSON list, now makes `models` exit 1
   with one `error:` line naming the problem in place of a traceback. The error
@@ -253,6 +274,15 @@ and versions follow [Semantic Versioning](https://semver.org/).
   The receipt then says how many more the index holds, and `map --json` has a
   new `failures_truncated` field. `results.jsonl` keeps every message whole,
   and the skill gives commands that count and list failures from it.
+- Error text is now cut to 200 characters, after the key is removed. This
+  covers the `error` line of a failed `ask` receipt, the `error` field of
+  `ask --json`, a budget refusal as text or as JSON, and an `error:` line
+  from `ask`, `map`, `models`, `record` or `usage`. Before, each was printed
+  whole. Some errors are still not cut: an argument error, a config file
+  error printed without `--json`, an error about the gateway URL or the key,
+  and an error from `inspect` or `allow-read`. `results.jsonl` keeps each
+  `map` failure message without this cut, with the key removed. A long path
+  in a message can push the rest of it out. See Known limits.
 - The reference documents every field of the `ask`, `map`, refusal and error
   JSON objects and of the `models` list.
 - The usage ledger can record `BadReplyError` as the `error_kind` of an `ask`.
@@ -262,9 +292,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   that ends during the check is counted, and its refusal says how much came
   from open runs and names `open-runs.jsonl`. When the records cannot all be
   read, the check refuses and names that file.
-- A budget refusal over a damaged ledger names the ledger and lists at most
-  five problems, each as a line number and a fixed reason. It never shows a
-  value or a key from the ledger.
+- A budget refusal over a damaged ledger names the ledger and lists up to
+  five problems, each as a line number and a fixed reason, then how many more
+  there are. The whole message is then cut to 200 characters, so it shows as
+  many problems as fit, and a long ledger path leaves room for fewer. It
+  never shows a value or a key from the ledger.
 - A second SIGINT or SIGTERM ends the process at once, even while it waits on
   a file or a lock. The next command charges a `map` run stopped this way from
   its open-run record. A signal that arrives after a command has printed its
@@ -303,35 +335,62 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Known limits
 
-These are open in this release. None of them is new in 0.8.0.
+These are open in this release. None of them is new in 0.8.0, except the cut
+of error text to 200 characters.
 
 - The output guard reads a shell command without running it, and it does not
   model every shell construct. Parameter expansion with a default or
   alternate word, a `case` pattern inside a command substitution, an
-  arithmetic shift, some wrapper commands, and file names that hold
-  private-use Unicode characters are read incorrectly. A command that uses
-  one can read a protected answer, or be denied by mistake. The guard
-  protects against accidental reads. It is not a security boundary.
-- A very long command can take longer than the guard's 3 second budget before
-  it is denied.
+  arithmetic shift, and file names that hold private-use Unicode characters
+  are read incorrectly. A command that uses one can read a protected answer,
+  or be denied by mistake. The guard protects against accidental reads. It is
+  not a security boundary.
+- The guard reads through six wrapper commands only: `env`, `command`,
+  `builtin`, `time`, `sudo` and `xargs`. A reader behind `xargs` is denied.
+  The command that `timeout`, `nice`, `nohup`, `stdbuf`, `exec`, `eval`,
+  `bash -c` or `sh -c` runs is not checked. So `timeout 5 cat answer.md`
+  reads a protected answer in full, and `enmaas allow-read` or
+  `enmaas ask --stdout` behind such a wrapper is not blocked.
+- A very long command, of several hundred kilobytes, can take the guard
+  longer than its 3 second budget, and its answer can come after the 5 second
+  hook timeout that both hosts are given. On Claude Code the hook is
+  registered with `onFailure: "block"`, so the host blocks the call when the
+  hook fails or times out. What Codex does in that case is not confirmed.
 - Two commands started at the same time each check the rolling budget on
   their own, so together they can spend more than the budget.
 - A gateway reply is read into memory whole, with no size limit.
-- `ask --stdout` prints the answer as the gateway sent it. If the gateway
-  echoes the API key inside an answer, the key is printed. The guard blocks
-  `--stdout` from an assistant.
+- If the gateway echoes the API key inside an answer, the key is in the
+  answer file. `ask --stdout` prints the answer as the gateway sent it, so it
+  prints that key and any terminal escape sequence in the answer.
+  `enmaas inspect` replaces the characters that cannot be printed, but it
+  also prints the key. The guard allows `inspect` to an assistant. It blocks
+  `ask --stdout` from an assistant, except behind a wrapper it does not read
+  through.
 - The hard link refusal checks the file after it is opened. A process that can
   write the output directory and removes the planted name at that moment can
   still have an answer written into the other file.
-- The installer removes a hook entry of your own if that entry mentions the
-  guard's path.
-- With `--json`, an argument error or a config file that is not valid UTF-8
-  prints plain text, not a JSON object.
+- When it registers or removes the guard in Claude Code's `settings.json`,
+  `install.sh` removes every `PreToolUse` hook entry whose command contains
+  the text `enmaas/guard/hooks/pre-tool-use.py`, including one you wrote
+  yourself. `install.sh --uninstall` does the same. `--dry-run` does not name
+  such an entry. It says only that it would replace or remove the enmaas
+  guard registration. In Codex's `config.toml` the installer stops with an
+  error when it finds such an entry outside its own marked block.
+- With `--json`, an argument error prints plain text on stderr, not a JSON
+  object. A config file that is not valid UTF-8 makes every command except
+  `inspect` and `allow-read` print a Python traceback and exit 1, with or
+  without `--json`.
+- An error is cut to 200 characters with its file path included, so a long
+  state directory path can push the reason or the fix hint out of the
+  message.
 - A config file or another input file that is a named pipe can block the
   command.
 - The ledger file is not checked for its owner.
 - A configured price that is not a finite number produces invalid JSON in
   `usage --json`.
+- For contributors: four tests write into the state directory of the person
+  who runs them, and two of those add rows to the usage ledger there.
+  `CONTRIBUTING.md` has the command that runs the tests in a scratch folder.
 
 ## [0.7.1] - 2026-11-09
 

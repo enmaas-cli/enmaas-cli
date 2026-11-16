@@ -61,8 +61,12 @@ Options:
 | `--uninstall` | Remove the command, skill, guard and its registrations. |
 
 The installer is safe to run again at any time. It reinstalls the parts you
-selected and leaves everything else in your settings exactly as it was. It checks
-both host files before writing and refuses to touch one it cannot edit safely.
+selected and keeps every other setting, with one exception. When it registers
+the guard in Claude Code's `settings.json`, it removes every `PreToolUse` hook
+entry whose command contains the text `enmaas/guard/hooks/pre-tool-use.py`,
+including one you wrote yourself. `--dry-run` does not name that entry. It
+checks both host files before writing and refuses to touch one it cannot edit
+safely.
 
 The installer honours `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and an absolute
 `XDG_DATA_HOME` if you have set them. The paths in this guide are the defaults.
@@ -176,8 +180,10 @@ version. If the run stops partway, fix what it reports and run it again.
 ```
 
 This removes the command, both skill copies, the guard and its two registrations.
-The `PreToolUse` list in `settings.json` keeps any other hooks you had. If the
-guard was the only one, an empty list is left so nothing else in the file moves. Your key file, your config file and your past answers stay where
+The `PreToolUse` list in `settings.json` keeps any other hooks you had, except a
+hook whose command contains the text `enmaas/guard/hooks/pre-tool-use.py`. That
+hook is removed too, even if you wrote it yourself, and `--dry-run` does not
+name it. If the guard was the only one, an empty list is left so nothing else in the file moves. Your key file, your config file and your past answers stay where
 they are. Delete
 `~/.secrets/enmaas`, `~/.config/enmaas/` and `~/.local/state/enmaas/` (or
 `$XDG_STATE_HOME/enmaas/`) yourself if you want them gone.

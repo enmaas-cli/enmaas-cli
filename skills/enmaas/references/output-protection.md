@@ -34,8 +34,13 @@ inside `sed` (`r`, `R`, `w`, `W`) and `awk` (`getline <`) programs. It handles
 quoted paths, Bash `$'...'` and `$"..."` quoting, globs, home paths, brace
 alternatives, simple directory changes, pipelines, heredocs, and input
 redirection. A reader command with a `$'...'` string the hook cannot decode
-the way Bash does, such as one with an unknown escape or a NUL, is denied. Common shell keywords and execution wrappers
-are checked, along with command substitutions.
+the way Bash does, such as one with an unknown escape or a NUL, is denied.
+The hook checks the command after a common shell keyword, such as `if` or
+`do`, and inside a command substitution. It reads through six execution
+wrappers: `env`, `command`, `builtin`, `time`, `sudo` and `xargs`. It does not
+check the command that another wrapper runs. `timeout`, `nice`, `nohup`,
+`stdbuf`, `exec`, `eval`, `bash -c` and `sh -c` are examples. Do not use a
+wrapper to get past a denial.
 Filename-only searches and counts are allowed as metadata. A file that a
 reader loads as input, such as a pattern file (`-f`), a script file, or an
 ignore or exclude file, is checked first, in every output mode.
@@ -59,8 +64,12 @@ Unsupported readers and disabled hooks do not grant permission to read answers.
 For `rg`, the guard enumerates filenames using the same traversal and ignore
 options. It does not read search results. Other directory checks use a
 conservative filesystem scan. Checks stop at 250,000 entries or three seconds, whichever comes first, and a
-check that stops early is a denial. On Claude Code the hook is registered with
-`onFailure: "block"`, so a hook that fails or is killed blocks the call. Narrow a rejected search instead of switching readers or disabling
+check that stops early is a denial. A very long command, of several hundred
+kilobytes, can still take the hook longer than three seconds, and its answer
+can then come after the 5 second hook timeout that both hosts are given. On
+Claude Code the hook is registered with `onFailure: "block"`, so a hook that
+fails or times out blocks the call. What Codex does in that case is not
+confirmed. Narrow a rejected search instead of switching readers or disabling
 protection. Piped searches without file operands inspect their upstream command;
 they do not scan the working directory. Native Grep defaults to filename output.
 

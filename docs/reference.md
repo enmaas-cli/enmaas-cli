@@ -109,7 +109,7 @@ These go before the subcommand: `enmaas --key-file PATH models`.
 - `-m, --model MODEL`: The model to use. Optional; without it the configured `default_model` applies and the receipt says `(default)`.
 - `--schema PATH`: Constrain the answer to this JSON Schema. Validated locally on both dialects. Every `$ref`, `$dynamicRef` and `$recursiveRef` must point inside the file, so it starts with `#`; enmaas never fetches a schema. A file nested more than 100 levels deep is refused. See [Structured output](../skills/enmaas/SKILL.md#structured-output).
 - `--schema-name NAME`: The name sent with the schema. Defaults to `StructuredOutput`. `ask` and unbatched `map` send the schema and its name with the request; batched `map` keeps the schema local and validates each answer after the reply is split.
-- `--json`: Print exactly one JSON object on stdout in place of the receipt, on every exit: a result, a refusal or an error. See [JSON output](#json-output).
+- `--json`: Print exactly one JSON object on stdout in place of the receipt: a result, a refusal or an error. This does not hold for an argument error, which prints plain text, or for a config file that is not valid UTF-8, which prints a Python traceback. See [JSON output](#json-output).
 - `--dialect {anthropic,openai}`: Override dialect selection. By default, the dialect is inferred from the model name.
 - `--max-tokens N`: Maximum output tokens. Must be positive.
 - `--timeout SECONDS`: Request timeout. Must be positive. Defaults to 280 seconds.
@@ -206,10 +206,16 @@ On exit code 3 from `map`, re-run with `--resume` to skip completed items. If th
 
 ## JSON output
 
-With `--json`, `ask` and `map` print exactly one JSON object on stdout, whatever
-happens: the command's result, a budget refusal, or an error. Warnings still go
-to stderr. No traceback is printed unless `ENMAAS_DEBUG=1` is set (see
+With `--json`, `ask` and `map` print exactly one JSON object on stdout: the
+command's result, a budget refusal, or an error. Warnings still go to stderr.
+No traceback is printed unless `ENMAAS_DEBUG=1` is set (see
 [Errors](#errors)).
+
+This does not hold in two known cases. An argument error, such as an unknown
+flag, prints plain text on stderr and nothing on stdout. A config file that is
+not valid UTF-8 prints a Python traceback on stderr and nothing on stdout, with
+or without `--json`. Both exit 1. They are listed under
+[Known limits](../CHANGELOG.md#known-limits) in the changelog.
 
 ### The `ask` object
 
@@ -450,8 +456,10 @@ everything else, so a stray typo anywhere in the file would run uncapped.
 For the same reason the command refuses to start when a budget is configured and
 the ledger cannot be read, when the open-run records cannot all be read, or when
 `ENMAAS_NO_USAGE_LOG` disables recording. A refusal over the ledger names it and
-lists at most five problems, each as a line number and a fixed reason such as
-`bad count` or `not JSON`, then how many more there are. It never shows a value
+lists up to five problems, each as a line number and a fixed reason such as
+`bad count` or `not JSON`, then how many more there are. The whole message is
+then cut to 200 characters, so it shows as many problems as fit, and a long
+ledger path leaves room for fewer. It never shows a value
 from the ledger. A ledger path that is a link, a FIFO or anything else that is
 not a regular file is one problem, `<path> is not a regular file`, and nothing
 waits on it.
@@ -703,10 +711,13 @@ that failed.
 request, by writing a record under a hidden `.enmaas-output` directory next to
 it. The guard installed by `install.sh` reads those records and denies an
 assistant's ordinary attempts to read the file: the hosts' file tools and the
-common shell readers. It answers inside a time budget of three seconds and denies
-a search it cannot finish checking in that time, so a slow check never turns into
-a silent allow. On Claude Code it is registered with `onFailure: "block"`, so a
-hook that fails or is killed blocks the call. The guard is for accidental reads;
+common shell readers. Its checks have a time budget of three seconds, and it
+denies a search it cannot finish checking in that time. A very long command, of
+several hundred kilobytes, can still take it longer than the budget, and its
+answer can then come after the 5 second hook timeout that both hosts are given.
+On Claude Code it is registered with `onFailure: "block"`, so a hook that fails
+or times out blocks the call. What Codex does in that case is not confirmed.
+The guard is for accidental reads;
 an assistant that writes its own program to open the file is outside its scope. `enmaas inspect PATH` is the sanctioned
 preview and `enmaas allow-read PATH`, run by a person, is the sanctioned
 exception. Full coverage rules, resume behaviour and troubleshooting are in
