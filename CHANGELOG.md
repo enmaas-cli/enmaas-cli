@@ -237,7 +237,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
   prompt or schema, an unknown model dialect, a refused index and a malformed
   `[budget]` table used to print text on stderr only. The error object is
   `{"status": "error", "error": ...}`; its text has the key removed, is printed
-  on one line, and is cut to 200 characters.
+  on one line, and is cut to 200 characters. An error about the gateway URL or
+  the key is not cut.
 - An error inside enmaas that no handler expected no longer prints a
   traceback. It is reported as `internal error (<class> at <file>:<line>)`,
   never with its text. `ENMAAS_DEBUG=1` adds the traceback on stderr, with the
