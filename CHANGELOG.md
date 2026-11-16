@@ -145,6 +145,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - An answer is written only to a regular file. A FIFO or a device at the answer
   path fails that `ask` or `map` item without blocking, and the reply's charge
   is still recorded.
+- An answer is no longer written through an existing file that has more than
+  one hard link. Before, the file was emptied when it was opened, so a second
+  name planted in the output directory let an answer replace any file you can
+  write. Now that `ask` or `map` item fails with `refusing to write an answer
+  through a file with more than one hard link`, the other file is unchanged,
+  and the reply's charge is still recorded.
 - An API key echoed back JSON-escaped in a gateway error body, as happens for a
   key holding a quote or a backslash, is now removed from the error message.
 - A client error during a request, such as a reply that cannot be decoded, now
@@ -152,8 +158,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
   not retried, for the same reason.
 - A reply field of an unexpected type, such as a `choices` value that is not a
   list of objects, now fails the request with `BadReplyError` in place of a
-  traceback. A missing or null field still reads as an empty answer. The error
-  keeps the token counts the reply reported, so `ask` and `map` charge them.
+  traceback. The error keeps the token counts the reply reported, so `ask`
+  and `map` charge them.
+- A reply with status 200 that holds no answer structure now fails the request
+  with `BadReplyError`. Before, a body such as `{}` was saved as an empty answer
+  with status ok. On the OpenAI dialect the answer structure is a non-empty
+  `choices` list whose first item holds a `message` object. On the Anthropic
+  dialect it is a `content` list. The error keeps the token counts the reply
+  reported. A missing, null or empty text inside that structure still reads as
+  an empty answer, and at the token limit it still fails with a message to
+  raise `--max-tokens`.
 - An OpenAI reply whose `content` is a list of parts is now read: its text
   parts are joined in order. An empty list reads as an empty answer, the same
   as a missing `content`. A non-empty list with no text part fails as

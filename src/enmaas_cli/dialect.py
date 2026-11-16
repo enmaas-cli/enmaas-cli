@@ -331,18 +331,21 @@ def _openai_content(content: object, usage: Usage) -> str:
 
 
 def _parse_openai(data: dict[str, Any]) -> Completion:
+    # The answer lives in choices[0].message. A reply without that structure
+    # holds no answer at all, even an empty one, so it fails. A message whose
+    # content is missing or null reads as empty, which lets a reply cut off
+    # during reasoning raise EmptyResponseError below.
     usage = _openai_usage(data)
     choices = data.get("choices")
     if choices is None or choices == []:
-        choice: dict[str, Any] = {}
-    elif isinstance(choices, list) and isinstance(choices[0], dict):
-        choice = choices[0]
-    else:
+        raise BadReplyError("reply holds no choices", usage)
+    if not isinstance(choices, list) or not isinstance(choices[0], dict):
         raise BadReplyError("reply choices is not a list of objects", usage)
+    choice = choices[0]
     message = choice.get("message")
     if message is None:
-        message = {}
-    elif not isinstance(message, dict):
+        raise BadReplyError("reply choice holds no message", usage)
+    if not isinstance(message, dict):
         raise BadReplyError(f"reply message is a {type(message).__name__}", usage)
     text, text_replaced = _utf8_safe(_openai_content(message.get("content"), usage))
     reasoning, reasoning_replaced = _utf8_safe(
@@ -377,11 +380,14 @@ def _anthropic_usage(data: dict[str, Any]) -> Usage:
 
 
 def _parse_anthropic(data: dict[str, Any]) -> Completion:
+    # The answer lives in the content list. A reply without one holds no
+    # answer at all and fails. An empty list is a reply with no blocks, as
+    # one cut off during reasoning can be.
     usage = _anthropic_usage(data)
     blocks = data.get("content")
     if blocks is None:
-        blocks = []
-    elif not isinstance(blocks, list) or not all(isinstance(b, dict) for b in blocks):
+        raise BadReplyError("reply holds no content list", usage)
+    if not isinstance(blocks, list) or not all(isinstance(b, dict) for b in blocks):
         raise BadReplyError("reply content is not a list of objects", usage)
 
     text_parts: list[str] = []

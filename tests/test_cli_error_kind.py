@@ -132,6 +132,33 @@ def test_exhausted_reply_is_recorded_as_empty_response_error(
     assert rows[0]["charge"] == 7
 
 
+@pytest.mark.parametrize(
+    ("body", "charge"),
+    [({}, 0), ({"usage": {"prompt_tokens": 5, "completion_tokens": 2}}, 7)],
+    ids=["empty-object", "usage-only"],
+)
+def test_a_success_reply_without_choices_is_recorded_as_bad_reply_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    body: dict[str, Any],
+    charge: int,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    output = tmp_path / "answer.md"
+    assert _ask(tmp_path, monkeypatch, handler, "-o", str(output), "--json") == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "error"
+    assert "choices" in result["error"]
+    assert not output.exists()
+    rows = _ledger_rows(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["error_kind"] == "BadReplyError"
+    assert rows[0]["charge"] == charge
+
+
 def test_transport_failure_is_recorded_as_gateway_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
