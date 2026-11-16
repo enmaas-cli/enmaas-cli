@@ -21,24 +21,26 @@
 **enmaas** is a command line tool and an agent skill. You, or your coding
 assistant, hand it work that is independent per item and needs no tool calls:
 classify a few hundred findings, read a long document once, get a second opinion
-from a different model family. It sends the work to EnMaaS, which hosts Claude,
-GPT, Gemini and two free open-weight models behind one key, writes every answer
-to a file, and prints a short receipt with a preview of at most 160 characters.
-The full answer stays out of the conversation that asked for it. The gateway is
-any endpoint that serves the OpenAI or Anthropic API shape under `/v1`; your
-organization gives you its URL and your key.
+from another model. It sends the work to a gateway that serves the OpenAI or
+Anthropic API shape under `/v1`, writes each answer to a file, and prints a
+short receipt. The full answer stays out of the conversation that asked for it.
 
-## Why teams use it
+- **Small context.** A long file is summarised without its text entering the
+  session.
+- **Cheap bulk work.** `enmaas map` sends items on their own, several at once.
+  The default model is free.
+- **A guard.** A hook for Claude Code and Codex denies what it recognizes as a
+  read of a delegated answer.
+- **A ledger.** `enmaas usage` shows what you spent. A token budget can refuse a
+  run before it starts.
 
-| | |
-|---|---|
-| **Free where free is enough** | On an 80-item rule-checking task scored against ground truth, the free default model matched in-session Opus (98.8% accuracy) for 95% less. The cheapest paid Claude model did worse and cost more. Price does not order capability, so the tool measures and you choose. |
-| **Context stays small** | A 150,000-token file is summarised without a token of it entering the session. Every later step is cheaper, because every tool call re-sends the whole conversation. |
-| **Bulk without the multiplier** | When an assistant loops over a list, each item carries the entire conversation. `enmaas map` sends items on their own, several at once, and batches shared instructions. |
-| **A guard for accidental reads** | A `PreToolUse` hook for Claude Code and Codex denies what it recognizes as a read of a delegated answer, and what it cannot finish checking. It allows a command it does not recognize. The assistant previews a bounded prefix; you decide when it may read the whole thing. |
+## What is new in 0.8.0
 
-One task class was measured. Treat the numbers as evidence to check against your
-own work, and run `enmaas usage` to see what yours costs.
+A hardening release. Keys and refused gateway URLs stay out of error text. New
+state files are private. A bad reply keeps its charge, and a budgeted run stops
+when the ledger is damaged. The guard recognizes more shell forms. Read the
+[changelog](CHANGELOG.md), including its
+[Known limits](CHANGELOG.md#known-limits), before you rely on the guard.
 
 ## Install
 
@@ -49,21 +51,16 @@ cd enmaas-cli
 ```
 
 The installer sets up the command, the gateway URL, the skill and the guard for
-whichever of Claude Code and Codex it finds. Put your key in `~/.secrets/enmaas`,
-run `enmaas models`, and you are done. The **[install guide](INSTALL.md)** has every
-step, the host setup, and a troubleshooting table.
+whichever of Claude Code and Codex it finds. Put your key in `~/.secrets/enmaas`
+and run `enmaas models`. The [install guide](INSTALL.md) has every step.
 
-### From a plugin marketplace
-
-This repository is also a Claude Code plugin. A marketplace that lists it
-installs the skill and the output guard in one step:
+From a Claude Code plugin marketplace that lists this repository:
 
 ```
 /plugin install enmaas --marketplace <owner>/<repo>
 ```
 
-The plugin cannot install the `enmaas` command itself, so add it separately and
-skip the skill and guard, which the plugin already provides:
+The plugin provides the skill and the guard. Add the command separately:
 
 ```bash
 ./install.sh --cli-only --gateway https://GATEWAY-HOST
@@ -71,37 +68,25 @@ skip the skill and guard, which the plugin already provides:
 
 ## Use
 
-**Ask** once, answer to a file:
-
 ```bash
-enmaas ask -f docs/reference.md -o /tmp/summary.md <<'PROMPT'
-Summarise this reference in ten bullet points for someone who has never used the tool.
-PROMPT
-```
+# One answer, written to a file
+enmaas ask -f docs/reference.md -o /tmp/summary.md -p "Summarise this in ten bullet points."
 
-**Map** over many items, one answer file each. The `===PER ITEM===` line makes
-`map` send the instructions once per group of ten:
-
-```bash
-printf '%s\n' '{"id": "a", "n": 7}' '{"id": "b", "n": 12}' '{"id": "c", "n": 31}' > items.jsonl
+# One answer file per item
+printf '%s\n' '{"id": "a", "n": 7}' '{"id": "b", "n": 12}' > items.jsonl
 printf 'Answer EVEN or ODD for each item.\n===PER ITEM===\nNUMBER: {n}\n' > template.txt
 enmaas map --items items.jsonl --template template.txt --outdir out
+
+enmaas inspect out/a.md          # a bounded preview
+enmaas allow-read out/a.md       # you, in your terminal: grant a full read
+enmaas usage --since 30          # what you have spent
 ```
 
 <p align="center">
   <img src="docs/img/receipt.svg" alt="A map receipt: model, batch size, twelve items attempted and ok, output directory, index file, tokens and elapsed time" width="80%">
 </p>
 
-**Look** at an answer without pulling it into an assistant, or let one read it:
-
-```bash
-enmaas inspect out/a.md          # first 2,000 characters
-enmaas allow-read out/a.md       # you, in your terminal: grant a full read
-enmaas usage --since 30          # what you have spent
-```
-
-`-m MODEL` is optional on `ask` and `map`. The built-in default,
-`rits/zai-org/glm-5-3`, is free.
+`-m MODEL` is optional. The built-in default, `rits/zai-org/glm-5-3`, is free.
 
 ## The output guard
 
@@ -109,39 +94,23 @@ enmaas usage --since 30          # what you have spent
   <img src="docs/img/guard.svg" alt="The guard denies an assistant's attempt to read a protected answer file; enmaas inspect shows a bounded prefix; a person can grant a full read with enmaas allow-read" width="100%">
 </p>
 
-Delegating saves little if the assistant reads the answer straight back. The
-guard denies reads of protected answer files through the hosts' file tools and
-the common shell readers, including through pipelines, globs, redirections and
-the file commands inside `sed` and `awk` programs. Receipts and every other file
-stay readable. It runs with `python3 -I -S` from two standard-library-only modules,
-gives its checks a fixed time budget of 3 seconds, and is registered so that a
-hook failure blocks the call on Claude Code. A very long command, of several
-hundred kilobytes, can take it past that budget and past the 5 second hook
-timeout that both hosts are given. What Codex does in that case is not
-confirmed. This and the other open limits are listed under
-[Known limits](CHANGELOG.md#known-limits). It guards against accidental reads by a
-well-behaved assistant. It is not a sandbox: an assistant that writes its own
-program to open the file, or copies the file first, is outside what it checks.
-The skill tells the assistant to respect a denial and ask you instead. Coverage
-and limits are in [output protection](skills/enmaas/references/output-protection.md).
-
-## What the assistant is told
-
-The skill gives Claude Code and Codex one rule: delegate when the work is
-independent per item, needs no tool calls, and is useful as a file. Classify,
-extract, rewrite, triage, summarise, second-opinion. Keep debugging, test-and-fix
-loops, dependent steps and decisions in the session. Read it in
-[SKILL.md](skills/enmaas/SKILL.md).
+The guard denies what it recognizes as a read of a protected answer file,
+through the hosts' file tools and the common shell readers. It allows a command
+it does not recognize. It guards against accidental reads by a well-behaved
+assistant. It is not a sandbox: an assistant that writes its own program to open
+the file, or copies the file first, is outside what it checks. Coverage is in
+[output protection](skills/enmaas/references/output-protection.md). Open gaps
+are in [Known limits](CHANGELOG.md#known-limits).
 
 ## Documentation
 
 | | |
 |---|---|
-| [Install guide](INSTALL.md) | Clone to first delegation, update, remove, troubleshoot |
-| [Reference](docs/reference.md) | Every command, flag, config key, exit code, and the budget and breaker rules |
-| [Skill](skills/enmaas/SKILL.md) | What the assistant is told, and the delegate / do-not-delegate lists |
-| [Output protection](skills/enmaas/references/output-protection.md) | Which files and tools the guard covers |
-| [Changelog](CHANGELOG.md) | What changed in each release |
+| [Install guide](INSTALL.md) | Install, update, remove, troubleshoot |
+| [Reference](docs/reference.md) | Every command, flag, config key and exit code |
+| [Skill](skills/enmaas/SKILL.md) | What the assistant is told to delegate |
+| [Output protection](skills/enmaas/references/output-protection.md) | What the guard covers |
+| [Changelog](CHANGELOG.md) | What changed in each release, and known limits |
 | [Contributing](CONTRIBUTING.md) | How changes land |
 | [Security](SECURITY.md) | How to report a problem |
 
@@ -151,7 +120,7 @@ loops, dependent steps and decisions in the session. Read it in
 uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 make check            # ruff, format, mypy strict, pytest
 make check-install    # installs into a throwaway HOME and checks every step
-make live             # free hosted models; export ENMAAS_BASE_URL and a key (ENMAAS_KEY or ~/.secrets/enmaas)
+make live             # free hosted models; needs ENMAAS_BASE_URL and a key
 ```
 
 ## License
