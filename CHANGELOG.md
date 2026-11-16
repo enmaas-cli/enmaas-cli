@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-16
+
 ### Security
 
 - The output guard now runs as `python3 -I -S`, in Python's isolated mode.
@@ -149,8 +151,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   one hard link. Before, the file was emptied when it was opened, so a second
   name planted in the output directory let an answer replace any file you can
   write. Now that `ask` or `map` item fails with `refusing to write an answer
-  through a file with more than one hard link`, the other file is unchanged,
-  and the reply's charge is still recorded.
+  through a file with more than one hard link`, and the reply's charge is
+  still recorded. The check runs after the file is opened, so it does not stop
+  a process that removes the planted name at that moment. See Known limits.
 - An API key echoed back JSON-escaped in a gateway error body, as happens for a
   key holding a quote or a backslash, is now removed from the error message.
 - A client error during a request, such as a reply that cannot be decoded, now
@@ -298,6 +301,38 @@ and versions follow [Semantic Versioning](https://semver.org/).
   as the `error_kind` of a `map`.
 - The `enmaas` console script now starts through `enmaas_cli.cli:entry`.
 
+### Known limits
+
+These are open in this release. None of them is new in 0.8.0.
+
+- The output guard reads a shell command without running it, and it does not
+  model every shell construct. Parameter expansion with a default or
+  alternate word, a `case` pattern inside a command substitution, an
+  arithmetic shift, some wrapper commands, and file names that hold
+  private-use Unicode characters are read incorrectly. A command that uses
+  one can read a protected answer, or be denied by mistake. The guard
+  protects against accidental reads. It is not a security boundary.
+- A very long command can take longer than the guard's 3 second budget before
+  it is denied.
+- Two commands started at the same time each check the rolling budget on
+  their own, so together they can spend more than the budget.
+- A gateway reply is read into memory whole, with no size limit.
+- `ask --stdout` prints the answer as the gateway sent it. If the gateway
+  echoes the API key inside an answer, the key is printed. The guard blocks
+  `--stdout` from an assistant.
+- The hard link refusal checks the file after it is opened. A process that can
+  write the output directory and removes the planted name at that moment can
+  still have an answer written into the other file.
+- The installer removes a hook entry of your own if that entry mentions the
+  guard's path.
+- With `--json`, an argument error or a config file that is not valid UTF-8
+  prints plain text, not a JSON object.
+- A config file or another input file that is a named pipe can block the
+  command.
+- The ledger file is not checked for its owner.
+- A configured price that is not a finite number produces invalid JSON in
+  `usage --json`.
+
 ## [0.7.1] - 2026-11-09
 
 ### Added
@@ -438,7 +473,8 @@ plugin marketplace.
 - A usage ledger with `enmaas usage`.
 - A skill that tells Claude Code and Codex when to delegate.
 
-[Unreleased]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/enmaas-cli/enmaas-cli/compare/v0.5.0...v0.6.0
