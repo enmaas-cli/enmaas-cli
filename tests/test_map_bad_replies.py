@@ -411,17 +411,52 @@ def test_main_reports_the_internal_count(
         assert "  internal  1 failed on an error inside enmaas; please report it" in captured.out
 
 
-def _nested_too_deeply(ids: list[str], batched: bool) -> httpx.Response:
-    return httpx.Response(200, content=b"[" * 200_000 + b"]" * 200_000)
+REFUSED_BODY = b"[[1]]"
+
+
+def _refused_by_the_decoder(ids: list[str], batched: bool) -> httpx.Response:
+    return httpx.Response(200, content=REFUSED_BODY)
 
 
 @pytest.mark.parametrize("mode", MODES)
-async def test_reply_nested_too_deeply_fails_as_a_bad_reply(tmp_path: Path, mode: str) -> None:
-    outcome = await _run(tmp_path, mode, _nested_too_deeply)
+async def test_reply_nested_too_deeply_fails_as_a_bad_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    # The depth at which the decoder gives up depends on the Python version
+    # and the stack size, so the decoder is made to give up on one body here.
+    decode = httpx.Response.json
+
+    def deep(response: httpx.Response) -> object:
+        if response.content == REFUSED_BODY:
+            raise RecursionError("maximum recursion depth exceeded")
+        return decode(response)
+
+    monkeypatch.setattr(httpx.Response, "json", deep)
+    outcome = await _run(tmp_path, mode, _refused_by_the_decoder)
     rows = _item_rows(tmp_path)
     (bad,) = SECOND[mode]
     assert rows[bad]["status"] == "error"
     assert "JSON nested too deeply" in rows[bad]["error"]
+    assert outcome.internal_errors == 0
+    assert (outcome.ok, outcome.failed) == (2, 1)
+
+
+def _nested_200_000_levels(ids: list[str], batched: bool) -> httpx.Response:
+    return httpx.Response(200, content=b"[" * 200_000 + b"]" * 200_000)
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_reply_with_200_000_levels_fails_as_a_bad_reply(tmp_path: Path, mode: str) -> None:
+    outcome = await _run(tmp_path, mode, _nested_200_000_levels)
+    rows = _item_rows(tmp_path)
+    (bad,) = SECOND[mode]
+    assert rows[bad]["status"] == "error"
+    # The decoder gives up on this body, or reads it when the stack has room.
+    # A body it can read is a list, which is a bad reply as well.
+    assert rows[bad]["error"] in {
+        f"gateway reply is {kind} (content type none, 400000 bytes)"
+        for kind in ("JSON nested too deeply", "JSON that is not an object")
+    }
     assert outcome.internal_errors == 0
     assert (outcome.ok, outcome.failed) == (2, 1)
 

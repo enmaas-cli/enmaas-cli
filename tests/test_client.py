@@ -348,7 +348,28 @@ async def test_bad_reply_content_type_is_printable() -> None:
     assert "text/plain?31m" in message
 
 
-async def test_reply_nested_too_deeply_is_a_bad_reply_and_never_retried() -> None:
+async def test_reply_nested_too_deeply_is_a_bad_reply_and_never_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from enmaas_cli.errors import BadReplyError
+
+    # The depth at which the decoder gives up depends on the Python version
+    # and the stack size, so the decoder is made to give up here.
+    def deep(response: httpx.Response) -> object:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(httpx.Response, "json", deep)
+    transport, calls = _counting(
+        httpx.Response(200, content=b"[[1]]", headers={"content-type": "application/json"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(BadReplyError) as exc:
+            await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
+    assert len(calls) == 1
+    assert "JSON nested too deeply" in str(exc.value)
+
+
+async def test_a_reply_with_200_000_levels_is_a_bad_reply_and_never_retried() -> None:
     from enmaas_cli.errors import BadReplyError
 
     body = b"[" * 200_000 + b"]" * 200_000
@@ -359,7 +380,12 @@ async def test_reply_nested_too_deeply_is_a_bad_reply_and_never_retried() -> Non
         with pytest.raises(BadReplyError) as exc:
             await call(client, BASE, REQ, timeout=5, retries=3, sleep=_no_sleep)
     assert len(calls) == 1
-    assert "JSON nested too deeply" in str(exc.value)
+    # The decoder gives up on this body, or reads it when the stack has room.
+    # A body it can read is a list, which is a bad reply as well.
+    assert str(exc.value) in {
+        f"gateway reply is {kind} (content type application/json, {len(body)} bytes)"
+        for kind in ("JSON nested too deeply", "JSON that is not an object")
+    }
 
 
 async def test_invalid_url_from_the_transport_is_terminal_gateway_error() -> None:

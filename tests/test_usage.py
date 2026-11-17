@@ -907,6 +907,29 @@ def test_both_readers_skip_every_bad_row(ledger: Path) -> None:
     assert len(load_events(ledger)) == 1
     events, problems = load_events_strict(ledger)
     assert len(events) == 1
+    reasons = [p.split(": ", 1)[1] for p in problems]
+    assert reasons[:9] == [*["bad elapsed"] * 5, *["bad text field"] * 4]
+    # The last bad row is DEEP. The decoder gives up on it, or reads it when
+    # the stack has room. A DEEP row it can read has only a model field.
+    assert reasons[9:] in (["nested too deeply"], ["missing field"])
+
+
+def test_a_row_nested_too_deeply_is_skipped_and_named(
+    ledger: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The depth at which the decoder gives up depends on the Python version
+    # and the stack size, so the decoder is made to give up on DEEP here.
+    decode = json.loads
+
+    def deep(text: str) -> object:
+        if text == DEEP:
+            raise RecursionError("maximum recursion depth exceeded")
+        return decode(text)
+
+    monkeypatch.setattr("enmaas_cli.usage.json.loads", deep)
+    assert len(load_events(ledger)) == 1
+    events, problems = load_events_strict(ledger)
+    assert len(events) == 1
     assert [p.split(": ", 1)[1] for p in problems] == [
         *["bad elapsed"] * 5,
         *["bad text field"] * 4,

@@ -407,11 +407,26 @@ class TestSchemaFileValidation:
         assert call_count["count"] == 0
 
 
-def test_response_nested_too_deeply_is_a_validation_error() -> None:
-    from enmaas_cli.schema import validate_against_schema
+def test_response_nested_too_deeply_is_a_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The depth at which the decoder gives up depends on the Python version
+    # and the stack size, so the decoder is made to give up here.
+    def deep(text: str) -> object:
+        raise RecursionError("maximum recursion depth exceeded")
 
+    monkeypatch.setattr("enmaas_cli.schema.json.loads", deep)
     with pytest.raises(ValidationError, match="^response is nested too deeply$"):
+        schema_module.validate_against_schema("[[1]]", {"type": "array"})
+
+
+def test_a_response_with_200_000_levels_is_refused_or_read() -> None:
+    # The decoder gives up on this document, or reads it when the stack has
+    # room. Both are correct: a deep array is still an array.
+    try:
         validate_against_schema("[" * 200_000 + "]" * 200_000, {"type": "array"})
+    except ValidationError as exc:
+        assert str(exc) == "response is nested too deeply"
 
 
 def test_schema_check_that_recurses_too_deeply_is_a_validation_error(

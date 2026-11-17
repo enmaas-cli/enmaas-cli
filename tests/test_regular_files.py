@@ -340,18 +340,24 @@ async def test_a_signal_after_a_failed_index_write_keeps_every_billed_charge(
         real_append(path, text)
 
     monkeypatch.setattr(runner, "_append_index", append)
-    replies = 0
+    requests = 0
 
     async def handle(request: httpx.Request) -> httpx.Response:
-        nonlocal replies
-        replies += 1
-        if replies > 2:
-            # Held until the run is cancelled.
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            # Held until the run is cancelled. It must be the first request:
+            # the other two finish without a wait, and a request that starts
+            # after the failed write is never sent.
             await asyncio.Event().wait()
         return _reply("answer")
 
     task = asyncio.ensure_future(_map(tmp_path, httpx.MockTransport(handle), concurrency=3))
     await asyncio.wait_for(failed.wait(), 10)
+    # The held request keeps the run going, so the cancel reaches a running
+    # task on every Python version. A finished task would ignore it.
+    assert requests == 3
+    assert not task.done()
     task.cancel()
     outcome = await asyncio.wait_for(task, 10)
     assert outcome.abort_reason == "interrupted"
