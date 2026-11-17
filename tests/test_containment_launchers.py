@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -357,6 +359,42 @@ def test_launcher_form_reads_the_program_by_its_base_name(
 @pytest.mark.parametrize(
     "command,message",
     [
+        # No command word is left after the wrappers.
+        ("command -v enmaas allow-read", ALLOW_READ),
+        ("timeout enmaas ask -p hi --stdout", STDOUT),
+        # cd, with the words in the options of a wrapper in front of it.
+        ("timeout -s enmaas allow-read cd x", ALLOW_READ),
+        # A shell that is given no source, and one that is.
+        ("bash script.sh enmaas allow-read x", ALLOW_READ),
+        ('bash -c "echo hi" enmaas allow-read x', ALLOW_READ),
+        ("eval true enmaas ask -p hi --stdout", STDOUT),
+        # A command the guard does not know.
+        ("echo enmaas allow-read x", ALLOW_READ),
+        # A reader that prints names or counts only.
+        ("grep -l x public.md enmaas allow-read y", ALLOW_READ),
+        ("grep -c x public.md enmaas ask -p hi --stdout", STDOUT),
+        # A reader whose files are all harmless.
+        ("cat public.md enmaas allow-read x", ALLOW_READ),
+        ("head -n 2 public.md enmaas ask -p hi --stdout", STDOUT),
+    ],
+)
+def test_every_path_that_allows_a_command_ends_with_the_check(
+    root: Path, command: str, message: str
+) -> None:
+    assert verdict(root, command) == message
+
+
+def test_ripgrep_search_of_harmless_files_ends_with_the_check(root: Path) -> None:
+    (root / "enmaas").write_text("public", encoding="utf-8")
+    (root / "allow-read").write_text("public", encoding="utf-8")
+    assert shell(root, "rg public public.md enmaas") is None
+    assert verdict(root, "rg public public.md enmaas allow-read") == ALLOW_READ
+    assert verdict(root, "rg public answer.md enmaas allow-read") == READ
+
+
+@pytest.mark.parametrize(
+    "command,message",
+    [
         ("cat answer.md enmaas allow-read x", READ),
         ("uv run enmaas allow-read x < answer.md", READ),
         ('bash -c "cat answer.md" enmaas allow-read x', READ),
@@ -472,3 +510,26 @@ def test_long_launcher_commands_are_checked(root: Path) -> None:
     assert verdict(root, f"uv run enmaas ask {padding}--stdout") == STDOUT
     assert shell(root, "ls " + "enmaas " * 2_000) is None
     assert verdict(root, "ls " + "enmaas " * 2_000 + "allow-read x") == ALLOW_READ
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("cat public.md", None),
+        ("uv run enmaas inspect answer.md", None),
+        ("cat answer.md", READ),
+        ("uv run enmaas allow-read x", ALLOW_READ),
+    ],
+)
+def test_launcher_check_keeps_the_depth_of_nested_shell_strings(
+    root: Path, command: str, expected: str | None
+) -> None:
+    # Each eval costs two calls, as before. A third call for each level would
+    # pass this limit and deny commands that were checked before.
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(len(inspect.stack()) + 200)
+    try:
+        reason = verdict(root, "eval " * 80 + command)
+    finally:
+        sys.setrecursionlimit(limit)
+    assert reason == expected

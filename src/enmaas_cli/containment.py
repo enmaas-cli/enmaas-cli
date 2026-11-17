@@ -979,27 +979,23 @@ def _segment(
         # The guard cannot tell which program runs, or which file a reader opens.
         raise ValueError("dollar quoting the guard cannot read")
     args = [_shell_value(arg) for arg in tokens[index + 1 :]]
+    # Any command word but enmaas may be a launcher, so each path below that
+    # allows the command ends with the launcher check. A denial found before
+    # it keeps its own message. The check is called here, in this function,
+    # so a nested shell string costs the same number of calls as before.
+    if name == "cd" and len(args) == 1 and not any(c in args[0] for c in "$`*?["):
+        return _launched_enmaas(cleaned), _path(args[0], cwd)
     if name == "enmaas":
         return _enmaas(args), cwd
-    reason, cwd = _command(name, args, tokens[index + 1 :], cwd, stdin, entered)
-    # Any other command word may be a launcher. A denial above keeps its message.
-    return reason or _launched_enmaas(cleaned), cwd
-
-
-def _command(
-    name: str, args: list[str], raw: list[str], cwd: Path, stdin: bool, entered: set[Path] | None
-) -> tuple[str | None, Path]:
-    """Check one simple command by its command word. raw holds args as written."""
-    if name == "cd" and len(args) == 1 and not any(c in args[0] for c in "$`*?["):
-        return None, _path(args[0], cwd)
     if name == "eval" or name in _SHELLS:
-        source = _shell_source(name, raw)
+        source = _shell_source(name, tokens[index + 1 :])
         if source is None:
-            return None, cwd
+            return _launched_enmaas(cleaned), cwd
         # eval runs in this shell, so a cd inside it also moves later commands.
-        return _shell(source, cwd, entered if name == "eval" else None), cwd
+        reason = _shell(source, cwd, entered if name == "eval" else None)
+        return reason or _launched_enmaas(cleaned), cwd
     if name not in _READERS:
-        return None, cwd
+        return _launched_enmaas(cleaned), cwd
     operands, pattern, metadata, program_paths, inputs = _reader_operands(name, args)
     for value in program_paths:
         # sed and awk open these names as files. A directory yields nothing.
@@ -1013,7 +1009,7 @@ def _command(
         if reason:
             return reason, cwd
     if metadata:
-        return None, cwd
+        return _launched_enmaas(cleaned), cwd
     if name in _SEARCHERS and not operands:
         recursive = name == "rg" or any(
             flag in {"-r", "-R", "--recursive", "--dereference-recursive"}
@@ -1022,7 +1018,7 @@ def _command(
         if recursive and not stdin:
             operands = ["."]
     if name == "rg" and operands and "RIPGREP_CONFIG_PATH" not in os.environ:
-        return _rg_scope(args, operands, cwd), cwd
+        return _rg_scope(args, operands, cwd) or _launched_enmaas(cleaned), cwd
     for operand in operands:
         if operand == "-":
             continue
@@ -1030,7 +1026,7 @@ def _command(
         reason = _check_path(path, pattern) if path.is_dir() else _literal_operand(operand, cwd)
         if reason:
             return reason, cwd
-    return None, cwd
+    return _launched_enmaas(cleaned), cwd
 
 
 def _ansi_c(body: str) -> str | None:
