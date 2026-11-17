@@ -465,6 +465,193 @@ def test_forms_outside_the_check_stay_allowed(root: Path, command: str) -> None:
     assert shell(root, command) is None
 
 
+# The word enmaas as the command word, behind a launcher the guard does not
+# read, and behind a wrapper it reads through.
+FORMS = ["enmaas", "uv run enmaas", "ionice enmaas", "timeout 5 uvx /usr/bin/enmaas"]
+
+# A double dash ends the options of enmaas. The next word is the subcommand.
+DOUBLE_DASH = [
+    ("-- allow-read x", ALLOW_READ),
+    ("-- allow-read", ALLOW_READ),
+    ("-- ask -p hi --stdout", STDOUT),
+    ("-- ask --stdout", STDOUT),
+    ("--config c -- allow-read x", ALLOW_READ),
+    ("--config=c -- allow-read x", ALLOW_READ),
+    ("--key-file k --config c -- allow-read x", ALLOW_READ),
+    ("--key-file k -- ask -p hi --stdout", STDOUT),
+    ("-- inspect answer.md", None),
+    ("-- usage", None),
+    ("-- ask -p hi -o out.md", None),
+    ("--config c -- ask -p hi -o out.md", None),
+    ("--", None),
+    ("--config c --", None),
+    # The word after the double dash is the subcommand, whatever it is.
+    ("-- -- allow-read x", None),
+    ("-- --config c allow-read x", None),
+    ("-- x allow-read", None),
+    # A double dash after ask ends the search for --stdout.
+    ("ask -o out.md -- --stdout", None),
+    ("-- ask -o out.md -- --stdout", None),
+]
+
+
+@pytest.mark.parametrize("arguments,expected", DOUBLE_DASH)
+@pytest.mark.parametrize("form", FORMS)
+def test_double_dash_before_the_subcommand_does_not_hide_it(
+    root: Path, form: str, arguments: str, expected: str | None
+) -> None:
+    assert verdict(root, f"{form} {arguments}") == expected
+
+
+# Bash takes a redirection out of the words of a command wherever it stands.
+# Each of these is one or more whole redirections.
+REDIRECTIONS = [
+    "2>/dev/null",
+    "2>&1",
+    ">&2",
+    ">| log",
+    "<> f",
+    "&>> log",
+    "&> log",
+    "&>log",
+    "2> log",
+    "2>>log",
+    "10>log",
+    ">&-",
+    "2>&-",
+    "<&0",
+    "2<>f",
+    ">& log",
+    "{fd}>log",
+    "{fd}>&1",
+    "1>&2 2>&1",
+    ">log 2>&1",
+    "2>&1 >log",
+    "2>/dev/null >| log <> f",
+]
+
+# Where the redirection stands, with the decision of the command without it.
+REDIRECTION_PLACES = [
+    ("{} allow-read x", ALLOW_READ),
+    ("{} ask -p hi --stdout", STDOUT),
+    ("{} --config c allow-read x", ALLOW_READ),
+    ("--config c {} allow-read x", ALLOW_READ),
+    ("--config=c {} ask -p hi --stdout", STDOUT),
+    ("--key-file k {0} --config c {0} allow-read x", ALLOW_READ),
+    ("-- {} allow-read x", ALLOW_READ),
+    ("{} -- ask -p hi --stdout", STDOUT),
+    ("ask -p hi {} --stdout", STDOUT),
+    ("allow-read {} x", ALLOW_READ),
+    ("{} inspect answer.md", None),
+    ("{} ask -p hi -o out.md", None),
+    ("{} usage", None),
+    ("{} --version", None),
+    ("{}", None),
+    ("--config c {}", None),
+    ("-- {} inspect answer.md", None),
+    ("inspect answer.md {}", None),
+    ("ask -p hi -o out.md {}", None),
+]
+
+
+@pytest.mark.parametrize("place,expected", REDIRECTION_PLACES)
+@pytest.mark.parametrize("redirection", REDIRECTIONS)
+@pytest.mark.parametrize("form", FORMS[:2])
+def test_redirection_before_the_subcommand_does_not_hide_it(
+    root: Path, form: str, redirection: str, place: str, expected: str | None
+) -> None:
+    assert verdict(root, f"{form} {place.format(redirection)}") == expected
+
+
+@pytest.mark.parametrize(
+    "arguments,expected",
+    [
+        ("2>/dev/null allow-read x", ALLOW_READ),
+        ("2>&1 allow-read x", ALLOW_READ),
+        (">&2 allow-read x", ALLOW_READ),
+        (">| log allow-read x", ALLOW_READ),
+        ("<> f allow-read x", ALLOW_READ),
+        ("&>> log allow-read x", ALLOW_READ),
+        ("&> log allow-read x", ALLOW_READ),
+        ("2>/dev/null ask -p hi --stdout", STDOUT),
+        ("2>&1 ask -p hi --stdout", STDOUT),
+        (">&2 ask -p hi --stdout", STDOUT),
+        (">| log ask -p hi --stdout", STDOUT),
+        ("<> f ask -p hi --stdout", STDOUT),
+        ("&>> log ask -p hi --stdout", STDOUT),
+        ("&> log ask -p hi --stdout", STDOUT),
+    ],
+)
+@pytest.mark.parametrize("form", FORMS)
+def test_reported_redirections_are_denied(
+    root: Path, form: str, arguments: str, expected: str
+) -> None:
+    assert verdict(root, f"{form} {arguments}") == expected
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "inspect answer.md 2>/dev/null",
+        "2>/dev/null inspect answer.md",
+        "2>/dev/null ask -p hi -o out.md",
+        "usage > log",
+        "2>&1",
+        ">&2 --version",
+        "usage 2>&1 | head -3",
+        # Bash takes the word after the operator as the file name, so the
+        # program gets x as its subcommand.
+        ">| allow-read x",
+        ">& allow-read x",
+        "&> allow-read x",
+        "2>&1 >| allow-read",
+    ],
+)
+@pytest.mark.parametrize("form", FORMS)
+def test_redirection_with_a_harmless_command_stays_allowed(
+    root: Path, form: str, arguments: str
+) -> None:
+    assert shell(root, f"{form} {arguments}") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # git reads the double dash, and allow-read is a path here.
+        "git grep enmaas -- allow-read",
+        # The program gets the word 2 as its subcommand and refuses it.
+        "enmaas 2 allow-read x",
+        "enmaas {fd} allow-read x",
+        "uv run enmaas 10 -- allow-read x",
+        # A quoted operator is a plain word for Bash. The guard reads it as a
+        # redirection with its target.
+        "enmaas '>&' log allow-read x",
+        "enmaas \\>\\| log allow-read x",
+    ],
+)
+def test_harmless_command_that_reads_like_a_hidden_subcommand_is_denied(
+    root: Path, command: str
+) -> None:
+    assert verdict(root, command) == ALLOW_READ
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        # A redirection between a global option and its value. The guard reads
+        # the first word after the option as the value.
+        "--config 2>/dev/null c allow-read x",
+        "--config >&2 c allow-read x",
+        "--key-file >| log k ask -p hi --stdout",
+    ],
+)
+@pytest.mark.parametrize("form", FORMS[:2])
+def test_redirection_inside_a_global_option_still_hides_the_subcommand(
+    root: Path, form: str, arguments: str
+) -> None:
+    assert shell(root, f"{form} {arguments}") is None
+
+
 def test_launcher_check_stops_when_the_time_budget_is_spent(root: Path) -> None:
     spent = False
     check = containment._enmaas

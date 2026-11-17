@@ -203,6 +203,11 @@ _AWK_GETLINE_FILE = re.compile(r'getline\b[^<"\n;]*<\s*"([^"\n]*)"')
 _AWK_PIPE_GETLINE = re.compile(r'"([^"\n]*)"\s*\|&?\s*getline\b')
 _PROGRAM_READERS = {"sed", "awk", "gawk"}
 _HEREDOC_START = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([\w]+))")
+# What a redirection leaves in the words of a command. The file descriptor in
+# front of an operator is a number or a {name}: the 2 of 2>&1 and of 2> log.
+# An operator is a run of these signs that holds < or >: >&, <&, >|, <>, &>, &>>.
+_REDIRECTION_DESCRIPTOR = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z_0-9]*\}")
+_REDIRECTION_OPERATOR = re.compile(r"[<>&|]*[<>][<>&|]*")
 
 # Bash decodes these escapes inside $'...'. Any other escape is left to Bash
 # rules the guard does not copy, so the string counts as unreadable.
@@ -373,9 +378,34 @@ def _literal_operand(value: str, cwd: Path) -> str | None:
     return _check_path(root, str(Path(*parts[first:])))
 
 
+def _after_redirections(args: list[str], index: int) -> int:
+    """Return the index of the first word, from index on, that no redirection left.
+
+    Bash takes a redirection out of the words of a command wherever it stands.
+    The word list still holds the file descriptor in front of an operator, and
+    every operator the guard does not remove, each with the word after it,
+    which Bash takes as the target. A quoted word of the same shape is skipped
+    too. enmaas refuses that word as its subcommand, so no command that runs
+    is missed.
+    """
+    while index < len(args):
+        if _REDIRECTION_DESCRIPTOR.fullmatch(args[index]):
+            index += 1
+        elif _REDIRECTION_OPERATOR.fullmatch(args[index]):
+            index += 2
+        else:
+            break
+    return index
+
+
 def _enmaas(args: list[str]) -> str | None:
-    index = 0
+    index = _after_redirections(args, 0)
     while index < len(args) and args[index].startswith("-"):
+        if args[index] == "--":
+            # From Python 3.12 on, the parser ends the options here and reads
+            # the next word as the subcommand.
+            index = _after_redirections(args, index + 1)
+            break
         option, equal, _ = args[index].partition("=")
         matches = [
             flag
@@ -384,7 +414,7 @@ def _enmaas(args: list[str]) -> str | None:
         ]
         if len(matches) != 1:
             return None
-        index += 1 if equal else 2
+        index = _after_redirections(args, index + (1 if equal else 2))
     if index >= len(args):
         return None
     subcommand = args[index]
