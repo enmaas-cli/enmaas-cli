@@ -211,6 +211,7 @@ def _open_for_append(ledger: Path) -> int:
     the type check on the descriptor refuses a FIFO that has a reader.
     """
     ledger.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The ledger's parent is made private, so pass a ledger inside the state directory.
     make_state_dir_private(ledger.parent)
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
@@ -478,6 +479,7 @@ def _open_for_read(ledger: Path) -> int | None:
     A ledger and a state directory from an earlier version lose their group
     and other access here too, so `enmaas usage` alone makes them private.
     """
+    # The ledger's parent is made private, so pass a ledger inside the state directory.
     make_state_dir_private(ledger.parent)
     try:
         fd = os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)

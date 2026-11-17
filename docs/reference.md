@@ -551,11 +551,23 @@ count against the ceiling. With `ENMAAS_NO_USAGE_LOG` set no write is tried, so
 nothing is printed.
 
 **The ledger file.** When any command creates the state directory, it gets mode
-0700, and a new ledger gets mode 0600. A directory or a ledger that already
-exists, and that you own, loses its group and other access the next time `ask`,
-`map`, `enmaas record` or `enmaas usage` opens it, and nothing is printed. A
-directory behind a symbolic link is not changed, and a mode that cannot be
-changed does not stop the command. The ledger is opened without following a symbolic link
+0700, and a new ledger gets mode 0600. A state directory that already exists,
+and that you own, loses its group and other access when any enmaas command
+starts, also one that opens no file in it, such as `models`, `inspect` or
+`allow-read`. A command line that only prints help or the version, or that is
+refused for its arguments, changes nothing. A ledger that already exists, and
+that you own, loses its group and other access when a command opens it, so
+`enmaas usage` alone is enough for both. The setuid, setgid and sticky bits are
+removed in the same change. A directory or a file with no group or other access
+is left as it is, and owner permissions are never added. If you gave a group
+access to the state directory or the ledger on purpose, enmaas removes it
+again: from the directory on each command, and from the ledger each time a
+command opens it. A ledger with more than one hard link is not changed, because
+the change would reach its other names. A state directory reached through a
+symbolic link at its last component is not changed; run `chmod 700` on the
+target yourself. A state directory you cannot open for reading is not changed
+either. Nothing is printed, and a mode that cannot be changed does not stop the
+command. The ledger is opened without following a symbolic link
 and without blocking, and only a regular file is read or written. A link or a
 FIFO at the ledger path is never written through: the command prints
 `warning: usage was not recorded: <path> is not a regular file` and goes on. `enmaas usage` over such a path prints `warning: <path> is not a
@@ -576,7 +588,8 @@ described under the ledger file. The
 file is created with mode 0600, and every change to it
 holds a lock on `open-runs.lock` beside it; the lock file stays there. A record
 file or a lock file that already exists, and that you own, loses its group and
-other access when a command opens it. The line
+other access when a command opens it, by the rules given under the ledger file.
+The line
 is removed after the run's ledger event is written, and the file is removed when
 no line is left. When the ledger event could not be written, the line stays, and
 a later command charges the run once the ledger can be written. The record is
@@ -734,4 +747,5 @@ the output directory is a link or anything other than a regular file, `map`
 stops with an error before it sends any request. A new `results.jsonl` gets
 mode 0600, because it names every item and what each request cost; one that
 already exists, and that you own, loses its group and other access when `map`
-next runs on that directory. The output directory keeps its mode.
+next runs on that directory, unless it has more than one hard link. The output
+directory keeps its mode.

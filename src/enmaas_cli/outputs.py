@@ -29,8 +29,9 @@ def make_state_dir_private(directory: Path) -> None:
 
     A version before 0.8.0 created the directory readable by every user on
     the machine, and creating it private now does not change one that
-    already exists. Every site that creates the state directory, or reads a
-    file in it, calls this.
+    already exists. Every command calls this once when it starts, and so
+    does every site that creates the state directory or reads a file in it.
+    A directory that is missing is not created.
 
     Only a real directory this user owns is changed. O_NOFOLLOW refuses a
     link at the last component, so a link to some other directory leaves
@@ -69,11 +70,14 @@ def make_file_private(descriptor: int) -> None:
     Only a regular file this user owns is changed, and only through the
     descriptor the caller already checked, never by path. Owner bits are
     only ever removed, so a file its owner made read-only stays read-only.
+    A file with more than one hard link is not changed: the mode belongs to
+    the file, so the change would reach another name of the same file, in a
+    place this tool knows nothing about.
     A failure is ignored for the same reason as in make_state_dir_private.
     """
     try:
         info = os.fstat(descriptor)
-        if stat.S_ISREG(info.st_mode) and _too_open(info):
+        if stat.S_ISREG(info.st_mode) and info.st_nlink <= 1 and _too_open(info):
             os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o600)
     except OSError:
         pass
