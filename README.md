@@ -36,9 +36,10 @@ short receipt. The full answer stays out of the conversation that asked for it.
 
 ## What is new in 0.8.0
 
-A hardening release. Keys and refused gateway URLs stay out of error text. New
-state files are private. A bad reply keeps its charge, and a budgeted run stops
-when the ledger is damaged. The guard recognizes more shell forms. Read the
+A hardening release. Keys and refused gateway URLs stay out of error text.
+State files are private, including the ones an older version left open. A bad
+reply keeps its charge, and a budgeted run stops when the ledger is damaged.
+The guard recognizes more shell forms. Read the
 [changelog](CHANGELOG.md), including its
 [Known limits](CHANGELOG.md#known-limits), before you rely on the guard.
 

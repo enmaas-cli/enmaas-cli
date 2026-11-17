@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from .auth import ERROR_TEXT_CHARS, cut_redacted, error_text, printable, redact
 from .dialect import Completion, Dialect
 from .errors import ExitCode
+from .outputs import make_state_dir_private
 
 if TYPE_CHECKING:  # pragma: no cover
     # Types only. ask imports this module, and receipts stays a leaf.
@@ -36,9 +37,11 @@ def create_run_dir(root: Path) -> Path:
     arbitrary, and building filenames from it is a path traversal risk.
 
     The root is the state directory. When this creates it, it is mode 0o700,
-    because it holds every answer and the usage ledger.
+    because it holds every answer and the usage ledger. One that an earlier
+    version left open to other users is made private.
     """
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    make_state_dir_private(root)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S")
     path = root / f"{stamp}-{secrets.token_hex(2)}"
     while path.exists():

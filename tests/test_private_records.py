@@ -163,12 +163,12 @@ def test_a_new_ledger_is_mode_600_under_umask_022(tmp_path: Path) -> None:
     assert _mode(ledger) == 0o600
 
 
-def test_an_existing_ledger_keeps_its_mode(tmp_path: Path) -> None:
+def test_an_existing_ledger_loses_group_and_other_access(tmp_path: Path) -> None:
     ledger = tmp_path / "usage.jsonl"
     ledger.write_text("", encoding="utf-8")
     ledger.chmod(0o640)
     assert append_event(ledger, _event())
-    assert _mode(ledger) == 0o640
+    assert _mode(ledger) == 0o600
 
 
 def test_a_new_index_is_mode_600_under_umask_022(tmp_path: Path) -> None:
@@ -178,12 +178,12 @@ def test_a_new_index_is_mode_600_under_umask_022(tmp_path: Path) -> None:
     assert _mode(index) == 0o600
 
 
-def test_an_existing_index_keeps_its_mode(tmp_path: Path) -> None:
+def test_an_existing_index_loses_group_and_other_access(tmp_path: Path) -> None:
     index = tmp_path / "results.jsonl"
     index.write_text("", encoding="utf-8")
     index.chmod(0o644)
     _append_index(index, "row\n")
-    assert _mode(index) == 0o644
+    assert _mode(index) == 0o600
 
 
 def test_the_open_run_file_is_mode_600_under_umask_022(tmp_path: Path) -> None:

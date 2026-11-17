@@ -37,6 +37,7 @@ from .outputs import (
     MAX_INSPECT_CHARS,
     allow_read,
     inspect_file,
+    make_state_dir_private,
     state_root,
 )
 from .receipts import (
@@ -742,6 +743,12 @@ def main(argv: list[str] | None = None, *, process: bool = False) -> int:
     exits. In-process callers keep their own handlers.
     """
     args = build_parser().parse_args(argv)
+    # Every command makes a state directory left open by an earlier version
+    # private, also one that opens no file in it. A missing directory is not
+    # created and nothing is printed. With no home directory there is no
+    # state directory to find, and the command goes on as before.
+    with contextlib.suppress(RuntimeError):
+        make_state_dir_private(state_root())
     if args.command in LOCAL_COMMANDS:
         return _local(args)
     config_path = args.config or default_config_path()

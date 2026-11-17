@@ -37,6 +37,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypeGuard
 
+from .outputs import make_file_private, make_state_dir_private
 from .runner import _charge_row_parts
 from .tokens import MAX_RECORDED
 from .usage import MAX_TEXT_CHARS, UsageEvent, _is_disabled, append_event
@@ -236,6 +237,8 @@ def _load(state_dir: Path) -> list[OpenRun]:
         if not stat.S_ISREG(info.st_mode):
             raise OSError("the open-run record file is not a regular file")
         _require_owner(info)
+        # A record file from an earlier version can be open to other users.
+        make_file_private(fd)
         if info.st_size > MAX_FILE_BYTES:
             raise _TooLarge(TOO_MANY_BYTES)
         raw = _read_bounded(fd, MAX_FILE_BYTES + 1)
@@ -356,10 +359,14 @@ def _acquire(fd: int) -> None:
 def _locked(state_dir: Path) -> Iterator[None]:
     """Hold the exclusive lock that every read-modify-write of the file takes."""
     # Private, because the files inside name the user's output directories.
+    # A directory or a lock file from an earlier version can be open to other
+    # users, so both are made private here as well.
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    make_state_dir_private(state_dir)
     fd = os.open(state_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         _require_owner(os.fstat(fd))
+        make_file_private(fd)
         _acquire(fd)
         yield
     finally:
@@ -865,6 +872,8 @@ def open_charge(state_dir: Path) -> OpenCharge:
     """
     if _is_disabled():
         return OpenCharge(0, True)
+    # No lock is taken here, so this read makes the directory private itself.
+    make_state_dir_private(state_dir)
     try:
         runs = _load(state_dir)
     except _TooLarge as exc:

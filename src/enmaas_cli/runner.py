@@ -28,7 +28,7 @@ from .dialect import (
     thinking_off_payload,
 )
 from .errors import CallError, where
-from .outputs import protect, write_output
+from .outputs import make_file_private, protect, write_output
 from .schema import ValidationError, load_schema, validate_against_schema
 from .tokens import MAX_RECORDED, Usage
 
@@ -210,7 +210,8 @@ def _append_index(index: Path, text: str) -> None:
     """Append rows to the index, never through a symbolic link.
 
     A new index is mode 0o600: it names every item and what each request
-    cost. An existing one keeps its mode. O_NOFOLLOW makes a link swapped in
+    cost. An existing one this user owns loses its group and other access.
+    The output directory is never changed. O_NOFOLLOW makes a link swapped in
     during the run fail the write instead of sending the rows to the link's
     target. O_NONBLOCK keeps a FIFO swapped in from blocking the open, so
     the check after it can refuse it.
@@ -222,6 +223,7 @@ def _append_index(index: Path, text: str) -> None:
     except BaseException:
         os.close(fd)
         raise
+    make_file_private(fd)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
 
@@ -230,7 +232,8 @@ def _check_index(index: Path) -> None:
     """Refuse an index that cannot be written safely, before anything is sent.
 
     A link, a path that is not a regular file and a file another user owns
-    are all refused.
+    are all refused. An index from an earlier version that passes loses its
+    group and other access here, before a run that appends nothing ends.
     """
     try:
         info = os.lstat(index)
@@ -243,6 +246,7 @@ def _check_index(index: Path) -> None:
     fd = os.open(index, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         _require_own_regular(fd, index)
+        make_file_private(fd)
     finally:
         os.close(fd)
 
