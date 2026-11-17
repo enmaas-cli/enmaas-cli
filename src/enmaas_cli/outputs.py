@@ -24,6 +24,66 @@ def state_root() -> Path:
     return root / "enmaas" / "runs"
 
 
+def make_state_dir_private(directory: Path) -> None:
+    """Remove group and other access from the state directory. Never raises.
+
+    A version before 0.8.0 created the directory readable by every user on
+    the machine, and creating it private now does not change one that
+    already exists. Every site that creates the state directory, or reads a
+    file in it, calls this.
+
+    Only a real directory this user owns is changed. O_NOFOLLOW refuses a
+    link at the last component, so a link to some other directory leaves
+    that directory alone. The check and the change use one descriptor, so
+    a directory swapped in between them cannot receive the change. Owner
+    bits are only ever removed, never added, so a directory its owner made
+    read-only stays read-only.
+
+    A failure is ignored without a message: a file system that is read-only
+    or has no modes would otherwise print a warning on every command, and
+    the command itself has lost nothing.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        info = os.fstat(descriptor)
+        if stat.S_ISDIR(info.st_mode) and _too_open(info):
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o700)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def make_file_private(descriptor: int) -> None:
+    """Remove group and other access from an open state file. Never raises.
+
+    For the usage ledger, the open-run records, their lock file and a `map`
+    index, each of which an earlier version created readable by every user
+    on the machine. Never for an answer file: its owner chose where it goes
+    and who reads it.
+
+    Only a regular file this user owns is changed, and only through the
+    descriptor the caller already checked, never by path. Owner bits are
+    only ever removed, so a file its owner made read-only stays read-only.
+    A failure is ignored for the same reason as in make_state_dir_private.
+    """
+    try:
+        info = os.fstat(descriptor)
+        if stat.S_ISREG(info.st_mode) and _too_open(info):
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o600)
+    except OSError:
+        pass
+
+
+def _too_open(info: os.stat_result) -> bool:
+    """Whether this user owns the file and its group or other users have any access."""
+    return info.st_uid == os.getuid() and bool(info.st_mode & 0o077)
+
+
 def marker_path(path: Path) -> Path:
     """Return the exact marker for the resolved output path."""
     resolved = path.resolve()

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from enmaas_cli.auth import printable
 from enmaas_cli.errors import ExitCode
+from enmaas_cli.outputs import make_file_private, make_state_dir_private
 from enmaas_cli.pricing import (
     OPUS_REFERENCE,
     ModelPrice,
@@ -201,7 +202,8 @@ def _open_for_append(ledger: Path) -> int:
 
     The state directory is created private, mode 0o700, and a new ledger
     mode 0o600: both name the user's models and what they cost. An existing
-    file keeps its mode.
+    directory or ledger from an earlier version loses its group and other
+    access here, when this user owns it.
 
     Defends against a planted file at the ledger path. O_NOFOLLOW refuses a
     link, so a row cannot be sent to the link's target. O_NONBLOCK makes a
@@ -209,6 +211,7 @@ def _open_for_append(ledger: Path) -> int:
     the type check on the descriptor refuses a FIFO that has a reader.
     """
     ledger.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    make_state_dir_private(ledger.parent)
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         fd = os.open(ledger, flags, 0o600)
@@ -229,6 +232,7 @@ def _open_for_append(ledger: Path) -> int:
     except BaseException:
         os.close(fd)
         raise
+    make_file_private(fd)
     return fd
 
 
@@ -470,7 +474,11 @@ def _open_for_read(ledger: Path) -> int | None:
     wrote to it, which would hang every command that reads the ledger. The open
     is nonblocking and the type is checked on the descriptor, so nothing
     waits. A link is refused because the writer never writes through one.
+
+    A ledger and a state directory from an earlier version lose their group
+    and other access here too, so `enmaas usage` alone makes them private.
     """
+    make_state_dir_private(ledger.parent)
     try:
         fd = os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except (FileNotFoundError, NotADirectoryError):
@@ -485,6 +493,7 @@ def _open_for_read(ledger: Path) -> int | None:
     except BaseException:
         os.close(fd)
         raise
+    make_file_private(fd)
     return fd
 
 

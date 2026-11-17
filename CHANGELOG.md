@@ -63,8 +63,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   with mode 0600, and the state directory with mode 0700 by every command that
   creates it, including `enmaas record`. Before, under the usual umask 022, the
   ledger and the index were readable by every user on the machine, and so was
-  the state directory when `enmaas record` created it. A file that already
-  exists keeps its mode. The ledger, like the index, is now opened without
+  the state directory when `enmaas record` created it. A directory or a file
+  that already exists is made private when a command next opens it; the next
+  entry gives the rules. The ledger, like the index, is now opened without
   following a symbolic link and without blocking, and only a regular file is
   read or written. Before, a link at `usage.jsonl` sent the ledger rows to
   the link's target, and a FIFO there hung every `ask`, `map` and `usage` with
@@ -77,12 +78,20 @@ and versions follow [Semantic Versioning](https://semver.org/).
   file, and is the error class name otherwise. The exit code and `--json`
   output do not change.
 - After an upgrade, a state directory and a ledger made by an earlier version
-  keep the modes they had, because enmaas sets a mode only when it creates a
-  file or a directory. To make them private, run
-  `chmod 700 ~/.local/state/enmaas/runs` and
-  `chmod 600 ~/.local/state/enmaas/runs/usage.jsonl`. When `XDG_STATE_HOME`
-  is set, the directory is `$XDG_STATE_HOME/enmaas/runs`. A `results.jsonl`
-  from an earlier run also keeps its mode.
+  do not stay readable by other users. The first command that opens the state
+  directory sets it to mode 0700, and sets the existing ledger, open-run
+  records and lock file to mode 0600 as it opens each one. In normal use that
+  is the first `ask`, `map`, `enmaas record` or `enmaas usage`, and
+  `enmaas usage` alone is enough for the directory and the ledger. With
+  `ENMAAS_NO_USAGE_LOG` set, `ask` and `map` do not open the ledger, so they
+  do not change it. An existing `results.jsonl` is set to mode 0600 the next
+  time `map` runs on its output directory. Only a directory or a file you own
+  is changed, and only group and other access is removed, so one you made
+  read-only stays read-only. The `map` output directory and your answer files
+  keep their modes. When the state directory is a symbolic link, the directory
+  it points to is not changed. Nothing is printed, and a mode that cannot be
+  changed, as on a read-only file system, does not stop the command or lose a
+  ledger row.
 - A malformed gateway reply, a stop signal or a crash no longer loses the
   spend of the requests a run already made. Before, a reply such as
   `{"choices": [1]}` ended a `map` run with a traceback before its ledger

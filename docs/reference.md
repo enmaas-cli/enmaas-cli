@@ -552,7 +552,10 @@ nothing is printed.
 
 **The ledger file.** When any command creates the state directory, it gets mode
 0700, and a new ledger gets mode 0600. A directory or a ledger that already
-exists keeps its mode. The ledger is opened without following a symbolic link
+exists, and that you own, loses its group and other access the next time `ask`,
+`map`, `enmaas record` or `enmaas usage` opens it, and nothing is printed. A
+directory behind a symbolic link is not changed, and a mode that cannot be
+changed does not stop the command. The ledger is opened without following a symbolic link
 and without blocking, and only a regular file is read or written. A link or a
 FIFO at the ledger path is never written through: the command prints
 `warning: usage was not recorded: <path> is not a regular file` and goes on. `enmaas usage` over such a path prints `warning: <path> is not a
@@ -568,9 +571,12 @@ reaches its end is still counted, it also keeps an open-run record.
 run id, the absolute path of the output directory, the size in bytes of its
 `results.jsonl` at the start, the start time, the process id, the model and the
 dialect. It holds no prompt, answer or key. When any command creates that
-directory, it gets mode 0700; a directory that already exists keeps its mode. The
+directory, it gets mode 0700; a directory that already exists is made private as
+described under the ledger file. The
 file is created with mode 0600, and every change to it
-holds a lock on `open-runs.lock` beside it; the lock file stays there. The line
+holds a lock on `open-runs.lock` beside it; the lock file stays there. A record
+file or a lock file that already exists, and that you own, loses its group and
+other access when a command opens it. The line
 is removed after the run's ledger event is written, and the file is removed when
 no line is left. When the ledger event could not be written, the line stays, and
 a later command charges the run once the ledger can be written. The record is
@@ -727,4 +733,5 @@ exception. Full coverage rules, resume behaviour and troubleshooting are in
 the output directory is a link or anything other than a regular file, `map`
 stops with an error before it sends any request. A new `results.jsonl` gets
 mode 0600, because it names every item and what each request cost; one that
-already exists keeps its mode.
+already exists, and that you own, loses its group and other access when `map`
+next runs on that directory. The output directory keeps its mode.
