@@ -42,8 +42,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `sh`, `bash`, `dash`, `zsh` or `ksh` with `-c`. Before, the guard stopped at
   any of these, so `timeout 5 cat answer.md` read a protected answer in full,
   and `enmaas allow-read` or `enmaas ask --stdout` behind one was not blocked.
-  A reader behind one of these with an option the guard does not know is
-  denied.
+  Any command behind one of these with an option the guard does not know
+  is denied, harmless or not. `timeout` takes one word as its duration,
+  whatever that word is.
 - The output guard now checks a file that a reader loads as input before it
   allows a search that prints only file names or counts. Before,
   `rg -l -f answer.md other.txt` was allowed, and ripgrep printed the text of
@@ -257,7 +258,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A reader that closes stdout before the receipt is printed no longer makes a
   finished `ask` or `map` exit 120 with a `BrokenPipeError`.
 - With `--json`, `ask` and `map` now print exactly one JSON object on stdout
-  on every exit, and `models` prints the error object when it fails. A
+  on every exit but two, and `models` prints the error object when it fails.
+  The two are an argument error and a config file that is not valid UTF-8;
+  see Known limits. A
   missing items file, a bad template, attachment,
   prompt or schema, an unknown model dialect, a refused index and a malformed
   `[budget]` table used to print text on stderr only. The error object is
@@ -362,7 +365,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Known limits
 
 These are open in this release. None of them is new in 0.8.0, except the cut
-of error text to 200 characters.
+of error text to 200 characters and the denial of an unknown wrapper option.
 
 - The output guard reads a shell command without running it, and it does not
   model every shell construct. Parameter expansion with a default or
@@ -380,13 +383,30 @@ of error text to 200 characters.
   answer in full, and `enmaas allow-read` or `enmaas ask --stdout` behind
   such a launcher is not blocked. Shell text that the guard cannot see is not
   checked either: a script file, text piped to a shell, and text that a
-  variable or a command substitution produces. `command cat -v answer.md` is
-  allowed by mistake.
+  variable or a command substitution produces. A `-v` anywhere after
+  `command` stops the check, so `command cat -v answer.md` is allowed by
+  mistake. `uv run`, `uvx` and `pipx run` are launchers too, so
+  `uv run enmaas ask --stdout` is not blocked.
+- A command behind `timeout`, `nice`, `nohup`, `stdbuf`, `exec` or `setsid`,
+  or a shell started with `-c`, is denied when it uses an option the guard
+  does not know, even when the command is harmless. A shortened long option
+  such as `timeout --sig=KILL` counts as unknown. Write the option in full.
+- `timeout` with a duration that expands to no word or to several words, such
+  as an unset variable, shifts the command by a word, and the guard then
+  checks the wrong word.
+- A redirection written before the command hides the command from the guard:
+  `2>&1 cat answer.md` reads a protected answer. The usual order,
+  `cat answer.md 2>&1`, is denied.
+- A read inside a shell function, a command name built with braces such as
+  `{cat,answer.md}`, and a read after `pushd` into another directory are not
+  seen. `grep -r` with no file operand searches the working directory even
+  when its input is a pipe, and the guard does not check that search.
 - A very long command, of several hundred kilobytes, can take the guard
   longer than its 3 second budget, and its answer can come after the 5 second
   hook timeout that both hosts are given. On Claude Code the hook is
   registered with `onFailure: "block"`, so the host blocks the call when the
-  hook fails or times out. What Codex does in that case is not confirmed.
+  hook fails or times out. A Claude Code version that does not know that
+  setting runs the call. What Codex does in that case is not confirmed.
 - Two commands started at the same time each check the rolling budget on
   their own, so together they can spend more than the budget.
 - A gateway reply is read into memory whole, with no size limit.
@@ -419,9 +439,10 @@ of error text to 200 characters.
 - The ledger file is not checked for its owner.
 - A configured price that is not a finite number produces invalid JSON in
   `usage --json`.
-- For contributors: four tests write into the state directory of the person
-  who runs them, and two of those add rows to the usage ledger there.
-  `CONTRIBUTING.md` has the command that runs the tests in a scratch folder.
+- For contributors: a few tests write into the state directory of the person
+  who runs them. When `XDG_STATE_HOME` is set, two of them add rows to the
+  usage ledger there. `CONTRIBUTING.md` has the command that runs the tests
+  in a scratch folder.
 
 ## [0.7.1] - 2026-11-09
 

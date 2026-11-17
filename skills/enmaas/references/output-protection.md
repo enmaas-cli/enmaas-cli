@@ -72,8 +72,11 @@ can then come after the 5 second hook timeout that both hosts are given. On
 Claude Code the hook is registered with `onFailure: "block"`, so a hook that
 fails or times out blocks the call. What Codex does in that case is not
 confirmed. Narrow a rejected search instead of switching readers or disabling
-protection. Piped searches without file operands inspect their upstream command;
-they do not scan the working directory. Native Grep defaults to filename output.
+protection. For a piped search without file operands the hook inspects the
+upstream command and does not scan the working directory. A recursive search
+such as `grep -r` with no file operand still searches the working directory
+when its input is a pipe, and the hook does not check that search. Native Grep
+defaults to filename output.
 
 A human-granted exception persists across sessions. The next generation for
 that path restores protection. Resume preserves approval when it skips that

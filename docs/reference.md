@@ -123,7 +123,8 @@ These go before the subcommand: `enmaas --key-file PATH models`.
 - `--system TEXT`: System message.
 - `-o, --output PATH`: Write response to this path instead of a timestamped run directory.
 - `--stdout`: Print the response body to stdout and the receipt to stderr.
-  The output guard denies assistant use of this option.
+  The output guard denies assistant use of this option in the command forms
+  it reads. See [Known limits](../CHANGELOG.md#known-limits).
 - `--save-thinking`: Save reasoning tokens to a separate file (when available).
 - `--retries N`: Number of retries on transient failures. Defaults to 3.
 

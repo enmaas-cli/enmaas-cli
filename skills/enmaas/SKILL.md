@@ -55,7 +55,7 @@ If a full answer is needed, explain why and give the user
 `enmaas allow-read PATH` to run in their own terminal. Do not run that command
 yourself. After the user grants the exception, the file can be read normally.
 The next enmaas generation for that path restores protection. Do not use
-`ask --stdout` from assistant tools; the hook blocks it.
+`ask --stdout` from assistant tools; the hook blocks the forms it reads.
 
 Counts prove completion status, not answer correctness. The usage ledger covers
 gateway calls, not the parent context. Do not claim a measured monetary saving

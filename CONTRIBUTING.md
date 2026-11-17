@@ -45,8 +45,9 @@ step, including a second run and `--uninstall`. Run it without redirecting outpu
 checks whose failure is hidden is worse than no chain, and that mistake has
 already been made once in this repository's history.
 
-Four tests write into the state directory of the person who runs them, which
-is `~/.local/state/enmaas/runs/` by default. Two of them add rows to the usage
+A few tests write into the state directory of the person who runs them, which
+is `~/.local/state/enmaas/runs/` by default. Most leave only a lock file. When
+`XDG_STATE_HOME` is set in your environment, two of them add rows to the usage
 ledger there. To keep the tests out of your own files, point `HOME` and
 `XDG_STATE_HOME` at a scratch folder:
 
