@@ -208,6 +208,10 @@ _HEREDOC_START = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([\w]+))")
 # An operator is a run of these signs that holds < or >: >&, <&, >|, <>, &>, &>>.
 _REDIRECTION_DESCRIPTOR = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z_0-9]*\}")
 _REDIRECTION_OPERATOR = re.compile(r"[<>&|]*[<>][<>&|]*")
+# The package that holds the enmaas program. A launcher can be given a version
+# or a source right after the name: enmaas-cli==0.8.0, enmaas-cli@., enmaas-cli[x].
+_PACKAGE = "enmaas-cli"
+_PACKAGE_WITH_SOURCE = tuple(_PACKAGE + char for char in "=<>~!@[")
 
 # Bash decodes these escapes inside $'...'. Any other escape is left to Bash
 # rules the guard does not copy, so the string counts as unreadable.
@@ -441,11 +445,16 @@ def _launched_enmaas(words: list[str]) -> str | None:
     A launcher the guard does not read, such as uv run, ionice or flock, runs
     the command in its later words. The guard cannot tell which word starts
     that command, so each word with the base name enmaas counts as a start.
+    pipx run takes the package name in place of the program name, so the
+    package name also counts, alone or with a version or a source after it.
     The words are not split again: a quoted sentence is one word.
     """
     values = [_shell_value(word) for word in words]
     for index, value in enumerate(values):
-        if "enmaas" not in value or Path(value).name != "enmaas":
+        if "enmaas" not in value:
+            continue
+        package = value == _PACKAGE or value.startswith(_PACKAGE_WITH_SOURCE)
+        if not package and Path(value).name != "enmaas":
             continue
         # Each candidate reads the words after it, so the deadline bounds the pass.
         if _remaining() <= 0:
@@ -1012,7 +1021,8 @@ def _segment(
     # Any command word but enmaas may be a launcher, so each path below that
     # allows the command ends with the launcher check. A denial found before
     # it keeps its own message. The check is called here, in this function,
-    # so a nested shell string costs the same number of calls as before.
+    # so each nested shell string costs two calls on the stack: one of _shell
+    # and one of this function.
     if name == "cd" and len(args) == 1 and not any(c in args[0] for c in "$`*?["):
         return _launched_enmaas(cleaned), _path(args[0], cwd)
     if name == "enmaas":

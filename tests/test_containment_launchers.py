@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import sys
-import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -435,7 +434,7 @@ def test_unquoted_sentence_with_the_words_in_order_is_denied(
         'echo "run enmaas ask -p hi --stdout to see it"',
         'git commit -m "docs enmaas allow-read"',
         'grep -rn "enmaas allow-read" src',
-        # The direct form reads only its own words, as before.
+        # The direct form reads only the words of the first enmaas.
         "enmaas ask -o out.md how to use enmaas allow-read",
     ],
 )
@@ -652,6 +651,135 @@ def test_redirection_inside_a_global_option_still_hides_the_subcommand(
     assert shell(root, f"{form} {arguments}") is None
 
 
+@pytest.mark.parametrize(
+    "command,message",
+    [
+        # pipx runs the only program of a package when given the package name.
+        ("pipx run enmaas-cli allow-read x", ALLOW_READ),
+        ("pipx run --spec . enmaas-cli allow-read x", ALLOW_READ),
+        ("pipx run enmaas-cli==0.8.0 ask -p hi --stdout", STDOUT),
+        ("pipx run enmaas-cli ask -p hi --stdout", STDOUT),
+        ("uvx enmaas-cli allow-read x", ALLOW_READ),
+        ("uv tool run enmaas-cli ask -p hi --stdout", STDOUT),
+        ("timeout 5 pipx run enmaas-cli allow-read x", ALLOW_READ),
+        ('bash -c "pipx run enmaas-cli allow-read x"', ALLOW_READ),
+        # Each character that can start a version or a source after the name.
+        ("pipx run enmaas-cli==0.8.0 allow-read x", ALLOW_READ),
+        ("pipx run enmaas-cli~=0.8 allow-read x", ALLOW_READ),
+        ("pipx run enmaas-cli!=0.7 allow-read x", ALLOW_READ),
+        ("pipx run 'enmaas-cli>=0.8' allow-read x", ALLOW_READ),
+        ('pipx run "enmaas-cli<1" allow-read x', ALLOW_READ),
+        ("uvx enmaas-cli@0.8.0 allow-read x", ALLOW_READ),
+        ("uvx enmaas-cli@git+https://example.com/e.git ask -p hi --stdout", STDOUT),
+        ("pipx run 'enmaas-cli[extra]' allow-read x", ALLOW_READ),
+        # Bash reads an unquoted > as a redirection, and the name stands alone.
+        ("pipx run enmaas-cli>=0.8 allow-read x", ALLOW_READ),
+        # The options of enmaas, a double dash and a redirection after the name.
+        ("pipx run enmaas-cli --config c allow-read x", ALLOW_READ),
+        ("pipx run enmaas-cli -- allow-read x", ALLOW_READ),
+        ("pipx run enmaas-cli 2>/dev/null allow-read x", ALLOW_READ),
+        # Accepted cost: any command with the package name in front of the words.
+        ("ls enmaas-cli allow-read", ALLOW_READ),
+        ("pip download enmaas-cli allow-read", ALLOW_READ),
+        ("enmaas-cli allow-read x", ALLOW_READ),
+    ],
+)
+def test_package_name_counts_as_an_enmaas_command(root: Path, command: str, message: str) -> None:
+    assert verdict(root, command) == message
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install enmaas-cli",
+        "pip show enmaas-cli",
+        "pip install 'enmaas-cli>=0.8'",
+        "pip install -U enmaas-cli 2>&1 | tail -3",
+        "uv tool install enmaas-cli==0.8.0",
+        "pipx install enmaas-cli",
+        "pipx run enmaas-cli inspect answer.md",
+        "pipx run enmaas-cli ask -p hi -o out.md",
+        "pipx run enmaas-cli==0.8.0 --version",
+        "git clone https://github.com/enmaas-cli/enmaas-cli.git",
+        "cd enmaas-cli && git status",
+        # The words sit in one quoted string.
+        'pipx run "enmaas-cli allow-read x"',
+        # Other names that start with the package name, or end with it.
+        "pipx run enmaas-cli-extra allow-read x",
+        "pipx run enmaas-client allow-read x",
+        "pipx run enmaas-cli.whl allow-read x",
+        "pipx run enmaas-cli/ allow-read x",
+        "pipx run ./enmaas-cli allow-read x",
+        "pipx run xenmaas-cli allow-read x",
+        # Other spellings of the package name are not read.
+        "pipx run enmaas_cli allow-read x",
+        "pipx run ENMAAS-CLI allow-read x",
+        "pipx run 'enmaas-cli >=0.8' allow-read x",
+    ],
+)
+def test_package_name_with_a_harmless_command_stays_allowed(root: Path, command: str) -> None:
+    assert shell(root, command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "xenmaas allow-read x",
+        "ENMAAS allow-read x",
+        "Enmaas ask -p hi --stdout",
+        "uv run xenmaas allow-read x",
+        "uv run ENMAAS ask -p hi --stdout",
+        "ionice /usr/bin/xenmaas allow-read x",
+        "ionice /usr/bin/ENMAAS allow-read x",
+        "uv run enmaasx allow-read x",
+        "uv run enmaas.py allow-read x",
+        "uv run my-enmaas ask -p hi --stdout",
+        # The assignment gives a variable the plain name. Bash runs allow-read.
+        "X=enmaas allow-read x",
+    ],
+)
+def test_other_program_names_stay_allowed(root: Path, command: str) -> None:
+    assert shell(root, command) is None
+
+
+def test_assignment_whose_value_names_the_program_counts_as_a_start(root: Path) -> None:
+    # Accepted cost: Bash runs a program called allow-read here, not enmaas.
+    assert verdict(root, "X=/usr/bin/enmaas allow-read x") == ALLOW_READ
+    assert verdict(root, "X=./enmaas ask -p hi --stdout") == STDOUT
+    assert shell(root, "X=/usr/bin/enmaas inspect answer.md") is None
+    assert shell(root, "X=/usr/bin/enmaas") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # No command word is left after the wrapper.
+        "timeout -s enmaas allow-read",
+        "timeout -s enmaas allow-read cd x",
+        # A shell that is given no source, and one whose source is allowed.
+        "timeout -s enmaas allow-read bash script.sh",
+        'timeout -s enmaas allow-read bash -c "echo hi"',
+        "timeout -s enmaas allow-read eval true",
+        # A command the guard does not know.
+        "timeout -s enmaas allow-read ls",
+        # A search that prints names or counts only.
+        "timeout -s enmaas allow-read grep -l x public.md",
+        # A ripgrep search of harmless files.
+        "timeout -s enmaas allow-read rg public public.md",
+        # A reader whose files are all harmless.
+        "timeout -s enmaas allow-read cat public.md",
+    ],
+)
+def test_every_exit_reads_the_words_a_wrapper_took(
+    root: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # timeout takes enmaas as its signal and allow-read as its duration, so
+    # the command it runs holds neither word. Only a check that reads every
+    # word of the simple command denies these.
+    monkeypatch.delenv("RIPGREP_CONFIG_PATH", raising=False)
+    assert verdict(root, command) == ALLOW_READ
+
+
 def test_launcher_check_stops_when_the_time_budget_is_spent(root: Path) -> None:
     spent = False
     check = containment._enmaas
@@ -673,21 +801,42 @@ def test_launcher_check_stops_when_the_time_budget_is_spent(root: Path) -> None:
     assert reason and NARROW in reason
 
 
-def test_very_long_launcher_command_ends_inside_the_time_budget(root: Path) -> None:
-    budget = 1.0
-    with patch.object(containment, "_TIME_BUDGET_SECONDS", budget):
-        started = time.monotonic()
+def test_very_long_launcher_command_stops_at_the_deadline(root: Path) -> None:
+    # The clock is patched: each look at it costs one tick of a budget of 100
+    # ticks. No wall time is measured, so the load of the machine cannot
+    # change the result.
+    budget = 100
+    looks = 0
+    candidates = 0
+    check = containment._enmaas
+
+    def remaining() -> float:
+        nonlocal looks
+        looks += 1
+        return float(budget - looks)
+
+    def count(args: list[str]) -> str | None:
+        nonlocal candidates
+        candidates += 1
+        # Fail at once, without reading the other candidates.
+        assert candidates <= budget, "the check read on after the deadline"
+        return check(args)
+
+    with (
+        patch.object(containment, "_remaining", remaining),
+        patch.object(containment, "_enmaas", count),
+    ):
         harmless = shell(root, "uv run " + "enmaas ask " * 10_000 + "-o out.md")
-        first = time.monotonic() - started
-        started = time.monotonic()
+        read = candidates
+        looks = candidates = 0
         restricted = shell(root, "uv run " + "enmaas ask " * 10_000 + "--stdout")
-        second = time.monotonic() - started
-    # A check that finishes in time gives its normal answer. One that meets
-    # the deadline is denied. Neither answer comes long after the budget.
-    assert harmless is None or NARROW in harmless
-    assert restricted and (STDOUT in restricted or NARROW in restricted)
-    assert first < budget + 1.5
-    assert second < budget + 1.5
+    # The harmless command holds 10,000 candidates. The check reads the clock
+    # before each one and stops when the budget is spent.
+    assert harmless and NARROW in harmless
+    assert 0 < read < budget
+    # The first candidate of the restricted command is denied.
+    assert restricted and STDOUT in restricted
+    assert candidates == 1
 
 
 def test_long_launcher_commands_are_checked(root: Path) -> None:
@@ -711,8 +860,9 @@ def test_long_launcher_commands_are_checked(root: Path) -> None:
 def test_launcher_check_keeps_the_depth_of_nested_shell_strings(
     root: Path, command: str, expected: str | None
 ) -> None:
-    # Each eval costs two calls, as before. A third call for each level would
-    # pass this limit and deny commands that were checked before.
+    # Each nested shell string costs two calls: one of _shell and one of
+    # _segment. A third call for each level would pass this limit, and the
+    # guard would refuse these commands with a RecursionError.
     limit = sys.getrecursionlimit()
     sys.setrecursionlimit(len(inspect.stack()) + 200)
     try:
