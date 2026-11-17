@@ -205,7 +205,7 @@ _PROGRAM_READERS = {"sed", "awk", "gawk"}
 _HEREDOC_START = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([\w]+))")
 # What a redirection leaves in the words of a command. The file descriptor in
 # front of an operator is a number or a {name}: the 2 of 2>&1 and of 2> log.
-# An operator is a run of these signs that holds < or >: >&, <&, >|, <>, &>, &>>.
+# An operator is a run of <, >, & and | that holds < or >: >&, <&, >|, <>, &>, &>>.
 _REDIRECTION_DESCRIPTOR = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z_0-9]*\}")
 _REDIRECTION_OPERATOR = re.compile(r"[<>&|]*[<>][<>&|]*")
 # The package that holds the enmaas program. A launcher can be given a version

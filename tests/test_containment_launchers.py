@@ -742,6 +742,24 @@ def test_other_program_names_stay_allowed(root: Path, command: str) -> None:
     assert shell(root, command) is None
 
 
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        # A word that only holds the name does not end the search for a start.
+        ("ionice xenmaas enmaas allow-read x", ALLOW_READ),
+        ("uv run enmaas-client enmaas ask -p hi --stdout", STDOUT),
+        # The target of a redirection the guard removes is not one of the words.
+        ("echo hi > enmaas allow-read x", None),
+        ("uv run enmaas ask -p hi -o out.md > --stdout", None),
+        # A quoted word of | or & holds no < or >, so it is not read as a redirection.
+        ("enmaas '|' x allow-read y", None),
+        ("uv run enmaas '&' x allow-read y", None),
+    ],
+)
+def test_words_the_launcher_check_reads(root: Path, command: str, expected: str | None) -> None:
+    assert verdict(root, command) == expected
+
+
 def test_assignment_whose_value_names_the_program_counts_as_a_start(root: Path) -> None:
     # Accepted cost: Bash runs a program called allow-read here, not enmaas.
     assert verdict(root, "X=/usr/bin/enmaas allow-read x") == ALLOW_READ
