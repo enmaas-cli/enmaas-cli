@@ -405,6 +405,27 @@ def _enmaas(args: list[str]) -> str | None:
     return None
 
 
+def _launched_enmaas(words: list[str]) -> str | None:
+    """Apply the enmaas check to each word named enmaas in one simple command.
+
+    A launcher the guard does not read, such as uv run, ionice or flock, runs
+    the command in its later words. The guard cannot tell which word starts
+    that command, so each word with the base name enmaas counts as a start.
+    The words are not split again: a quoted sentence is one word.
+    """
+    values = [_shell_value(word) for word in words]
+    for index, value in enumerate(values):
+        if "enmaas" not in value or Path(value).name != "enmaas":
+            continue
+        # Each candidate reads the words after it, so the deadline bounds the pass.
+        if _remaining() <= 0:
+            return _narrow()
+        reason = _enmaas(values[index + 1 :])
+        if reason:
+            return reason
+    return None
+
+
 def _value_options(name: str) -> set[str]:
     if name in _SEARCHERS:
         return _SEARCH_VALUES | (_RG_VALUES if name == "rg" else _GREP_VALUES)
@@ -952,18 +973,27 @@ def _segment(
         while index < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", tokens[index]):
             index += 1
     if index >= len(tokens):
-        return None, cwd
+        return _launched_enmaas(cleaned), cwd
     name = Path(_shell_value(tokens[index])).name
     if _UNRESOLVED in name or (name in _READERS and any(_UNRESOLVED in word for word in words)):
         # The guard cannot tell which program runs, or which file a reader opens.
         raise ValueError("dollar quoting the guard cannot read")
     args = [_shell_value(arg) for arg in tokens[index + 1 :]]
-    if name == "cd" and len(args) == 1 and not any(c in args[0] for c in "$`*?["):
-        return None, _path(args[0], cwd)
     if name == "enmaas":
         return _enmaas(args), cwd
+    reason, cwd = _command(name, args, tokens[index + 1 :], cwd, stdin, entered)
+    # Any other command word may be a launcher. A denial above keeps its message.
+    return reason or _launched_enmaas(cleaned), cwd
+
+
+def _command(
+    name: str, args: list[str], raw: list[str], cwd: Path, stdin: bool, entered: set[Path] | None
+) -> tuple[str | None, Path]:
+    """Check one simple command by its command word. raw holds args as written."""
+    if name == "cd" and len(args) == 1 and not any(c in args[0] for c in "$`*?["):
+        return None, _path(args[0], cwd)
     if name == "eval" or name in _SHELLS:
-        source = _shell_source(name, tokens[index + 1 :])
+        source = _shell_source(name, raw)
         if source is None:
             return None, cwd
         # eval runs in this shell, so a cd inside it also moves later commands.
