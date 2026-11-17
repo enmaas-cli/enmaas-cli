@@ -172,7 +172,6 @@ _WRAPPERS: dict[str, tuple[str, str, set[str], set[str]]] = {
     "setsid": ("cfw", "", {"--ctty", "--fork", "--wait"}, set()),
 }
 _NICE_ADJUSTMENT = re.compile(r"-[-+]?[0-9]+")
-_DURATION = re.compile(r"(?:[0-9]+\.?[0-9]*|\.[0-9]+)[smhd]?")
 # Shells that run their first operand as source when given -c. The letters are
 # options without a value that every listed shell reads the same way. Bash has
 # a few more, and reads its long options with one dash or two. The other
@@ -234,6 +233,10 @@ _UNRESOLVED = "\ue0ff"
 # Runs of text that hold no character the dollar quote pass acts on.
 _UNQUOTED_PLAIN = re.compile(r"[^\\'\"$`#<>()\n]+")
 _QUOTED_PLAIN = re.compile(r"[^\\\"$`]+")
+
+
+class _BudgetSpent(Exception):
+    """The time budget ran out in code that cannot return a denial itself."""
 
 
 def _shell_value(value: str) -> str:
@@ -637,10 +640,13 @@ def _rg_scope(args: list[str], operands: list[str], cwd: Path) -> str | None:
     return None
 
 
-def _wrapped(name: str, tokens: list[str]) -> list[str]:
-    """Return the command a transparent wrapper runs, after the wrapper's own options."""
+def _wrapped(name: str, tokens: list[str], index: int) -> int:
+    """Return where the command a transparent wrapper runs starts.
+
+    index is the first word after the wrapper's name. The result can pass the
+    end of tokens, which means the wrapper runs nothing.
+    """
     flags, valued, long_flags, long_valued = _WRAPPERS[name]
-    index = 0
     while index < len(tokens) and tokens[index].startswith("-") and tokens[index] != "-":
         option = tokens[index]
         index += 1
@@ -648,7 +654,7 @@ def _wrapped(name: str, tokens: list[str]) -> list[str]:
             break
         if option in {"--help", "--version"}:
             # The wrapper prints its own text and runs nothing.
-            return []
+            return len(tokens)
         if name == "nice" and _NICE_ADJUSTMENT.fullmatch(option):
             continue
         if option.startswith("--"):
@@ -666,11 +672,10 @@ def _wrapped(name: str, tokens: list[str]) -> list[str]:
             if letter not in flags:
                 raise ValueError("unsupported execution wrapper option")
     if name == "timeout":
-        # One word before the command is the duration.
-        if index < len(tokens) and not _DURATION.fullmatch(tokens[index]):
-            raise ValueError("unsupported timeout duration")
+        # The program always takes exactly one word as the duration: a number,
+        # a variable or a substitution. The command starts after it.
         index += 1
-    return tokens[index:]
+    return index
 
 
 def _shell_source(name: str, tokens: list[str]) -> str | None:
@@ -716,42 +721,53 @@ def _shell_source(name: str, tokens: list[str]) -> str | None:
 
 def _unwrap(tokens: list[str]) -> list[str]:
     """Expose commands behind common shell keywords and execution wrappers."""
-    while tokens:
-        if re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", tokens[0]):
-            tokens = tokens[1:]
+    index = 0
+    # The last -v or -V, found once, when the first command wrapper asks for it.
+    query: int | None = None
+    while index < len(tokens):
+        # A long chain of wrappers must not run past the time budget.
+        if _remaining() <= 0:
+            raise _BudgetSpent
+        if re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", tokens[index]):
+            index += 1
             continue
-        name = Path(_shell_value(tokens[0])).name
+        name = Path(_shell_value(tokens[index])).name
         if name == "env":
-            tokens = tokens[1:]
-            while tokens and tokens[0].startswith("-"):
-                option = tokens.pop(0)
-                if option in {"-u", "--unset"} and tokens:
-                    tokens.pop(0)
+            index += 1
+            while index < len(tokens) and tokens[index].startswith("-"):
+                option = tokens[index]
+                index += 1
+                if option in {"-u", "--unset"} and index < len(tokens):
+                    index += 1
                 elif option not in {"-i", "--ignore-environment", "--"}:
                     raise ValueError("unsupported env wrapper option")
             continue
         if name in {"if", "then", "elif", "else", "do", "while", "until", "!", "{", "}"}:
-            tokens = tokens[1:]
+            index += 1
             continue
         if name in _WRAPPERS:
-            tokens = _wrapped(name, tokens[1:])
+            index = _wrapped(name, tokens, index + 1)
             continue
         if name not in {"command", "builtin", "time", "sudo", "xargs"}:
-            return tokens
-        tokens = tokens[1:]
-        if name == "command" and any(flag in tokens for flag in ("-v", "-V")):
-            return []
+            return tokens[index:]
+        index += 1
+        if name == "command":
+            if query is None:
+                query = max((i for i, t in enumerate(tokens) if t in {"-v", "-V"}), default=-1)
+            if query >= index:
+                return []
         value_options = {
             "sudo": {"-u", "-g", "-h", "-p", "-C", "--user", "--group", "--host"},
             "xargs": {"-I", "-n", "-P", "-L", "-d", "-s", "-E"},
             "time": {"-o", "-f", "--output", "--format"},
         }.get(name, set())
-        while tokens and tokens[0].startswith("-"):
-            option = tokens.pop(0)
+        while index < len(tokens) and tokens[index].startswith("-"):
+            option = tokens[index]
+            index += 1
             if option == "--":
                 break
-            if option in value_options and tokens:
-                tokens.pop(0)
+            if option in value_options and index < len(tokens):
+                index += 1
             elif option.partition("=")[0] in value_options and "=" in option:
                 continue
             elif option not in {
@@ -781,10 +797,11 @@ def _unwrap(tokens: list[str]) -> list[str]:
         if name == "xargs":
             # Its operands come from stdin, so checking only its command line
             # cannot establish which files a reader will open.
-            tokens = _unwrap(tokens)
-            if tokens and Path(tokens[0]).name in _READERS | {"enmaas"}:
+            command = _unwrap(tokens[index:])
+            if command and Path(command[0]).name in _READERS | {"enmaas"}:
                 raise ValueError("xargs supplies dynamic file operands; use explicit paths")
-    return tokens
+            return command
+    return []
 
 
 def _substitutions(command: str, *, literal: bool = False) -> tuple[str, list[str]]:
@@ -1219,7 +1236,15 @@ def _shell_syntax(command: str) -> str:
 
 def _shell(command: str, cwd: Path, entered: set[Path] | None = None) -> str | None:
     """Check shell source. Add the directories it may end in to entered, when given."""
-    command, embedded = _heredocs(_dollar_quotes(command))
+    # The guard writes this code point into the text as its own marker. A
+    # command that already holds it, as written or in a decoded $'...' string,
+    # would be read wrongly, so it is refused before and after the decoding.
+    if _QUOTED_ESCAPE in command:
+        raise ValueError("command holds a code point the guard reserves")
+    command = _dollar_quotes(command)
+    if _QUOTED_ESCAPE in command:
+        raise ValueError("command holds a code point the guard reserves")
+    command, embedded = _heredocs(command)
     command, substitutions = _substitutions(command)
     lexer = shlex.shlex(_shell_syntax(command), posix=True, punctuation_chars=";&|()<>\n")
     lexer.whitespace = " \t\r"
@@ -1288,6 +1313,8 @@ def _check_tool(event: dict[str, object]) -> str | None:
                 return f"{_PREFIX}shell workdir requires a directory string."
             return _shell(command, _path(workdir, cwd))
         value = inputs.get("file_path", inputs.get("path"))
+        if isinstance(value, str) and _QUOTED_ESCAPE in value:
+            raise ValueError("path holds a code point the guard reserves")
         if name == "Grep":
             if value is None:
                 value = "."
@@ -1309,6 +1336,8 @@ def _check_tool(event: dict[str, object]) -> str | None:
         if not isinstance(value, str) or not value:
             return f"{_PREFIX}{name} requires a file path string."
         return _check_path(_path(value, cwd), pattern)
+    except _BudgetSpent:
+        return _narrow()
     except (OSError, ValueError, RuntimeError) as exc:
         return (
             f"{_PREFIX}could not check this {name} input ({type(exc).__name__}). "

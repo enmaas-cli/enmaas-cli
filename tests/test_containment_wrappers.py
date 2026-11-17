@@ -20,6 +20,8 @@ UNCHECKED = "could not check this Bash input (ValueError)"
 ALLOW_READ = "the human must run enmaas allow-read"
 STDOUT = "ask --stdout increases parent context cost"
 NARROW = "safe scan limit or time budget"
+# The guard uses this code point as its own marker while it reads a command.
+MARKER = "\ue0fe"
 
 
 @pytest.fixture
@@ -116,6 +118,14 @@ TIMEOUT = [
     "timeout -- 5",
     "/usr/bin/timeout 5",
     "timeout '5'",
+    "timeout $T",
+    'timeout "$T"',
+    "timeout ${TIMEOUT:-60}",
+    "timeout $((60*5))",
+    "timeout $(echo 5)",
+    "timeout 1e3",
+    "timeout inf",
+    "timeout +5",
 ]
 NICE = [
     "nice",
@@ -220,12 +230,46 @@ def test_unknown_wrapper_option_is_denied(root: Path, command: str) -> None:
 def test_timeout_duration_is_not_taken_for_the_command(root: Path) -> None:
     # 5 is the duration and cat is the command.
     assert reads(root, "timeout 5 cat answer.md")
-    # Here cat stands where the duration belongs. The real program refuses it.
-    assert shell(root, "timeout cat answer.md")
-    assert unchecked(root, "timeout cat public.md")
+    # Here cat stands where the duration belongs. The real program refuses it
+    # and runs nothing, so no file is read.
+    assert shell(root, "timeout cat answer.md") is None
+    assert shell(root, "timeout cat public.md") is None
+    # The word after the duration is the command, whatever the duration holds.
+    assert reads(root, "timeout cat cat answer.md")
     assert shell(root, "timeout") is None
     assert shell(root, "timeout 5") is None
     assert shell(root, "timeout -k 5") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "timeout $T make",
+        'timeout "$TIMEOUT" pytest',
+        "timeout ${TIMEOUT:-60} npm test",
+        "timeout $((60*5)) make",
+        "timeout 1e3 make",
+        "timeout inf make",
+        "timeout +5 make",
+    ],
+)
+def test_timeout_duration_that_is_not_a_plain_number_is_allowed(root: Path, command: str) -> None:
+    assert shell(root, command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "timeout $T cat answer.md",
+        'timeout "$T" cat answer.md',
+        "timeout ${TIMEOUT:-60} cat answer.md",
+        "timeout -k 1 $T cat answer.md",
+        "timeout $T nice cat answer.md",
+    ],
+)
+def test_reader_behind_a_timeout_with_any_duration_is_denied(root: Path, command: str) -> None:
+    assert reads(root, command)
+    assert shell(root, command.replace("answer.md", "public.md")) is None
 
 
 @pytest.mark.parametrize(
@@ -236,6 +280,8 @@ def test_timeout_duration_is_not_taken_for_the_command(root: Path) -> None:
         "nohup --help",
         "stdbuf --help",
         "setsid --version",
+        "timeout --help cat answer.md",
+        "nice --version cat answer.md",
         "nice",
         "nohup",
         "exec",
@@ -510,6 +556,174 @@ def test_escaped_dollar_in_double_quotes_keeps_its_reading_outside_shell_strings
     assert reads(root, 'grep "\\$" answer.md')
     assert shell(root, 'sed -n "\\$p" public.md') is None
     assert shell(root, 'echo "\\$(cat answer.md)" "\\`cat answer.md\\`"') is None
+
+
+def test_operands_after_the_shell_source_are_not_source(root: Path) -> None:
+    # The shell runs only the first operand. The rest are its positional parameters.
+    assert shell(root, "bash -c 'echo' cat answer.md") is None
+
+
+def test_cd_inside_a_shell_string_does_not_move_later_commands(root: Path) -> None:
+    # The cd runs in the child shell, so the later cat still runs in the first directory.
+    assert shell(root, "bash -c 'cd dir'; cat deep.md") is None
+
+
+def test_command_that_holds_the_marker_code_point_is_denied(root: Path) -> None:
+    named = root / f"a{MARKER}b.md"
+    named.write_text("PRIVATE ANSWER", encoding="utf-8")
+    protect(named)
+    assert unchecked(root, f"cat a{MARKER}b.md")
+    assert unchecked(root, f"cat 'a{MARKER}b.md'")
+    assert unchecked(root, f'cat "a{MARKER}b.md"')
+    assert unchecked(root, f"timeout 5 bash -c 'cat a{MARKER}b.md'")
+    assert unchecked(root, f"echo $(cat a{MARKER}b.md)")
+    assert unchecked(root, f"echo {MARKER}")
+    # Bash decodes each of these strings to the same file name.
+    assert unchecked(root, r"cat $'a\ue0feb.md'")
+    assert unchecked(root, r"""bash -c 'cat $'\''a\ue0feb.md'\'''""")
+    assert unchecked(root, r"cat $'a\xee\x83\xbeb.md'")
+    # The code point is refused even inside a string the guard cannot decode.
+    assert unchecked(root, f"echo $'\\cA{MARKER}'")
+    # A command without the code point is unaffected.
+    assert reads(root, "cat answer.md")
+    assert shell(root, "cat public.md") is None
+    assert shell(root, r'echo "\$(cat answer.md)"') is None
+
+
+@pytest.mark.parametrize(
+    "tool,inputs",
+    [
+        ("Read", {"file_path": "{}"}),
+        ("Grep", {"path": "{}", "pattern": "x", "output_mode": "content"}),
+        ("Grep", {"path": "{}", "pattern": "x"}),
+    ],
+)
+def test_file_tool_path_that_holds_the_marker_code_point_is_denied(
+    root: Path, tool: str, inputs: dict[str, str]
+) -> None:
+    named = root / f"a{MARKER}b.md"
+    named.write_text("PRIVATE ANSWER", encoding="utf-8")
+    protect(named)
+
+    def check(path: Path) -> str | None:
+        tool_input = {key: value.format(path) for key, value in inputs.items()}
+        return check_tool({"tool_name": tool, "cwd": str(root), "tool_input": tool_input})
+
+    message = f"could not check this {tool} input (ValueError)"
+    assert message in (check(named) or "")
+    assert message in (check(root / f"missing{MARKER}.md") or "")
+    # A path without the code point is unaffected.
+    assert check(root / "public.md") is None
+    if tool == "Read" or "output_mode" in inputs:
+        assert READ in (check(root / "answer.md") or "")
+    else:
+        assert check(root / "answer.md") is None
+
+
+# The wrappers the guard already knew, pinned so the walk through a long chain
+# keeps every decision.
+@pytest.mark.parametrize(
+    "command",
+    [
+        "command cat answer.md",
+        "command -p cat answer.md",
+        "builtin cat answer.md",
+        "env cat answer.md",
+        "env -u X cat answer.md",
+        "env --unset X cat answer.md",
+        "env -i X=1 cat answer.md",
+        "env -- cat answer.md",
+        "time cat answer.md",
+        "time -p cat answer.md",
+        "time -o out.txt cat answer.md",
+        "time --output=out.txt cat answer.md",
+        "sudo cat answer.md",
+        "sudo -u root -g wheel cat answer.md",
+        "sudo --user=root cat answer.md",
+        "sudo -n -- cat answer.md",
+        "X=1 Y=2 cat answer.md",
+        "if cat answer.md; then echo; fi",
+        "! cat answer.md",
+        "{ cat answer.md; }",
+        "while ! cat answer.md; do echo; done",
+        "command sudo env -i time -p nice cat answer.md",
+        "command env sudo builtin cat answer.md",
+    ],
+)
+def test_reader_behind_an_older_wrapper_is_checked(root: Path, command: str) -> None:
+    assert reads(root, command)
+    assert shell(root, command.replace("answer.md", "public.md")) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env -u",
+        "env -x cat public.md",
+        "sudo --bogus cat public.md",
+        "sudo -u",
+        "printf answer.md | xargs cat",
+        "printf answer.md | xargs -n 1 cat",
+        "printf answer.md | xargs -I{} cat {}",
+        "printf answer.md | xargs -I {} cat {}",
+        "printf x | xargs sudo -u root cat",
+        "printf x | xargs env X=1 enmaas inspect",
+    ],
+)
+def test_older_wrapper_the_guard_cannot_read_is_denied(root: Path, command: str) -> None:
+    assert unchecked(root, command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "command -v cat answer.md",
+        "command -V cat answer.md",
+        "command -v",
+        "command",
+        "env",
+        "time",
+        "sudo",
+        "xargs",
+        "X=1",
+        "printf x | xargs -n 1 echo",
+        "printf x | xargs -0 -r echo answer.md",
+        "printf x | xargs -n",
+    ],
+)
+def test_older_wrapper_that_runs_no_reader_is_allowed(root: Path, command: str) -> None:
+    assert shell(root, command) is None
+
+
+def test_wrapper_chain_checks_the_deadline_each_turn(root: Path) -> None:
+    calls = 0
+
+    def remaining() -> float:
+        # The budget runs out right after the check starts.
+        nonlocal calls
+        calls += 1
+        return 1.0 if calls == 1 else -1.0
+
+    with patch.object(containment, "_remaining", remaining):
+        reason = shell(root, "nice nice nice ls")
+    assert reason and NARROW in reason
+
+
+def test_very_long_wrapper_chain_ends_inside_the_time_budget(root: Path) -> None:
+    budget = 1.0
+    with patch.object(containment, "_TIME_BUDGET_SECONDS", budget):
+        started = time.monotonic()
+        harmless = shell(root, "nice " * 20_000 + "cat public.md")
+        first = time.monotonic() - started
+        started = time.monotonic()
+        reader = shell(root, "nice " * 20_000 + "cat answer.md")
+        second = time.monotonic() - started
+    # A check that finishes in time gives its normal answer. One that meets
+    # the deadline is denied. Neither answer comes long after the budget.
+    assert harmless is None or NARROW in harmless
+    assert reader and (READ in reader or NARROW in reader)
+    assert first < budget + 1.5
+    assert second < budget + 1.5
 
 
 def test_long_wrapper_and_eval_chains_are_checked(root: Path) -> None:
