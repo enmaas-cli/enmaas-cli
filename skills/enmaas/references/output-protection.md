@@ -40,9 +40,10 @@ The hook checks the command after a common shell keyword, such as `if` or
 wrappers: `env`, `command`, `builtin`, `time`, `sudo`, `xargs`, `timeout`,
 `nice`, `nohup`, `stdbuf`, `exec` and `setsid`. It reads shell text given to
 `eval`, or to `sh`, `bash`, `dash`, `zsh` or `ksh` with `-c`. It does not
-check the command that another launcher runs, such as `ionice`, `flock` or
-`find -exec`, or shell text in a script file. Do not use a wrapper to get
-past a denial.
+check a read that another launcher runs, such as `ionice`, `flock`, `uv run`
+or `find -exec`, or shell text in a script file. It denies
+`enmaas allow-read` and `enmaas ask --stdout` behind any launcher. Do not use
+a wrapper to get past a denial.
 Filename-only searches and counts are allowed as metadata. A file that a
 reader loads as input, such as a pattern file (`-f`), a script file, or an
 ignore or exclude file, is checked first, in every output mode.

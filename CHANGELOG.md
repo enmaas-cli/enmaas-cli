@@ -45,6 +45,15 @@ and versions follow [Semantic Versioning](https://semver.org/).
   Any command behind one of these with an option the guard does not know
   is denied, harmless or not. `timeout` takes one word as its duration,
   whatever that word is.
+- The output guard now denies `enmaas allow-read` and `enmaas ask --stdout`
+  behind any other command too. Before, `uv run enmaas ask --stdout` and
+  `ionice enmaas allow-read PATH` were allowed. The guard now applies the
+  check after every word named `enmaas` in a command, and after the package
+  name `enmaas-cli`, which `pipx run` accepts in place of the program name.
+- The output guard now finds the enmaas subcommand after a `--` and after a
+  redirection. Before, `enmaas -- allow-read PATH` and
+  `enmaas 2>/dev/null allow-read PATH` were allowed, and so were the same
+  forms of `enmaas ask --stdout`.
 - The output guard now checks a file that a reader loads as input before it
   allows a search that prints only file names or counts. Before,
   `rg -l -f answer.md other.txt` was allowed, and ripgrep printed the text of
@@ -378,15 +387,29 @@ of error text to 200 characters and the denial of an unknown wrapper option.
   `builtin`, `time`, `sudo`, `xargs`, `timeout`, `nice`, `nohup`, `stdbuf`,
   `exec` and `setsid`. It reads shell text given to `eval`, or to `sh`,
   `bash`, `dash`, `zsh` or `ksh` with `-c`. The command that any other
-  launcher runs is not checked. `ionice`, `flock`, `watch`, `script -c` and
-  `find -exec` are examples. So `ionice cat answer.md` reads a protected
-  answer in full, and `enmaas allow-read` or `enmaas ask --stdout` behind
-  such a launcher is not blocked. Shell text that the guard cannot see is not
-  checked either: a script file, text piped to a shell, and text that a
-  variable or a command substitution produces. A `-v` anywhere after
-  `command` stops the check, so `command cat -v answer.md` is allowed by
-  mistake. `uv run`, `uvx` and `pipx run` are launchers too, so
-  `uv run enmaas ask --stdout` is not blocked.
+  launcher runs is not checked for reads. `ionice`, `flock`, `watch`,
+  `script -c`, `find -exec`, `uv run`, `uvx` and `pipx run` are examples. So
+  `ionice cat answer.md` reads a protected answer in full. Shell text that
+  the guard cannot see is not checked either: a script file, text piped to a
+  shell, and text that a variable or a command substitution produces. A `-v`
+  anywhere after `command` stops the check, so `command cat -v answer.md` is
+  allowed by mistake.
+- `enmaas allow-read` and `enmaas ask --stdout` are denied behind any
+  launcher, but only where the guard can read the words. They are not blocked
+  when the program name, the subcommand or the option comes from a variable
+  or a command substitution, as in `e=enmaas; $e allow-read PATH`. They are
+  not blocked when a launcher gets the command as one quoted string, as in
+  `ionice bash -c "enmaas allow-read PATH"`. They are not blocked when a
+  redirection stands between a global option and its value, as in
+  `enmaas --config 2>/dev/null c.toml allow-read PATH`, or when `pipx run`
+  gets the package name inside a quoted requirement with a space, as in
+  `pipx run 'enmaas-cli >=0.8' allow-read PATH`.
+- The same check denies a harmless command that holds a word named `enmaas`
+  or `enmaas-cli` followed by `allow-read`, or by `ask` and `--stdout`, as
+  separate words: `echo enmaas allow-read answer.md`,
+  `which enmaas allow-read` and `git grep enmaas -- allow-read` are denied.
+  Put such text in quotes. A command with several thousand such words is
+  denied when the check reaches the guard's time budget.
 - A command behind `timeout`, `nice`, `nohup`, `stdbuf`, `exec` or `setsid`,
   or a shell started with `-c`, is denied when it uses an option the guard
   does not know, even when the command is harmless. A shortened long option
@@ -397,6 +420,9 @@ of error text to 200 characters and the denial of an unknown wrapper option.
 - A redirection written before the command hides the command from the guard:
   `2>&1 cat answer.md` reads a protected answer. The usual order,
   `cat answer.md 2>&1`, is denied.
+- A `;` or `|` written right against a redirection sign joins two commands
+  for the guard: `echo hi;<public.md cat answer.md` reads a protected answer.
+  With a space after the `;`, the same command is denied.
 - A read inside a shell function, a command name built with braces such as
   `{cat,answer.md}`, and a read after `pushd` into another directory are not
   seen. `grep -r` with no file operand searches the working directory even
