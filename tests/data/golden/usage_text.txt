@@ -1,0 +1,31 @@
+=== exit 0
+=== stdout
+Usage summary (all time)
+
+Total calls:      3
+Total input:      6,210 tokens
+  (cached):       1,200 tokens
+Total output:     1,220 tokens
+  (reasoning):    120 tokens
+Total elapsed:    44.2s
+
+Spend:            $0.00
+  unpriced:       other/model-a (no rate configured, so not counted above)
+Opus-equivalent:  $0.06
+  reference:      Claude Opus 5 list rate, $5.00 in / $25.00 out per MTok
+
+By model:
+  other/model-a                                1 calls          10 in          20 out       0.5s
+  rits/zai-org/glm-5-3                         2 calls       6,200 in       1,200 out      43.8s
+
+By command:
+  ask            1 calls       1,200 in         300 out       1.5s
+  map            1 calls       5,000 in         900 out      42.2s
+  record         1 calls          10 in          20 out       0.5s
+
+=== stderr
+
+=== usage.jsonl
+{"timestamp": "2026-11-01T09:00:00+00:00", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 1200, "cached_tokens": 200, "output_tokens": 300, "reasoning_tokens": 0, "elapsed": 1.5, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 1300}
+{"timestamp": "2026-11-02T10:30:00+00:00", "command": "map", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 5000, "cached_tokens": 1000, "output_tokens": 900, "reasoning_tokens": 120, "elapsed": 42.25, "status": "error", "schema_used": false, "error_kind": "PartialFailure", "items_total": 10, "items_ok": 9, "items_failed": 1, "charge": 4900}
+{"timestamp": "2026-11-03T12:00:00+00:00", "command": "record", "model": "other/model-a", "dialect": "anthropic", "input_tokens": 10, "cached_tokens": 0, "output_tokens": 20, "reasoning_tokens": 0, "elapsed": 0.5, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 30}

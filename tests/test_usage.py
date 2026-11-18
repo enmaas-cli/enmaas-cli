@@ -1,11 +1,13 @@
 """Tests for usage ledger. All offline, no live calls."""
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from enmaas_cli.cli import main
 from enmaas_cli.usage import (
     UsageEvent,
     append_event,
@@ -570,7 +572,7 @@ def test_strict_reader_rejects_negative_counts(tmp_path: Path) -> None:
 
     events, problems = load_events_strict(ledger)
     assert events == []
-    assert any("nonnegative" in p for p in problems)
+    assert problems == ["line 1: bad count"]
 
 
 def test_strict_reader_rejects_string_counts(tmp_path: Path) -> None:
@@ -591,7 +593,7 @@ def test_strict_reader_rejects_naive_timestamps(tmp_path: Path) -> None:
 
     events, problems = load_events_strict(ledger)
     assert events == []
-    assert any("naive" in p for p in problems)
+    assert problems == ["line 1: bad timestamp"]
 
 
 def test_strict_reader_reports_invalid_utf8(tmp_path: Path) -> None:
@@ -605,7 +607,7 @@ def test_strict_reader_reports_invalid_utf8(tmp_path: Path) -> None:
     events, problems = load_events_strict(ledger)
     assert events == []
     assert len(problems) == 1
-    assert "could not be read" in problems[0]
+    assert problems == ["not UTF-8 text"]
 
 
 def test_strict_reader_agrees_with_the_forgiving_one_when_healthy(
@@ -684,7 +686,12 @@ def test_append_event_reports_a_failure_at_close_not_just_at_write(
         items_ok=None,
         items_failed=None,
     )
-    monkeypatch.setattr(Path, "open", lambda *a, **k: FailsOnClose())
+
+    def fails_on_close(fd: int, *args: object, **kwargs: object) -> FailsOnClose:
+        os.close(fd)
+        return FailsOnClose()
+
+    monkeypatch.setattr(os, "fdopen", fails_on_close)
 
     assert append_event(tmp_path / "usage.jsonl", event) is False
 
@@ -737,3 +744,236 @@ def test_a_ledger_mixing_old_and_new_rows_totals_correctly(tmp_path: Path) -> No
     assert problems == []
     # Old row derives 10 + reasoning fallback 3 = 13; new row uses 100.
     assert rolling_spend(events, window_days=30, now=now) == 113
+
+
+HUGE = int("9" * 4300)
+
+
+@pytest.mark.parametrize(
+    "name", ["input_tokens", "cached_tokens", "output_tokens", "reasoning_tokens", "charge"]
+)
+def test_a_count_above_the_cap_is_handled_like_a_negative_one(tmp_path: Path, name: str) -> None:
+    ledger = tmp_path / "usage.jsonl"
+    good = _ok_row()
+    ledger.write_text(
+        json.dumps(_ok_row(**{name: 10**18 + 1}))
+        + "\n"
+        + json.dumps(_ok_row(**{name: HUGE}))
+        + "\n"
+        + json.dumps(good)
+        + "\n",
+        encoding="utf-8",
+    )
+    assert len(load_events(ledger)) == 1
+    events, problems = load_events_strict(ledger)
+    assert len(events) == 1
+    assert len(problems) == 2
+    # The value itself is not repeated, so a huge one cannot grow the message.
+    assert all(len(p) < 300 for p in problems)
+
+
+def test_usage_and_the_rolling_check_survive_huge_ledger_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.budget import rolling_check
+    from enmaas_cli.cli import main
+    from enmaas_cli.config import Config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+    ledger = tmp_path / "state" / "enmaas" / "runs" / "usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    row = _ok_row(input_tokens=HUGE, output_tokens=HUGE, charge=HUGE)
+    ledger.write_text((json.dumps(row) + "\n") * 2, encoding="utf-8")
+    assert main(["--config", str(tmp_path / "none.toml"), "usage"]) == 0
+    assert main(["--config", str(tmp_path / "none.toml"), "usage", "--json"]) == 0
+    capsys.readouterr()
+    check = rolling_check(Config(budget_tokens=100, budget_window_days=7), ledger)
+    assert check.message is not None
+    assert len(check.message) < 1000
+
+
+def test_text_from_a_ledger_row_prints_on_one_line(tmp_path: Path) -> None:
+    from enmaas_cli.usage import format_summary
+
+    ledger = tmp_path / "usage.jsonl"
+    rows = [
+        _ok_row(model="evil\n  forged line\x1b]0;title\x07", command="ask\x1b[2J\nx"),
+    ]
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    text = format_summary(summarize_usage(load_events(ledger)))
+    assert "\x1b" not in text
+    assert "\x07" not in text
+    forged = [line for line in text.splitlines() if "forged line" in line]
+    # Once in the unpriced list and once in the by-model table, never alone.
+    assert len(forged) == 2
+    assert all("calls" in line or "unpriced" in line for line in forged)
+    assert not any(line.startswith("x") for line in text.splitlines())
+
+
+def test_the_budget_refusal_never_prints_ledger_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from enmaas_cli.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://gw.example.test")
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+    ledger = tmp_path / "state" / "enmaas" / "runs" / "usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    forged_key = "\x1b]0;title\x07\nforged line"
+    rows = [
+        json.dumps(_ok_row(**{forged_key: 1})),
+        json.dumps(_ok_row(timestamp="9" * 200_000)),
+        *["not json \x1b[2J"] * 6,
+    ]
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    config = tmp_path / "budget.toml"
+    config.write_text("[budget]\nwindow_days = 7\ntokens = 100\n", encoding="utf-8")
+    argv = ["--config", str(config), "ask", "-m", "m", "--dialect", "openai", "-p", "hi"]
+    assert main(argv) == 3
+    err = capsys.readouterr().err
+    assert len(err) < 1000
+    assert all(ch.isprintable() for line in err.splitlines() for ch in line)
+    assert "forged" not in err
+    assert "9" * 20 not in err
+    expected_message = (
+        f"a token budget is configured but the usage ledger {ledger} could not be read: "
+        "line 1: unknown field; line 2: bad timestamp; line 3: not JSON; line 4: not JSON; "
+        "line 5: not JSON; and 3 more"
+    )
+    assert err == f"enmaas ask refused\n  budget    {expected_message[:200]}\n"
+
+
+# Ledger rows are checked field by field, so no row can break a reader.
+
+
+def _row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "command": "ask",
+        "model": "m",
+        "dialect": "openai",
+        "input_tokens": 100,
+        "cached_tokens": 0,
+        "output_tokens": 10,
+        "reasoning_tokens": 0,
+        "elapsed": 1.0,
+        "status": "ok",
+        "schema_used": False,
+        "error_kind": None,
+        "items_total": None,
+        "items_ok": None,
+        "items_failed": None,
+        "charge": 110,
+    }
+    row.update(overrides)
+    return row
+
+
+DEEP = '{"model": ' + "[" * 100_000 + "]" * 100_000 + "}"
+BAD_ROWS = [
+    json.dumps(_row(elapsed="1.0")),
+    json.dumps(_row(elapsed=None)),
+    # json writes these as the bare words NaN and Infinity, which it reads back.
+    json.dumps(_row(elapsed=float("nan"))),
+    json.dumps(_row(elapsed=float("inf"))),
+    json.dumps(_row(elapsed=-1.0)),
+    json.dumps(_row(model=["m"])),
+    json.dumps(_row(command=None)),
+    json.dumps(_row(model="m" * 1025)),
+    json.dumps(_row(error_kind=7)),
+    DEEP,
+]
+
+
+@pytest.fixture
+def ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://gw.example.test")
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+    path = tmp_path / "state" / "enmaas" / "runs" / "usage.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("\n".join([json.dumps(_row()), *BAD_ROWS]) + "\n", encoding="utf-8")
+    return path
+
+
+def test_both_readers_skip_every_bad_row(ledger: Path) -> None:
+    assert len(load_events(ledger)) == 1
+    events, problems = load_events_strict(ledger)
+    assert len(events) == 1
+    reasons = [p.split(": ", 1)[1] for p in problems]
+    assert reasons[:9] == [*["bad elapsed"] * 5, *["bad text field"] * 4]
+    # The last bad row is DEEP. The decoder gives up on it, or reads it when
+    # the stack has room. A DEEP row it can read has only a model field.
+    assert reasons[9:] in (["nested too deeply"], ["missing field"])
+
+
+def test_a_row_nested_too_deeply_is_skipped_and_named(
+    ledger: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The depth at which the decoder gives up depends on the Python version
+    # and the stack size, so the decoder is made to give up on DEEP here.
+    decode = json.loads
+
+    def deep(text: str) -> object:
+        if text == DEEP:
+            raise RecursionError("maximum recursion depth exceeded")
+        return decode(text)
+
+    monkeypatch.setattr("enmaas_cli.usage.json.loads", deep)
+    assert len(load_events(ledger)) == 1
+    events, problems = load_events_strict(ledger)
+    assert len(events) == 1
+    assert [p.split(": ", 1)[1] for p in problems] == [
+        *["bad elapsed"] * 5,
+        *["bad text field"] * 4,
+        "nested too deeply",
+    ]
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_usage_reports_the_rows_it_skipped(
+    ledger: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], as_json: bool
+) -> None:
+    argv = ["--config", str(tmp_path / "none.toml"), "usage", *(["--json"] if as_json else [])]
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    skipped = len(BAD_ROWS)
+    assert f"warning: {skipped} rows of {ledger} could not be read and were skipped" in (
+        captured.err
+    )
+    if as_json:
+        obj = json.loads(captured.out)
+        assert obj["total_calls"] == 1
+        assert obj["skipped_rows"] == skipped
+    else:
+        assert "Total calls:      1" in captured.out
+
+
+def test_a_budgeted_ask_refuses_on_a_bad_row(
+    ledger: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "budget.toml"
+    config.write_text("[budget]\nwindow_days = 7\ntokens = 100000\n", encoding="utf-8")
+    argv = ["--config", str(config), "ask", "-m", "m", "--dialect", "openai", "-p", "hi"]
+    assert main(argv) == 3
+    assert "could not be read: line 2: bad elapsed;" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "NaN", "Infinity"])
+def test_record_refuses_an_elapsed_that_is_not_finite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    argv = ["record", "--model", "m", "--command", "c", "--input", "1", "--output", "1"]
+    with pytest.raises(SystemExit) as excinfo:
+        main([*argv, "--elapsed", value])
+    assert excinfo.value.code == 1
+    assert "error:" in capsys.readouterr().err
+    assert not (tmp_path / "enmaas" / "runs" / "usage.jsonl").exists()

@@ -57,12 +57,16 @@ Options:
 | `--cli-only` | Install the command only. No skill, no guard. |
 | `--skill-only` | Copy the skill and install the guard. No command. Add `--no-hook` for the skill alone. |
 | `--no-hook` | Install the command and skill but skip the output guard. |
-| `--dry-run` | Print what would happen and change nothing. |
+| `--dry-run` | Print what would happen and change nothing. It names each file it would change and the change, and never prints what the file already holds. |
 | `--uninstall` | Remove the command, skill, guard and its registrations. |
 
 The installer is safe to run again at any time. It reinstalls the parts you
-selected and leaves everything else in your settings exactly as it was. It checks
-both host files before writing and refuses to touch one it cannot edit safely.
+selected and keeps every other setting, with one exception. When it registers
+the guard in Claude Code's `settings.json`, it removes every `PreToolUse` hook
+entry whose command contains the text `enmaas/guard/hooks/pre-tool-use.py`,
+including one you wrote yourself. `--dry-run` does not name that entry. It
+checks both host files before writing and refuses to touch one it cannot edit
+safely.
 
 The installer honours `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and an absolute
 `XDG_DATA_HOME` if you have set them. The paths in this guide are the defaults.
@@ -125,7 +129,7 @@ Pass `-o PATH` to keep an answer somewhere permanent.
 
 Start a new Claude Code session, or restart the one you have open, so it reloads
 settings. Type `/hooks` and confirm a `PreToolUse` entry whose command runs
-`python3 -S` on `.../enmaas/guard/hooks/pre-tool-use.py`. The skill loads on its own from
+`python3 -I -S` on `.../enmaas/guard/hooks/pre-tool-use.py`. The skill loads on its own from
 `~/.claude/skills/enmaas/`.
 
 ### Codex
@@ -176,8 +180,10 @@ version. If the run stops partway, fix what it reports and run it again.
 ```
 
 This removes the command, both skill copies, the guard and its two registrations.
-The `PreToolUse` list in `settings.json` keeps any other hooks you had. If the
-guard was the only one, an empty list is left so nothing else in the file moves. Your key file, your config file and your past answers stay where
+The `PreToolUse` list in `settings.json` keeps any other hooks you had, except a
+hook whose command contains the text `enmaas/guard/hooks/pre-tool-use.py`. That
+hook is removed too, even if you wrote it yourself, and `--dry-run` does not
+name it. If the guard was the only one, an empty list is left so nothing else in the file moves. Your key file, your config file and your past answers stay where
 they are. Delete
 `~/.secrets/enmaas`, `~/.config/enmaas/` and `~/.local/state/enmaas/` (or
 `$XDG_STATE_HOME/enmaas/`) yourself if you want them gone.
@@ -198,7 +204,7 @@ they are. Delete
 | `Could not confirm that enmaas-cli is removed` | `--uninstall` could not list installed tools with `uv` or `pipx`. | Read the tool's error above the line, fix it, and run `./install.sh --uninstall` again. |
 | `Could not put the previous copy back at ...` | A skill or guard swap failed and the rollback failed too. The message names where the backup is. | Move the backup to the named path by hand, then run the installer again. |
 | `No gateway URL. Run this again with --gateway URL, or set base_url in ~/.config/enmaas/config.toml.` | The installer ran without a terminal to ask on, and no URL was configured. | Pass `--gateway https://GATEWAY-HOST`. |
-| HTTP 401 or 403 from `enmaas models` | The key is wrong, expired or pasted with extra characters. | Open the file, make sure it holds one line and nothing else. Request a new key if it still fails. |
+| HTTP 401 or 403 from `enmaas models` | The key is wrong or expired. A key pasted with a space, a tab, a second line or a non-ASCII character does not get this far: it is refused before any request with `holds a character that cannot be sent in a header`. | Check the key against the one you were given. Request a new key if it still fails. |
 | `/hooks` in Claude Code shows no enmaas entry | Settings were not reloaded, or the file was not written. | Restart Claude Code. If still missing, run `./install.sh` again and read its output. It refuses to write a `settings.json` that is not valid JSON and tells you so. |
 | Codex never asked to trust the hook | Config was not reloaded. | Restart Codex. Check `~/.codex/config.toml` for the guard block. |
 | `enmaas containment: ...` when the assistant reads a file | The guard is working. The file is a protected answer. | Let the assistant use `enmaas inspect PATH`, or run `enmaas allow-read PATH` yourself. |
@@ -207,6 +213,8 @@ they are. Delete
 | `is a symbolic link to ..., which does not exist`, `is read-only`, or `Cannot write to ..., which is needed for ...` | A settings path points nowhere, or the installer cannot write where it needs to. | Fix the link or the permission, then run the installer again. |
 | `holds NaN or Infinity` or `is not valid JSON (duplicate key ...)` | `settings.json` contains a value or a repeated key that a rewrite would silently change. | Fix the file by hand, then run the installer again. |
 | `--uninstall` exits 1 and shows a `uv` or `pipx` error | The CLI is installed but the tool could not remove it. | Read the tool's error above the line, fix it, and run `./install.sh --uninstall` again. |
+| `the usage ledger ... cannot be written, so the token budget cannot be tracked` | A `[budget]` is configured and the state directory or `usage.jsonl` in it is read-only, the disk is full, or the ledger is at the file size limit (`ulimit -f`). No request was sent. | Fix the permission, free disk space, or raise the limit. To run without a budget, remove the `[budget]` table from `~/.config/enmaas/config.toml`. |
+| `the usage ledger ... could not be read: ... is not a regular file` (exit 3) | A `[budget]` is configured and `usage.jsonl` in the state directory is a symbolic link, a FIFO or anything else that is not a regular file. enmaas never reads or writes through such a path. No request was sent. | Remove the link or FIFO. To keep the rows of a ledger that was a link, move its target to the ledger path as a regular file. |
 | `exhausted max_tokens (... output tokens, stop=...) during reasoning` | The model spent its output budget thinking. | Add `--thinking off`, or shorten the prompt. On the hosted free models, raising `--max-tokens` was measured to make no difference. |
 
 If none of these match, open an issue in this repository with the full command and

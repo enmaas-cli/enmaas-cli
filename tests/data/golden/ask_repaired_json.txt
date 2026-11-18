@@ -1,0 +1,22 @@
+=== exit 0
+=== stdout
+{
+  "status": "ok",
+  "model": "rits/zai-org/glm-5-3",
+  "dialect": "openai",
+  "path": "<TMP>/state/enmaas/runs/<RUNDIR>/response.md",
+  "tokens": {
+    "input": 30,
+    "cached": null,
+    "output": 5,
+    "reasoning": null
+  },
+  "elapsed": <ELAPSED>,
+  "replaced": 1,
+  "error": null
+}
+
+=== stderr
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 30, "cached_tokens": null, "output_tokens": 5, "reasoning_tokens": null, "elapsed": <ELAPSED>, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 35}

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "enmaas-cli"
-version = "0.7.1"
+version = "0.8.0"
 description = "Delegate bulk and one-shot model work to the EnMaaS gateway; answers go to files"
 readme = "README.md"
 license = "Apache-2.0"
@@ -35,10 +35,10 @@ Changelog = "https://github.com/enmaas-cli/enmaas-cli/blob/main/CHANGELOG.md"
 Issues = "https://github.com/enmaas-cli/enmaas-cli/issues"
 
 [project.scripts]
-enmaas = "enmaas_cli.cli:main"
+enmaas = "enmaas_cli.cli:entry"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "types-jsonschema"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "types-jsonschema", "coverage>=7"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/enmaas_cli"]
@@ -51,9 +51,22 @@ addopts = "-m 'not live'"
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+# The helper also serves the installer on Python 3.9.
+per-file-target-version = { "src/enmaas_cli/hostconfig.py" = "py39" }
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C901"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+# The output guard parses shell text one construct at a time. Each branch
+# is one shell rule, and splitting them would scatter the parser that the
+# guard's safety depends on.
+"src/enmaas_cli/containment.py" = ["C901"]
+# The limit is for the package. Test helpers build fixtures case by case.
+"tests/**" = ["C901"]
 
 [tool.mypy]
 strict = true

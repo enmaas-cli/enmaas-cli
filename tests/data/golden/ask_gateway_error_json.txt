@@ -1,0 +1,22 @@
+=== exit 1
+=== stdout
+{
+  "status": "error",
+  "model": "rits/zai-org/glm-5-3",
+  "dialect": "openai",
+  "path": null,
+  "tokens": {
+    "input": null,
+    "cached": null,
+    "output": null,
+    "reasoning": null
+  },
+  "elapsed": <ELAPSED>,
+  "replaced": 0,
+  "error": "500: the gateway is down"
+}
+
+=== stderr
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": null, "cached_tokens": null, "output_tokens": null, "reasoning_tokens": null, "elapsed": <ELAPSED>, "status": "error", "schema_used": false, "error_kind": "GatewayError", "items_total": null, "items_ok": null, "items_failed": null, "charge": 0}

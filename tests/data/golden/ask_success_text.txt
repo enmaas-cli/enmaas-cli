@@ -1,0 +1,13 @@
+=== exit 0
+=== stdout
+enmaas ask ok
+  model     rits/zai-org/glm-5-3  (openai dialect)
+  output    <TMP>/state/enmaas/runs/<RUNDIR>/response.md  (17 B)
+  tokens    in 40 (10 cached)   out 6   reasoning 2
+  elapsed   <ELAPSED>
+  preview   {"answer": "yes"}
+
+=== stderr
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 40, "cached_tokens": 10, "output_tokens": 6, "reasoning_tokens": 2, "elapsed": <ELAPSED>, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 36}

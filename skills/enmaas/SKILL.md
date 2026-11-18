@@ -55,7 +55,7 @@ If a full answer is needed, explain why and give the user
 `enmaas allow-read PATH` to run in their own terminal. Do not run that command
 yourself. After the user grants the exception, the file can be read normally.
 The next enmaas generation for that path restores protection. Do not use
-`ask --stdout` from assistant tools; the hook blocks it.
+`ask --stdout` from assistant tools; the hook blocks the forms it reads.
 
 Counts prove completion status, not answer correctness. The usage ledger covers
 gateway calls, not the parent context. Do not claim a measured monetary saving
@@ -204,13 +204,67 @@ can be counted without importing this package.
 | Code | Meaning | What to do |
 |---|---|---|
 | 0 | all succeeded | continue |
-| 1 | config, auth, or validation error | read the message, it names the fix |
-| 2 | partial failure | check `results.jsonl` in the outdir |
+| 1 | config, auth, or validation error, or a `map` whose `results.jsonl` could not be written | read the message, it names the fix |
+| 2 | partial failure | read the failures from `results.jsonl` in the outdir, as shown below |
 | 3 | circuit breaker or token budget stopped the run | read the receipt; raise a spent budget before using `--resume` |
+| 130 or 143 | stopped by SIGINT or SIGTERM; after one signal a `map` recorded its spend and printed its receipt first | re-run the `map` with `--resume` to finish; for an `ask`, check whether the answer file exists before running it again |
+
+One signal stops a run cleanly. A second one ends the process at once; the next
+`ask` or `map` then charges the run's spend from its open-run record. Send one
+signal and wait. An `ask` stopped before its reply arrived records nothing; a
+reply that had arrived is recorded. A signal that arrives after the result was
+printed changes nothing, including the exit status.
 
 The breaker aborts a bulk run on 6 consecutive failures, or more than 50% of a
 full 20-item window. `--resume` skips items already recorded `ok` with an
 output file present, so finishing a half-done run is cheap.
+
+### Read failures from the index
+
+The `map` receipt lists the first 20 failures, each message cut to 200
+characters, and says how many more the index holds. `--json` does the same
+and sets `failures_truncated`. `results.jsonl` in the outdir keeps every
+message whole. Use these commands to read it instead of printing the file.
+Each item counts by its latest row, so an item a resume fixed is not counted.
+
+`-I` runs Python in isolated mode, so a `json.py` in the current directory
+cannot run. The listing makes each printed value printable and cuts it, so an
+id or an error cannot drive the terminal.
+
+Count the failed items:
+
+    python3 -I -c '
+    import json, sys
+    last = {}
+    for line in open(sys.argv[1], encoding="utf-8"):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and "id" in row and "status" in row:
+            last[str(row["id"])] = row
+    print(sum(1 for row in last.values() if row["status"] == "error"))
+    ' /tmp/triage/results.jsonl
+
+List the first 20 failed ids, each cut to 100 characters, with the first 200
+characters of its error:
+
+    python3 -I -c '
+    import json, sys
+    def shown(value, limit):
+        return "".join(ch if ch.isprintable() else "?" for ch in str(value)[:limit])
+    last = {}
+    for line in open(sys.argv[1], encoding="utf-8"):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and "id" in row and "status" in row:
+            last[str(row["id"])] = row
+    failed = [row for row in last.values() if row["status"] == "error"]
+    for row in failed[:20]:
+        print(shown(row["id"], 100), shown(row.get("error"), 200))
+    ' /tmp/triage/results.jsonl
 
 ## Reasoning consumes the output budget
 

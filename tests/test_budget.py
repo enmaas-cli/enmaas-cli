@@ -13,7 +13,8 @@ from enmaas_cli.budget import (
     metered,
     rolling_spend,
 )
-from enmaas_cli.dialect import Usage, parse_response
+from enmaas_cli.dialect import parse_response
+from enmaas_cli.tokens import Usage
 from enmaas_cli.usage import UsageEvent
 
 
@@ -284,3 +285,15 @@ def test_legacy_rows_fall_back_to_the_reasoning_breakdown() -> None:
     )
     assert legacy.charge is None
     assert rolling_spend([legacy], window_days=30, now=now) == 100
+
+
+def test_charge_from_rows_skips_a_charge_above_the_cap() -> None:
+    from enmaas_cli.tokens import MAX_RECORDED
+
+    rows = [
+        {"type": "request", "charge": MAX_RECORDED + 1, "items": 1},
+        {"type": "request", "charge": int("9" * 4300), "items": 1},
+        {"type": "request", "charge": MAX_RECORDED, "items": 1},
+        {"type": "request", "charge": 4, "items": 1},
+    ]
+    assert charge_from_rows(rows) == MAX_RECORDED + 4

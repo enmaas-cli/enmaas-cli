@@ -39,11 +39,46 @@ make check
 ```
 
 That runs `ruff check`, `ruff format --check`, `mypy` in strict mode, and
-`pytest`. All four must pass. If you touched `install.sh` or anything it copies,
-also run `make check-install`; it installs into a throwaway home and checks every
+`pytest`. All four must pass. If you touched `install.sh`, its settings helper,
+or anything it copies, also run `make check-install`; it installs into a throwaway home and checks every
 step, including a second run and `--uninstall`. Run it without redirecting output: a chain of
 checks whose failure is hidden is worse than no chain, and that mistake has
 already been made once in this repository's history.
+
+A few tests write into the state directory of the person who runs them, which
+is `~/.local/state/enmaas/runs/` by default. Most leave only a lock file. When
+`XDG_STATE_HOME` is set in your environment, two of them add rows to the usage
+ledger there. To keep the tests out of your own files, point `HOME` and
+`XDG_STATE_HOME` at a scratch folder:
+
+```bash
+scratch="$(mktemp -d)"
+HOME="$scratch" XDG_STATE_HOME="$scratch/state" make check
+```
+
+Some tests compare an error line that enmaas cuts to 200 characters. The line
+holds a path under the temporary directory, so these tests fail when `TMPDIR`
+is long. The number depends on the length: in one measurement 8 tests failed
+with a `TMPDIR` of 96 characters, and 17 failed with one of 117 characters. If
+that happens, give pytest a short base directory:
+
+```bash
+pytest --basetemp="$(mktemp -d /tmp/enmaas.XXXXXX)"
+```
+
+pytest removes the directory it is given before it uses it, so pass a new one
+as shown.
+
+Installer settings edits live in `src/enmaas_cli/hostconfig.py`.
+`scripts/install_helper.py` loads it by path without importing the CLI package.
+The helper shares URL rules with `gateway.py` and keeps the installer messages.
+`tests/test_hostconfig.py` checks complete files, refusals and repeated edits.
+To measure its branch coverage:
+
+```bash
+python -m coverage run --branch --source=enmaas_cli.hostconfig -m pytest tests/test_hostconfig.py
+python -m coverage report -m
+```
 
 Live tests hit the real gateway and need a credential. They are deselected by
 default and never run in CI:

@@ -1,0 +1,14 @@
+=== exit 0
+=== stdout
+enmaas ask ok
+  model     rits/zai-org/glm-5-3  (openai dialect)
+  output    <TMP>/state/enmaas/runs/<RUNDIR>/response.md  (19 B)
+  tokens    in 30   out 5
+  elapsed   <ELAPSED>
+  warning   1 character the model emitted could not be encoded and became U+FFFD
+  preview   {"answer": "x�y"}
+
+=== stderr
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 30, "cached_tokens": null, "output_tokens": 5, "reasoning_tokens": null, "elapsed": <ELAPSED>, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 35}

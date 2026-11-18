@@ -10,7 +10,9 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
+from enmaas_cli.dialect import Dialect
 from enmaas_cli.pricing import ModelPrice
 
 DEFAULT_MODEL = "rits/zai-org/glm-5-3"
@@ -38,7 +40,7 @@ class Config:
     concurrency: int = 4
     # Below the measured ~300s gateway ceiling so our deadline fires first.
     timeout: int = 280
-    dialect_overrides: dict[str, str] = field(default_factory=dict)
+    dialect_overrides: dict[str, Dialect] = field(default_factory=dict)
     # USD per million tokens, keyed by model id or by a prefix covering a
     # family. The gateway publishes no rates, so these can only come from
     # whoever knows what their account is charged.
@@ -53,7 +55,9 @@ class Config:
 
 DEFAULTS = Config()
 
-_SCALARS = {
+_DIALECTS: dict[str, Dialect] = {"anthropic": "anthropic", "openai": "openai"}
+
+_SCALARS: dict[str, type[Any]] = {
     "base_url": str,
     "key_file": str,
     "default_model": str,
@@ -86,45 +90,75 @@ def load_config(path: Path) -> Config:
 
     config = Config()
     warnings: list[str] = []
-    updates: dict[str, object] = {}
-
+    updates: dict[str, Any] = {}
     for key, value in raw.items():
-        if key == "prices":
-            parsed, price_warnings = _parse_prices(value)
-            warnings.extend(price_warnings)
-            if parsed:
-                updates["prices"] = parsed
-        elif key == "budget":
-            updates.update(_parse_budget(value))
-        elif key == "dialect_overrides":
-            if isinstance(value, dict):
-                updates["dialect_overrides"] = {str(k): str(v) for k, v in value.items()}
-            else:
-                warnings.append("dialect_overrides must be a table, ignoring it")
-        elif key in _SCALARS:
-            expected = _SCALARS[key]
-            # bool subclasses int, so `concurrency = true` would otherwise pass
-            # the isinstance check and silently become 1.
-            wrong_type = not isinstance(value, expected) or (
-                expected is int and isinstance(value, bool)
-            )
-            if wrong_type:
-                warnings.append(f"{key} must be {expected.__name__}, ignoring {value!r}")
-            elif key in {"concurrency", "timeout"} and value <= 0:
-                warnings.append(f"{key} must be positive, ignoring {value!r}")
-            else:
-                updates[key] = value
-        else:
-            warnings.append(f"unknown config key {key!r} in {path}, ignoring it")
+        _read_key(key, value, path, updates, warnings)
 
-    return replace(config, **updates, warnings=warnings)  # type: ignore[arg-type]
+    return replace(config, **updates, warnings=warnings)
+
+
+def _read_key(
+    key: str, value: Any, path: Path, updates: dict[str, Any], warnings: list[str]
+) -> None:
+    """Read one top-level key into `updates`, or say in `warnings` why it is ignored."""
+    if key == "prices":
+        parsed, price_warnings = _parse_prices(value)
+        warnings.extend(price_warnings)
+        if parsed:
+            updates["prices"] = parsed
+    elif key == "budget":
+        updates.update(_parse_budget(value))
+    elif key == "dialect_overrides":
+        if isinstance(value, dict):
+            overrides, override_warnings = _parse_dialect_overrides(value)
+            warnings.extend(override_warnings)
+            updates["dialect_overrides"] = overrides
+        else:
+            warnings.append("dialect_overrides must be a table, ignoring it")
+    elif key in _SCALARS:
+        problem = _scalar_problem(key, value)
+        if problem is None:
+            updates[key] = value
+        else:
+            warnings.append(problem)
+    else:
+        warnings.append(f"unknown config key {key!r} in {path}, ignoring it")
+
+
+def _scalar_problem(key: str, value: Any) -> str | None:
+    """Why the value of a scalar key cannot be used, or None when it can."""
+    expected = _SCALARS[key]
+    # bool subclasses int, so `concurrency = true` would otherwise pass the
+    # isinstance check and silently become 1.
+    if not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
+        return f"{key} must be {expected.__name__}, ignoring {value!r}"
+    if key in {"concurrency", "timeout"} and value <= 0:
+        return f"{key} must be positive, ignoring {value!r}"
+    return None
+
+
+def _parse_dialect_overrides(value: dict[Any, Any]) -> tuple[dict[str, Dialect], list[str]]:
+    """Read the [dialect_overrides] table, dropping each value that is not a dialect.
+
+    Checked here, when the config loads, so a bad value is reported on every
+    command that reads the config, not only by a run of the model it names.
+    """
+    overrides: dict[str, Dialect] = {}
+    warnings: list[str] = []
+    for model, raw in value.items():
+        dialect = _DIALECTS.get(str(raw))
+        if dialect is None:
+            warnings.append(f"invalid dialect override '{raw!s}' for {model!s}, ignoring")
+        else:
+            overrides[str(model)] = dialect
+    return overrides, warnings
 
 
 def _parse_prices(value: object) -> tuple[dict[str, ModelPrice], list[str]]:
     """Read the [prices] table, warning rather than dropping silently.
 
-    A price that vanishes without a word makes a model look free, which is
-    the same silent understatement the ledger already had to be fixed for.
+    A price that vanishes without a word makes a model look free, which
+    understates the cost without saying so.
     """
     warnings: list[str] = []
     if not isinstance(value, dict):

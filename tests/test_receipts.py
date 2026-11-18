@@ -1,21 +1,30 @@
+from __future__ import annotations
+
+import json
 import re
 from pathlib import Path
+from typing import Any
 
-from enmaas_cli.dialect import Completion, Usage
+import httpx
+import pytest
+
+from enmaas_cli.cli import main
+from enmaas_cli.dialect import Completion
 from enmaas_cli.receipts import ask_receipt, create_run_dir, map_receipt, preview, prune_runs
 from enmaas_cli.runner import MapOutcome
+from enmaas_cli.tokens import Usage
 
 
 def test_preview_collapses_whitespace_and_truncates() -> None:
     text = "line one\n\n   line  two\n" + ("x" * 500)
-    out = preview(text, limit=40)
+    out = preview(text, key="k", limit=40)
     assert "\n" not in out
     assert len(out) == 40
     assert out.startswith("line one line two")
 
 
 def test_preview_of_empty_text_is_empty() -> None:
-    assert preview("", limit=40) == ""
+    assert preview("", key="k", limit=40) == ""
 
 
 def test_create_run_dir_uses_timestamp_and_random_slug(tmp_path: Path) -> None:
@@ -62,6 +71,7 @@ def test_ask_receipt_shows_cached_and_reasoning_tokens(tmp_path: Path) -> None:
         completion=completion,
         path=out,
         elapsed=6.2,
+        key="k",
     )
     assert "enmaas ask ok" in text
     assert "10,265 (9,216 cached)" in text
@@ -75,7 +85,9 @@ def test_ask_receipt_reports_unknown_not_zero(tmp_path: Path) -> None:
     out = tmp_path / "response.md"
     out.write_text("hi", encoding="utf-8")
     completion = Completion(text="hi", reasoning="", stop="stop", usage=Usage())
-    text = ask_receipt(model="m", dialect="openai", completion=completion, path=out, elapsed=1.0)
+    text = ask_receipt(
+        model="m", dialect="openai", completion=completion, path=out, elapsed=1.0, key="k"
+    )
     assert "unknown" in text
     assert "in 0" not in text
 
@@ -89,7 +101,9 @@ def test_ask_receipt_flags_truncation(tmp_path: Path) -> None:
         stop="length",
         usage=Usage(input_tokens=10, output_tokens=20),
     )
-    text = ask_receipt(model="m", dialect="openai", completion=completion, path=out, elapsed=1.0)
+    text = ask_receipt(
+        model="m", dialect="openai", completion=completion, path=out, elapsed=1.0, key="k"
+    )
     assert "truncated" in text
 
 
@@ -254,6 +268,7 @@ def test_the_receipt_says_when_output_was_repaired() -> None:
         completion=completion,
         path=Path("out.md"),
         elapsed=1.0,
+        key="k",
     )
     assert "1 character the model emitted could not be encoded" in text
     assert "U+FFFD" in text
@@ -267,6 +282,7 @@ def test_a_clean_response_gains_no_warning() -> None:
         completion=completion,
         path=Path("out.md"),
         elapsed=1.0,
+        key="k",
     )
     assert "U+FFFD" not in text
 
@@ -305,6 +321,103 @@ def test_ask_receipt_marks_a_defaulted_model(tmp_path: Path) -> None:
         completion=completion,
         path=path,
         elapsed=0.1,
+        key="k",
         model_defaulted=True,
     )
     assert "  model     m  (default)  (openai dialect)" in text
+
+
+# Gateway text in a printed receipt cannot forge a line or reach the terminal.
+#
+# A gateway error body is not trusted. The receipt prints it on one line with
+# control characters replaced. The index rows and the --json output keep the
+# message as it was, because JSON encoding already escapes those characters.
+
+
+FORGED = "bad\n  failure   z  forged line\x1b]0;title\x07"
+CONTROL = ("\x1b", "\x07", "\n", "\r")
+
+
+def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ENMAAS_KEY", "sk-oai-x")
+    monkeypatch.setenv("ENMAAS_BASE_URL", "https://gw.example.test")
+    monkeypatch.delenv("ENMAAS_NO_USAGE_LOG", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text=body)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _map(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *extra: str) -> int:
+    _setup(tmp_path, monkeypatch, FORGED)
+    items = tmp_path / "items.jsonl"
+    items.write_text(json.dumps({"id": "a", "x": "a"}) + "\n", encoding="utf-8")
+    template = tmp_path / "t.txt"
+    template.write_text("do {x}", encoding="utf-8")
+    argv = ["--config", str(tmp_path / "none.toml"), "map", "-m", "rits/zai-org/glm-5-3"]
+    argv += ["--dialect", "openai", "--items", str(items), "--template", str(template)]
+    argv += ["--outdir", str(tmp_path / "out"), "--retries", "0", "--concurrency", "1", *extra]
+    return main(argv)
+
+
+def _ask(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, *extra: str) -> int:
+    _setup(tmp_path, monkeypatch, body)
+    argv = ["--config", str(tmp_path / "none.toml"), "ask", "-m", "rits/zai-org/glm-5-3"]
+    argv += ["--dialect", "openai", "-p", "hi", "--retries", "0", *extra]
+    return main(argv)
+
+
+def _index_rows(tmp_path: Path) -> list[dict[str, Any]]:
+    lines = (tmp_path / "out" / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def test_map_receipt_prints_a_forged_failure_on_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _map(tmp_path, monkeypatch) == 2
+    out = capsys.readouterr().out
+    failures = [line for line in out.split("\n") if line.startswith("  failure")]
+    assert len(failures) == 1
+    assert not any(ch in failures[0] for ch in CONTROL)
+    assert "\x1b" not in out
+    assert "\x07" not in out
+
+
+def test_map_index_and_json_keep_the_raw_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _map(tmp_path, monkeypatch, "--json") == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failures"] == [{"id": "a", "error": f"400: {FORGED}"}]
+    (row,) = [r for r in _index_rows(tmp_path) if r.get("id") == "a"]
+    assert row["error"] == f"400: {FORGED}"
+
+
+def test_ask_receipt_prints_a_forged_error_on_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _ask(tmp_path, monkeypatch, FORGED) == 1
+    err = capsys.readouterr().err
+    lines = err.rstrip("\n").split("\n")
+    # The plain failure receipt: header, model line, error line.
+    assert len(lines) == 3
+    assert lines[2].startswith("  error     400: bad ")
+    for line in lines:
+        assert not any(ch in line for ch in CONTROL)
+
+
+def test_ask_json_keeps_the_raw_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _ask(tmp_path, monkeypatch, FORGED, "--json") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == f"400: {FORGED}"

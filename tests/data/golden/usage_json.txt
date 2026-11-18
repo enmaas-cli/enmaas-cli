@@ -1,0 +1,68 @@
+=== exit 0
+=== stdout
+{
+  "total_calls": 3,
+  "total_input_tokens": 6210,
+  "total_output_tokens": 1220,
+  "total_cached_tokens": 1200,
+  "total_reasoning_tokens": 120,
+  "total_elapsed": 44.25,
+  "by_model": {
+    "rits/zai-org/glm-5-3": {
+      "calls": 2,
+      "input_tokens": 6200,
+      "output_tokens": 1200,
+      "cached_tokens": 1200,
+      "reasoning_tokens": 120,
+      "elapsed": 43.75
+    },
+    "other/model-a": {
+      "calls": 1,
+      "input_tokens": 10,
+      "output_tokens": 20,
+      "cached_tokens": 0,
+      "reasoning_tokens": 0,
+      "elapsed": 0.5
+    }
+  },
+  "by_command": {
+    "ask": {
+      "calls": 1,
+      "input_tokens": 1200,
+      "output_tokens": 300,
+      "cached_tokens": 200,
+      "reasoning_tokens": 0,
+      "elapsed": 1.5
+    },
+    "map": {
+      "calls": 1,
+      "input_tokens": 5000,
+      "output_tokens": 900,
+      "cached_tokens": 1000,
+      "reasoning_tokens": 120,
+      "elapsed": 42.25
+    },
+    "record": {
+      "calls": 1,
+      "input_tokens": 10,
+      "output_tokens": 20,
+      "cached_tokens": 0,
+      "reasoning_tokens": 0,
+      "elapsed": 0.5
+    }
+  },
+  "spend_usd": 0.0,
+  "unpriced_models": [
+    "other/model-a"
+  ],
+  "opus_equivalent_usd": 0.06155,
+  "opus_reference": "Claude Opus 5 list rate, $5.00 in / $25.00 out per MTok",
+  "skipped_rows": 0
+}
+
+=== stderr
+
+=== usage.jsonl
+{"timestamp": "2026-11-01T09:00:00+00:00", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 1200, "cached_tokens": 200, "output_tokens": 300, "reasoning_tokens": 0, "elapsed": 1.5, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 1300}
+{"timestamp": "2026-11-02T10:30:00+00:00", "command": "map", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 5000, "cached_tokens": 1000, "output_tokens": 900, "reasoning_tokens": 120, "elapsed": 42.25, "status": "error", "schema_used": false, "error_kind": "PartialFailure", "items_total": 10, "items_ok": 9, "items_failed": 1, "charge": 4900}
+{"timestamp": "2026-11-03T12:00:00+00:00", "command": "record", "model": "other/model-a", "dialect": "anthropic", "input_tokens": 10, "cached_tokens": 0, "output_tokens": 20, "reasoning_tokens": 0, "elapsed": 0.5, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 30}

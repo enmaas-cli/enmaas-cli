@@ -1,0 +1,9 @@
+=== exit 3
+=== stdout
+
+=== stderr
+enmaas map refused
+  budget    500 of 100 tokens spent in the last 7 days
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 400, "cached_tokens": 0, "output_tokens": 100, "reasoning_tokens": 0, "elapsed": <ELAPSED>, "status": "ok", "schema_used": false, "error_kind": null, "items_total": null, "items_ok": null, "items_failed": null, "charge": 500}

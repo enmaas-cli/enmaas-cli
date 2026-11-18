@@ -31,10 +31,22 @@ The hook checks Claude `Read`, content-returning `Grep`, and common literal
 shell reads in Claude Code and Codex. Shell coverage includes `cat`, `head`,
 `tail`, `sed`, `awk`, `grep`, `rg`, `jq`, and `diff`, and the file commands
 inside `sed` (`r`, `R`, `w`, `W`) and `awk` (`getline <`) programs. It handles
-quoted paths, globs, home paths, brace alternatives, simple directory changes,
-pipelines, heredocs, and input redirection. Common shell keywords and execution wrappers
-are checked, along with command substitutions.
-Filename-only searches and counts are allowed as metadata.
+quoted paths, Bash `$'...'` and `$"..."` quoting, globs, home paths, brace
+alternatives, simple directory changes, pipelines, heredocs, and input
+redirection. A reader command with a `$'...'` string the hook cannot decode
+the way Bash does, such as one with an unknown escape or a NUL, is denied.
+The hook checks the command after a common shell keyword, such as `if` or
+`do`, and inside a command substitution. It reads through these execution
+wrappers: `env`, `command`, `builtin`, `time`, `sudo`, `xargs`, `timeout`,
+`nice`, `nohup`, `stdbuf`, `exec` and `setsid`. It reads shell text given to
+`eval`, or to `sh`, `bash`, `dash`, `zsh` or `ksh` with `-c`. It does not
+check a read that another launcher runs, such as `ionice`, `flock`, `uv run`
+or `find -exec`, or shell text in a script file. It denies
+`enmaas allow-read` and `enmaas ask --stdout` behind any launcher. Do not use
+a wrapper to get past a denial.
+Filename-only searches and counts are allowed as metadata. A file that a
+reader loads as input, such as a pattern file (`-f`), a script file, or an
+ignore or exclude file, is checked first, in every output mode.
 
 Use absolute paths from receipts. The hook does not evaluate environment
 variables or arbitrary programs to discover file paths. Reader commands fed
@@ -55,10 +67,17 @@ Unsupported readers and disabled hooks do not grant permission to read answers.
 For `rg`, the guard enumerates filenames using the same traversal and ignore
 options. It does not read search results. Other directory checks use a
 conservative filesystem scan. Checks stop at 250,000 entries or three seconds, whichever comes first, and a
-check that stops early is a denial. On Claude Code the hook is registered with
-`onFailure: "block"`, so a hook that fails or is killed blocks the call. Narrow a rejected search instead of switching readers or disabling
-protection. Piped searches without file operands inspect their upstream command;
-they do not scan the working directory. Native Grep defaults to filename output.
+check that stops early is a denial. A very long command, of several hundred
+kilobytes, can still take the hook longer than three seconds, and its answer
+can then come after the 5 second hook timeout that both hosts are given. On
+Claude Code the hook is registered with `onFailure: "block"`, so a hook that
+fails or times out blocks the call. What Codex does in that case is not
+confirmed. Narrow a rejected search instead of switching readers or disabling
+protection. For a piped search without file operands the hook inspects the
+upstream command and does not scan the working directory. A recursive search
+such as `grep -r` with no file operand still searches the working directory
+when its input is a pipe, and the hook does not check that search. Native Grep
+defaults to filename output.
 
 A human-granted exception persists across sessions. The next generation for
 that path restores protection. Resume preserves approval when it skips that

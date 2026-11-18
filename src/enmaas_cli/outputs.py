@@ -24,6 +24,70 @@ def state_root() -> Path:
     return root / "enmaas" / "runs"
 
 
+def make_state_dir_private(directory: Path) -> None:
+    """Remove group and other access from the state directory. Never raises.
+
+    A version before 0.8.0 created the directory readable by every user on
+    the machine, and creating it private now does not change one that
+    already exists. Every command calls this once when it starts, and so
+    does every site that creates the state directory or reads a file in it.
+    A directory that is missing is not created.
+
+    Only a real directory this user owns is changed. O_NOFOLLOW refuses a
+    link at the last component, so a link to some other directory leaves
+    that directory alone. The check and the change use one descriptor, so
+    a directory swapped in between them cannot receive the change. Owner
+    bits are only ever removed, never added, so a directory its owner made
+    read-only stays read-only.
+
+    A failure is ignored without a message: a file system that is read-only
+    or has no modes would otherwise print a warning on every command, and
+    the command itself has lost nothing.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        info = os.fstat(descriptor)
+        if stat.S_ISDIR(info.st_mode) and _too_open(info):
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o700)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def make_file_private(descriptor: int) -> None:
+    """Remove group and other access from an open state file. Never raises.
+
+    For the usage ledger, the open-run records, their lock file and a `map`
+    index, each of which an earlier version created readable by every user
+    on the machine. Never for an answer file: its owner chose where it goes
+    and who reads it.
+
+    Only a regular file this user owns is changed, and only through the
+    descriptor the caller already checked, never by path. Owner bits are
+    only ever removed, so a file its owner made read-only stays read-only.
+    A file with more than one hard link is not changed: the mode belongs to
+    the file, so the change would reach another name of the same file, in a
+    place this tool knows nothing about.
+    A failure is ignored for the same reason as in make_state_dir_private.
+    """
+    try:
+        info = os.fstat(descriptor)
+        if stat.S_ISREG(info.st_mode) and info.st_nlink <= 1 and _too_open(info):
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o600)
+    except OSError:
+        pass
+
+
+def _too_open(info: os.stat_result) -> bool:
+    """Whether this user owns the file and its group or other users have any access."""
+    return info.st_uid == os.getuid() and bool(info.st_mode & 0o077)
+
+
 def marker_path(path: Path) -> Path:
     """Return the exact marker for the resolved output path."""
     resolved = path.resolve()
@@ -97,15 +161,41 @@ def write_output(path: Path, text: str) -> None:
     A plain write follows a link, so a pre-existing output name that points
     at another writable file truncated that file. The mode applies only when
     the file is created; an existing file keeps the mode its owner chose.
+
+    Only a regular file is written. Another process could read an answer
+    sent to a FIFO and stop this one before its spend is recorded. The open
+    is nonblocking, so a FIFO cannot hold it, and the type is checked on the
+    open descriptor.
+
+    A file with more than one hard link is refused, because another name
+    for the same file could be any file its owner can write. The open does
+    not truncate: truncating at open time would empty that other file before
+    any check ran. The file is truncated only after both checks pass on the
+    open descriptor.
     """
     if path.is_symlink():
         raise _link_refusal(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        descriptor = os.open(path, flags, 0o600)
     except OSError as exc:
         # The link can appear between the check above and the open.
         if exc.errno == errno.ELOOP:
             raise _link_refusal(path) from None
+        raise
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(
+                f"refusing to write an answer to a path that is not a regular file: {path}"
+            )
+        if info.st_nlink > 1:
+            raise OSError(
+                f"refusing to write an answer through a file with more than one hard link: {path}"
+            )
+        os.ftruncate(descriptor, 0)
+    except BaseException:
+        os.close(descriptor)
         raise
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(text.encode("utf-8"))

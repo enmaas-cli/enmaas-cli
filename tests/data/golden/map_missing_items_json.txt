@@ -1,0 +1,8 @@
+=== exit 1
+=== stdout
+{
+  "status": "error",
+  "error": "[Errno 2] No such file or directory: 'no-such-items.jsonl'"
+}
+
+=== stderr

@@ -1,0 +1,11 @@
+=== exit 1
+=== stdout
+
+=== stderr
+enmaas ask FAILED
+  model     rits/zai-org/glm-5-3  (openai dialect)
+  output    <TMP>/state/enmaas/runs/<RUNDIR>/response.md
+  error     response is not valid JSON: Expecting value: line 1 column 1 (char 0)
+
+=== usage.jsonl
+{"timestamp": "<TIME>", "command": "ask", "model": "rits/zai-org/glm-5-3", "dialect": "openai", "input_tokens": 50, "cached_tokens": null, "output_tokens": 7, "reasoning_tokens": null, "elapsed": <ELAPSED>, "status": "error", "schema_used": true, "error_kind": "ValidationError", "items_total": null, "items_ok": null, "items_failed": null, "charge": 57}

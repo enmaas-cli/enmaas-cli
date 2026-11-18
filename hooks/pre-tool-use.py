@@ -12,6 +12,10 @@ _MAX_INPUT_BYTES = 1024 * 1024
 
 def main() -> None:
     try:
+        # Every launcher runs this with python3 -I, which keeps PYTHONPATH,
+        # this directory and the working directory off the import path, so
+        # workspace code cannot load. The bundled source is added by its
+        # absolute path instead.
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
         from enmaas_cli.containment import check_tool
 
