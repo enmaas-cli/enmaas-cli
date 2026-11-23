@@ -475,6 +475,32 @@ def test_gpt_models_get_max_completion_tokens() -> None:
     assert "max_tokens" not in request.body
 
 
+def test_codex_models_get_max_completion_tokens() -> None:
+    """codex-auto-review rejects max_tokens with HTTP 400.
+
+    Measured 2026-11-23 against the gateway:
+
+        400 Unsupported parameter: 'max_tokens' is not supported with this
+        model. Use 'max_completion_tokens' instead.
+
+    The prefix list covered gpt- only, so this model was unusable through the
+    CLI. It is the one an independent code or content review would reach for,
+    because it is a different family from the model under review.
+    """
+    request = build_request(
+        model="codex-auto-review",
+        prompt="hi",
+        dialect="openai",
+        max_tokens=256,
+        thinking=True,
+        system=None,
+        key="k",
+    )
+
+    assert request.body["max_completion_tokens"] == 256
+    assert "max_tokens" not in request.body
+
+
 def test_other_openai_models_keep_max_tokens() -> None:
     """The rename is per-model, not a blanket change to the dialect."""
     request = build_request(
