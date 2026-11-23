@@ -84,7 +84,12 @@ _OPENAI_THINKING_FLOOR: dict[str, tuple[dict[str, Any], str]] = {
 # Reasoning-family models took max_completion_tokens when max_tokens was
 # retired. Sending the old name is a 400 at request validation, before any
 # inference, so the model is unusable rather than merely degraded.
-_OPENAI_COMPLETION_TOKEN_PREFIXES = ("gpt-",)
+#
+# codex- added 2026-11-23. codex-auto-review returned "Unsupported parameter:
+# 'max_tokens' is not supported with this model. Use 'max_completion_tokens'
+# instead." It is the model an independent review reaches for, being a
+# different family from the one under review, so the gap mattered.
+_OPENAI_COMPLETION_TOKEN_PREFIXES = ("gpt-", "codex-")
 
 
 def openai_token_field(model: str) -> str:
